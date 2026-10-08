@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      0.2.8
+// @version      0.2.9
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @match        https://go.pertamaproperty.com/*
 // @run-at       document-start
@@ -34,7 +34,7 @@
   };
   let settings = JSON.parse(JSON.stringify(SETTINGS_DEFAULTS));
   function validateSettings(value) {
-    if (!value || !['leads', 'tasks'].includes(value.priority)
+    if (!value || !['leads', 'tasks', 'stage'].includes(value.priority)
       || !Array.isArray(value.pipelineIds) || value.pipelineIds.some(id => typeof id !== 'string')
       || new Set(value.pipelineIds).size !== value.pipelineIds.length) throw new Error('Invalid pipeline selection or priority.');
     for (const key of ['note', 'task', 'sms', 'newLeadStage']) {
@@ -98,7 +98,7 @@
   let currentUserId = null;
   let identityStatus = 'Awaiting CRM authentication headers';
   let identityExpires = 0;
-  window.pertamaUserDiagnostics = () => ({ version: '0.2.8', status: identityStatus,
+  window.pertamaUserDiagnostics = () => ({ version: '0.2.9', status: identityStatus,
     verified: Boolean(currentUserId) && identityExpires > Date.now() / 1000 });
   async function requireVerifiedUser() {
     if (!currentUserId || identityExpires <= Date.now() / 1000) {
@@ -293,12 +293,13 @@
       const lead = hit._source;
       if (lead?.pipelineId !== pipeline.id || lead.pipelineStageId !== pipeline.stages[stage]
         || lead.locationId !== LOCATION_ID || !hit._id || !lead.contactId) throw new Error('Top lead does not match the requested pipeline/stage/contact.');
-      if (lead.contactId !== excludedContact) return { contactId: lead.contactId, opportunityId: hit._id, pipeline: pipeline.name };
+      if (lead.contactId !== excludedContact) return { contactId: lead.contactId, opportunityId: hit._id,
+        pipeline: pipeline.name, pipelineId: pipeline.id, stageId: pipeline.stages[stage] };
     }
     if (bucket.docCount > hits.length) throw new Error('More leads exist beyond this response. No fallback taken.');
     return null;
   }
-  async function topPipelineLead(pipeline, stage = 'New Lead', excludedContact = null) {
+  async function topPipelineLead(pipeline, stage = 'New Lead', excludedContact = null, sameStage = false) {
     await requireVerifiedUser();
     if (!pipeline?.stages[stage]) throw new Error(`Unrecognised pipeline/stage: ${stage}`);
     if (!queryTemplates[pipeline.id]) {
@@ -310,6 +311,19 @@
     const ids = filterValues(body.filters, 'pipeline_id');
     if (ids.length !== 1 || ids[0] !== pipeline.id) throw new Error('Saved query belongs to a different pipeline.');
     body.filters = scopeLeadFilters(body.filters, currentUserId);
+    if (sameStage) {
+      function removeStageFilters(items) {
+        return (items || []).flatMap(item => {
+          if (item.filters) {
+            const children = removeStageFilters(item.filters);
+            return children.length ? [{ ...item, filters: children }] : [];
+          }
+          return item.field === 'pipeline_stage_id' ? [] : [item];
+        });
+      }
+      body.filters = [...removeStageFilters(body.filters),
+        { field: 'pipeline_stage_id', operator: 'eq', value: [pipeline.stages[stage]] }];
+    }
     const group = body.aggregations.find(a => a.name === 'pipelines');
     group.options = { ...group.options, include: [pipeline.stages[stage]] };
     return opportunityFromResponse(await readList('/opportunities/search', body), pipeline, stage, excludedContact);
@@ -327,6 +341,17 @@
     return { contactId: contacts[0].recordId };
   }
   async function findNextActionable() {
+    if (settings.priority === 'stage') {
+      const context = stageQueueContext();
+      if (!context) throw new Error('Choose the original stage queue before navigating.');
+      nextButton.textContent = `Checking ${context.pipeline.name} · ${context.stage}…`;
+      const lead = await topPipelineLead(context.pipeline, context.stage, context.queue.contactId, true);
+      syncStageQueue();
+      if (stageQueue !== context.queue || contactId() !== context.queue.contactId) {
+        throw new Error('Contact or stage queue changed during lookup. Navigation cancelled.');
+      }
+      return lead;
+    }
     const pipelines = settings.pipelineIds.map(id => {
       const pipeline = NAV_PIPELINES.find(p => p.id === id);
       if (!pipeline) throw new Error('A selected pipeline is no longer available. Update Settings.');
@@ -351,13 +376,118 @@
   }
   function openLead(lead) {
     if (!/^[a-zA-Z0-9_-]+$/.test(lead.contactId)) throw new Error('Invalid contact ID returned by lookup.');
-    if (lead.opportunityId) sessionStorage.setItem(`pertama:origin:${lead.contactId}`,
-      JSON.stringify({ pipeline: lead.pipeline, opportunityId: lead.opportunityId }));
-    else sessionStorage.removeItem(`pertama:origin:${lead.contactId}`);
+    if (lead.opportunityId) pinStageQueue({ contactId: lead.contactId, opportunityId: lead.opportunityId,
+      pipelineId: lead.pipelineId, stageId: lead.stageId });
+    else {
+      clearStageQueue();
+      sessionStorage.removeItem(`pertama:origin:${lead.contactId}`);
+    }
     location.assign(`/v2/location/${LOCATION_ID}/contacts/detail/${lead.contactId}`);
   }
 
-  // Observe session headers and list filters only; leave CRM requests unchanged.
+  // One tab-local queue, bound to the contact being viewed. Never derive it from a stage save.
+  const STAGE_QUEUE_KEY = `pertama:stage-queue:${LOCATION_ID}`;
+  let stageQueue = null;
+  let stageQueuePath = location.pathname;
+  let stageRouteRevision = 0;
+  const stageResults = new Map();
+  let stageRevision = 0;
+  let stageWritesPending = 0;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(STAGE_QUEUE_KEY) || 'null');
+    if (saved?.contactId === contactId() && location.pathname.includes(`/location/${LOCATION_ID}/`)) stageQueue = saved;
+    else sessionStorage.removeItem(STAGE_QUEUE_KEY);
+  } catch { /* Without a readable queue, require explicit selection. */ }
+
+  function clearStageQueue() {
+    stageQueue = null;
+    sessionStorage.removeItem(STAGE_QUEUE_KEY);
+  }
+  function syncStageQueue() {
+    if (stageQueuePath === location.pathname) return;
+    stageQueuePath = location.pathname;
+    stageRouteRevision++;
+    stageResults.clear();
+    stageRevision++;
+    if (stageQueue?.contactId !== contactId() || !location.pathname.includes(`/location/${LOCATION_ID}/`)) clearStageQueue();
+  }
+  // SPA route changes must invalidate immediately, including a quick away-and-back.
+  for (const method of ['pushState', 'replaceState']) {
+    const original = history[method];
+    history[method] = function() {
+      const result = original.apply(this, arguments);
+      try { syncStageQueue(); } catch { /* Never prevent CRM navigation. */ }
+      return result;
+    };
+  }
+  window.addEventListener('popstate', () => { try { syncStageQueue(); } catch { /* Observer only. */ } });
+  function stageQueueContext() {
+    syncStageQueue();
+    if (!stageQueue || stageQueue.contactId !== contactId() || !location.pathname.includes(`/location/${LOCATION_ID}/`)) return null;
+    if (!['contactId', 'opportunityId', 'pipelineId', 'stageId'].every(key =>
+      typeof stageQueue[key] === 'string' && /^[a-zA-Z0-9_-]+$/.test(stageQueue[key]))) return null;
+    const pipeline = NAV_PIPELINES.find(p => p.id === stageQueue.pipelineId);
+    const stage = pipeline && Object.keys(pipeline.stages).find(name => pipeline.stages[name] === stageQueue.stageId);
+    return stage ? { queue: stageQueue, pipeline, stage } : null;
+  }
+  function pinStageQueue(queue) {
+    syncStageQueue();
+    if (!queue || !['contactId', 'opportunityId', 'pipelineId', 'stageId'].every(key =>
+      typeof queue[key] === 'string' && /^[a-zA-Z0-9_-]+$/.test(queue[key]))) throw new Error('Invalid stage queue IDs.');
+    const pipeline = NAV_PIPELINES.find(p => p.id === queue.pipelineId);
+    if (!pipeline || !Object.values(pipeline.stages).includes(queue.stageId)) throw new Error('Stage queue is no longer available. Reopen the pipeline board.');
+    sessionStorage.setItem(`pertama:origin:${queue.contactId}`, JSON.stringify({
+      pipeline: pipeline.name, pipelineId: pipeline.id, opportunityId: queue.opportunityId,
+    }));
+    sessionStorage.setItem(STAGE_QUEUE_KEY, JSON.stringify(queue));
+    stageQueue = queue;
+  }
+  function stageQueueLabel() {
+    const context = stageQueueContext();
+    return context ? `Next from: ${context.pipeline.name} · ${context.stage}` : 'Choose the original stage queue';
+  }
+  function nextLeadLabel() {
+    return settings.priority === 'stage' ? `Next lead — ${stageQueueLabel()}` : 'Next lead';
+  }
+  function emptyQueueMessage() {
+    if (settings.priority !== 'stage') return 'No leads or pending tasks match your selected queues and saved filters.';
+    const context = stageQueueContext();
+    return context ? `No other matching leads in ${context.pipeline.name} · ${context.stage}.`
+      : 'The original stage queue is unavailable. Reopen the pipeline board.';
+  }
+  function observeStageRequest(method, url) {
+    syncStageQueue();
+    const parsed = new URL(url, location.href);
+    if (parsed.origin !== 'https://services.leadconnectorhq.com') return null;
+    const path = parsed.pathname.replace(/\/$/, '');
+    if (['PUT', 'PATCH', 'DELETE'].includes(method) && /^\/opportunities\/[^/]+$/.test(path)
+      || method === 'POST' && path === '/opportunities') {
+      stageResults.clear(); stageRevision++; stageWritesPending++;
+      return { write: true, finished: false };
+    }
+    return method === 'POST' && path === '/opportunities/search' && opportunitiesPage() && !stageWritesPending
+      ? stageRevision : null;
+  }
+  function finishStageWrite(observation) {
+    if (!observation?.write || observation.finished) return;
+    observation.finished = true;
+    stageWritesPending--;
+    stageResults.clear(); stageRevision++;
+  }
+  function rememberStageResults(data, revision) {
+    syncStageQueue();
+    if (typeof revision !== 'number' || revision !== stageRevision || stageWritesPending || !opportunitiesPage()) return;
+    for (const bucket of data?.aggregations?.pipelines?.buckets || []) {
+      for (const hit of bucket.topOpportunities?.hits?.hits || []) {
+        const lead = hit._source;
+        if (lead?.locationId !== LOCATION_ID || !hit._id || !lead.contactId || bucket.key !== lead.pipelineStageId) continue;
+        stageResults.set(hit._id, { contactId: lead.contactId, opportunityId: hit._id,
+          pipelineId: lead.pipelineId, stageId: lead.pipelineStageId });
+      }
+    }
+  }
+
+  // Observe session headers, list results and save receipts; leave CRM requests unchanged.
   let receiptBatch = null;
   function beginReceipts() {
     receiptBatch = [];
@@ -387,9 +517,10 @@
   }
   const originalFetch = window.fetch;
   window.fetch = function(input, init) {
-    let receipt;
+    let receipt, stageObservation = null;
     try {
       const request = input instanceof Request ? input : null;
+      stageObservation = observeStageRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input));
       captureReadHeaders(request?.url || String(input), init?.headers || request?.headers);
       captureQuery((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
         () => init?.body ?? (request ? request.clone().text() : null));
@@ -397,6 +528,10 @@
         () => init?.body ?? (request ? request.clone().text() : null));
     } catch { /* Observing must never prevent the CRM request. */ }
     const result = originalFetch.apply(this, arguments);
+    if (stageObservation?.write) result.then(() => finishStageWrite(stageObservation), () => finishStageWrite(stageObservation));
+    else if (typeof stageObservation === 'number') {
+      result.then(response => response.ok ? response.clone().json().then(data => rememberStageResults(data, stageObservation)) : null).catch(() => {});
+    }
     if (pipelineListRequest(input instanceof Request ? input.url : String(input))) {
       result.then(response => response.ok ? response.clone().json().then(rememberPipelines) : null).catch(() => {});
     }
@@ -425,6 +560,13 @@
     try {
       const info = xhrInfo.get(this);
       if (info) { captureReadHeaders(info.url, info.headers); captureQuery(info.method, info.url, () => body); }
+      const stageObservation = info ? observeStageRequest(info.method, info.url) : null;
+      if (stageObservation !== null) this.addEventListener('loadend', () => {
+        if (stageObservation.write) finishStageWrite(stageObservation);
+        else try {
+          if (this.status >= 200 && this.status < 300) rememberStageResults(this.responseType === 'json' ? this.response : JSON.parse(this.responseText), stageObservation);
+        } catch { /* Unreadable board results must not establish a queue. */ }
+      }, { once: true });
       if (info && pipelineListRequest(info.url)) this.addEventListener('loadend', () => {
         try { if (this.status >= 200 && this.status < 300) rememberPipelines(this.responseType === 'json' ? this.response : JSON.parse(this.responseText)); } catch { /* Keep previous catalog. */ }
       }, { once: true });
@@ -502,6 +644,7 @@
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   let busy = false;
   let guardedContact = null;
+  let guardedStageQueue = null;
   let step = '';
   let completed = [];
   let pendingSave = '';
@@ -516,6 +659,9 @@
     while (Date.now() < deadline) {
       if (guardedContact && contactId() !== guardedContact) {
         throw new Error(`Contact changed while waiting for ${description}. Expected ID: ${guardedContact}; current ID: ${contactId() || '(not on a contact page)'}.`);
+      }
+      if (guardedStageQueue && stageQueueContext()?.queue !== guardedStageQueue) {
+        throw new Error(`Original stage queue changed while waiting for ${description}. Execution stopped.`);
       }
       const result = find();
       if (result) return result;
@@ -665,7 +811,11 @@
     const opportunityId = link.closest('.card')?.id;
     if (!id || !pipeline || !opportunityId) return;
     try {
+      syncStageQueue();
+      clearStageQueue();
       sessionStorage.setItem(`pertama:origin:${id}`, JSON.stringify({ pipeline, opportunityId }));
+      const snapshot = stageResults.get(opportunityId);
+      if (snapshot?.contactId === id && NAV_PIPELINES.some(p => p.id === snapshot.pipelineId && p.name === pipeline)) pinStageQueue(snapshot);
     } catch { /* Without a remembered origin, only an unambiguous opportunity is allowed. */ }
   }
 
@@ -674,22 +824,98 @@
     catch { return null; }
   }
 
+  async function ensureStageQueue() {
+    const id = contactId();
+    if (!id || !location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Open a contact in the Pertama account to choose a stage queue.');
+    const existing = stageQueueContext();
+    if (existing) return existing;
+    const routeRevision = stageRouteRevision;
+    await openSidebar('sidebar-opportunities-icon');
+    const links = await wait(() => {
+      const found = all('a[href*="/opportunities/"][href*="pipelineId="]');
+      return found.length ? found : null;
+    }, 'contact opportunities for stage queue selection');
+    if (contactId() !== id || stageRouteRevision !== routeRevision) throw new Error('Contact changed before stage queue selection.');
+    const choices = new Map();
+    for (const link of links) {
+      const url = new URL(link.href, location.href);
+      const opportunityId = url.pathname.match(/\/opportunities\/([^/]+)\/?$/)?.[1];
+      const pipeline = NAV_PIPELINES.find(p => p.id === url.searchParams.get('pipelineId'));
+      if (opportunityId && pipeline) choices.set(opportunityId, pipeline);
+    }
+    if (!choices.size) throw new Error('Pipeline metadata is unavailable. Open the Opportunities board first.');
+    const selected = await new Promise(resolve => {
+      const previousFocus = document.activeElement;
+      const dialog = document.createElement('dialog');
+      dialog.id = 'pertama-stage-queue';
+      dialog.setAttribute('aria-labelledby', 'pertama-stage-queue-title');
+      dialog.style.cssText = 'width:min(500px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid #e4e7ec;border-radius:14px;padding:24px;font:14px/1.5 sans-serif;color:#182230;background:#fff';
+      dialog.innerHTML = `<style>
+        #pertama-stage-queue::backdrop{background:#10182866}
+        #pertama-stage-queue label{display:block;margin:16px 0}
+        #pertama-stage-queue select{display:block;width:100%;margin-top:6px;padding:8px;font:inherit}
+        #pertama-stage-queue button{padding:8px 12px;margin-right:8px;font:inherit;cursor:pointer}
+        </style><form><h2 id="pertama-stage-queue-title">Choose the original stage queue</h2>
+        <p>The stage when you opened this lead was not captured. Choose the pipeline opportunity and original stage to work through—even if you have already moved this lead.</p>
+        <label>Opportunity<select name="opportunity" required></select></label>
+        <label>Original stage<select name="stage" required></select></label>
+        <button type="button" data-cancel>Cancel</button><button type="submit">Use this queue</button></form>`;
+      const form = dialog.querySelector('form');
+      const opportunity = form.elements.namedItem('opportunity');
+      const stage = form.elements.namedItem('stage');
+      opportunity.add(new Option('Select an opportunity…', ''));
+      for (const [opportunityId, pipeline] of choices) opportunity.add(new Option(`${pipeline.name} · ${opportunityId}`, opportunityId));
+      const origin = readOrigin(id);
+      opportunity.value = choices.has(origin?.opportunityId) ? origin.opportunityId : choices.size === 1 ? choices.keys().next().value : '';
+      function updateStages() {
+        stage.replaceChildren(new Option('Select the original stage…', ''));
+        const pipeline = choices.get(opportunity.value);
+        for (const [name, stageId] of Object.entries(pipeline?.stages || {})) stage.add(new Option(name, stageId));
+      }
+      opportunity.addEventListener('change', updateStages);
+      updateStages();
+      let closed = false;
+      function finish(value) {
+        if (closed) return;
+        closed = true;
+        dialog.close(); dialog.remove(); previousFocus?.focus(); resolve(value);
+      }
+      dialog.querySelector('[data-cancel]').addEventListener('click', () => finish(null));
+      dialog.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
+      dialog.addEventListener('keydown', event => event.stopPropagation());
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        if (!form.reportValidity()) return;
+        const pipeline = choices.get(opportunity.value);
+        if (!pipeline || !Object.values(pipeline.stages).includes(stage.value)) return;
+        finish({ contactId: id, opportunityId: opportunity.value, pipelineId: pipeline.id, stageId: stage.value });
+      });
+      document.body.appendChild(dialog); dialog.showModal();
+      dialog.querySelector('[data-cancel]').focus();
+    });
+    if (!selected) return null;
+    if (contactId() !== id || stageRouteRevision !== routeRevision || !location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Contact changed during stage queue selection. Nothing saved.');
+    pinStageQueue(selected);
+    return stageQueueContext();
+  }
+
   async function nextLead() {
     if (busy) return;
     busy = true;
     nextButton.disabled = true;
     try {
       if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Open the Pertama account first.');
+      if (settings.priority === 'stage' && !await ensureStageQueue()) return;
       const lead = await findNextActionable();
       if (lead) openLead(lead);
-      else taskNotice('No leads or pending tasks match your selected queues and saved filters.');
+      else taskNotice(emptyQueueMessage());
     } catch (error) {
-      console.error('[Pertama Next lead v0.2.8]', error);
+      console.error('[Pertama Next lead v0.2.9]', error);
       taskNotice(`Next lead stopped: ${error.message} No records were changed.`, true);
     } finally {
       busy = false;
       nextButton.disabled = false;
-      nextButton.textContent = 'Next lead';
+      nextButton.textContent = nextLeadLabel();
     }
   }
 
@@ -766,7 +992,7 @@
       }, `task "${title}" marked complete or removed from the pending list`);
       taskNotice(`Completed: ${title}`);
     } catch (error) {
-      const report = `Pertama call task — v0.2.8\nContact ID: ${id}\n${error.message}\n${attempted
+      const report = `Pertama call task — v0.2.9\nContact ID: ${id}\n${error.message}\n${attempted
         ? `Completion clicked for "${title}", but not verified. Inspect it before retrying.`
         : 'Task completion was not clicked.'}\nNo automatic retry.`;
       console.error(report, error);
@@ -948,7 +1174,9 @@
       field('sms').checked = false;
       field('sms').disabled = Boolean(sms.error);
       field('smsText').value = renderTemplate(settings.sms, { firstName, name });
-      dialog.querySelector('[data-next]').textContent = 'After saving: open the next lead using your selected pipelines and lead priority.';
+      dialog.querySelector('[data-next]').textContent = settings.priority === 'stage'
+        ? `After saving — ${stageQueueLabel()}. No other queues or tasks will be used.`
+        : 'After saving: open the next lead using your selected pipelines and lead priority.';
       field('noteText').value = renderTemplate(settings.note, { firstName, name });
       field('task').checked = Boolean(due);
       field('task').disabled = !due;
@@ -1023,9 +1251,17 @@
         pendingSave = saved.pendingSave || '';
         throw new Error(`Repeat run blocked: an unfinished no-answer action exists from ${saved.time}. Stage/note/task changes may already be saved. Reconcile that action before starting another; refreshing does not clear this block.`);
       }
-      if (settings.pipelineIds?.length) {
+      if (settings.pipelineIds?.length || settings.priority === 'stage') {
         progress('Checking navigation identity…');
         await requireVerifiedUser();
+      }
+      if (settings.priority === 'stage') {
+        progress('Checking stage queue…');
+        const context = await ensureStageQueue();
+        if (!context) return;
+        // Refresh the action origin from the queue, including after a page reload.
+        pinStageQueue(context.queue);
+        guardedStageQueue = context.queue;
       }
       progress('Reading contact…');
       const { name, firstName } = await readContactName();
@@ -1049,7 +1285,7 @@
       const opportunityId = linkId(link);
       const originalPipelineId = new URL(link.href).searchParams.get('pipelineId');
       const pipeline = NAV_PIPELINES.find(p => p.id === originalPipelineId);
-      if (!opportunityId || !pipeline || origin && origin.pipeline !== pipeline.name) throw new Error('Original opportunity/pipeline could not be verified. Nothing saved.');
+      if (!opportunityId || !pipeline || origin && (origin.pipelineId ? origin.pipelineId !== pipeline.id : origin.pipeline !== pipeline.name)) throw new Error('Original opportunity/pipeline could not be verified. Nothing saved.');
       const pipelineName = pipeline.name;
       link.click();
       const stageControl = await wait(() => all('#OpportunityStage')[0], 'opportunity stage #OpportunityStage');
@@ -1160,13 +1396,14 @@
       localStorage.removeItem(checkpointKey(startingContact));
       progress('Opening next lead…');
       guardedContact = null; // Navigation is allowed only after the saves succeeded.
+      guardedStageQueue = null;
       const next = await findNextActionable();
       if (next) openLead(next);
-      else taskNotice('Selected actions saved. No leads or pending tasks match your selected queues and saved filters.');
+      else taskNotice(`Selected actions saved. ${emptyQueueMessage()}`);
 
     } catch (error) {
       const report = [
-        'Pertama No answer — v0.2.8', `Stopped: ${step}`,
+        'Pertama No answer — v0.2.9', `Stopped: ${step}`,
         `Contact ID: ${startingContact}`, `Current path: ${location.pathname}`,
         '', error.message || String(error), '',
         'Completed actions (verification noted below):', completed.join('\n') || 'None confirmed.',
@@ -1179,11 +1416,12 @@
       alert(report);
     } finally {
       guardedContact = null;
+      guardedStageQueue = null;
       busy = false;
       receiptBatch = null;
       runButton.disabled = false;
       runButton.textContent = 'Save and next';
-      nextButton.textContent = 'Next lead';
+      nextButton.textContent = nextLeadLabel();
     }
   }
 
@@ -1222,7 +1460,8 @@
       <label>Task title template<input name="task" required></label>
       <label>Default SMS<textarea name="sms" rows="4" required></textarea></label>
       <p>Call-task completion matches the current task title template exactly. Tasks created with an older template will need manual completion.</p>
-      <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option></select></label>
+      <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option><option value="stage">Same stage only</option></select></label>
+      <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; if it was not captured, you will be asked to choose it. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
       <label>New lead stage name<input name="newLeadStage" required></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups use your saved task-list filters. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
       <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Leave follow-up days blank for no task. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
@@ -1288,11 +1527,12 @@
           next.rules[stage] = { next: row.querySelector('[data-next]').value.trim(), days: rawDays === '' ? null : Number(rawDays), updateStage: row.querySelector('[data-update]').checked };
         }
         validateSettings(next);
-        for (const id of next.pipelineIds) {
+        for (const id of next.priority === 'stage' ? [] : next.pipelineIds) {
           const pipeline = NAV_PIPELINES.find(p => p.id === id);
           if (!pipeline || !pipeline.stages[next.newLeadStage]) throw new Error(`${pipeline?.name || 'Unavailable pipeline'} has no ${next.newLeadStage} stage. Disable it or change the stage name.`);
         }
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); settings = next; close(); taskNotice('Workflow settings saved.');
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); settings = next; close();
+        nextButton.textContent = nextLeadLabel(); taskNotice('Workflow settings saved.');
       } catch (error) { dialog.querySelector('[data-error]').textContent = error.message; }
     });
     document.body.appendChild(dialog); dialog.showModal();
@@ -1333,6 +1573,8 @@
   settingsButton.addEventListener('click', openSettings);
   // Keep the button immediately after Companies, including after SPA navigation.
   function placeButton() {
+    syncStageQueue();
+    if (!busy) nextButton.textContent = nextLeadLabel();
     const companies = document.getElementById('tb_business');
     runButton.hidden = !contactId() || !visible(companies);
     if (!runButton.hidden && companies.nextElementSibling !== runButton) {
