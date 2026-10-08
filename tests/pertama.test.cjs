@@ -20,7 +20,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = false } = {}) {
   const virtualConsole = new VirtualConsole();
   const dom = new JSDOM('<!doctype html><body><nav><a>Message hub</a><a>Settings</a></nav><button id="tb_business">Companies</button></body>', {
-    url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', virtualConsole,
+    url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole,
   });
   t.after(() => dom.window.close());
   const w = dom.window;
@@ -75,6 +75,59 @@ function result(hits, stageId = 'stage-atc') {
 function fields(filters, name) {
   return filters.flatMap(f => f.filters ? fields(f.filters, name) : f.field === name ? [f] : []);
 }
+
+test('unchanged captured queries do not repeatedly write localStorage', t => {
+  const h = harness(t);
+  const originalSet = h.w.Storage.prototype.setItem;
+  let writes = 0;
+  h.w.Storage.prototype.setItem = function (key, value) {
+    if (key === 'pertama:query:pipe-a') writes++;
+    return originalSet.call(this, key, value);
+  };
+  h.evaluate("rememberQuery('/opportunities/search', defaultPipelineQuery(NAV_PIPELINES[0]))");
+  h.evaluate("rememberQuery('/opportunities/search', defaultPipelineQuery(NAV_PIPELINES[0]))");
+  assert.equal(writes, 1);
+  h.evaluate("rememberQuery('/opportunities/search', { ...defaultPipelineQuery(NAV_PIPELINES[0]), query: 'changed' })");
+  assert.equal(writes, 2);
+  assert.equal(h.evaluate("queryTemplates['pipe-a'].query"), 'changed');
+});
+
+test('failed optional query persistence can retry, then deduplicates after success', t => {
+  const h = harness(t);
+  const originalSet = h.w.Storage.prototype.setItem;
+  let writes = 0;
+  h.w.Storage.prototype.setItem = function (key, value) {
+    if (key === 'pertama:query:pipe-a' && ++writes === 1) throw new Error('Storage full');
+    return originalSet.call(this, key, value);
+  };
+  for (let i = 0; i < 3; i++) h.evaluate("rememberQuery('/opportunities/search', defaultPipelineQuery(NAV_PIPELINES[0]))");
+  assert.equal(writes, 2);
+  assert.equal(JSON.parse(h.w.localStorage.getItem('pertama:query:pipe-a')).locationId, LOCATION);
+});
+
+test('unchanged authentication is not decoded repeatedly but changed credentials are verified', t => {
+  const h = harness(t);
+  let decodes = 0;
+  const originalAtob = h.w.atob.bind(h.w);
+  h.w.atob = value => { decodes++; return originalAtob(value); };
+  for (let i = 0; i < 5; i++) h.evaluate("captureReadHeaders('https://services.leadconnectorhq.com/contacts', liveReadHeaders)");
+  assert.equal(decodes, 0);
+  const claims = { user_id: 'user-b', sub: 'user-b', locations: [LOCATION], exp: Math.floor(Date.now() / 1000) + 3600 };
+  const authorization = `Bearer test.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.test`;
+  h.evaluate(`captureReadHeaders('https://services.leadconnectorhq.com/contacts', { authorization: ${JSON.stringify(authorization)} })`);
+  assert.equal(decodes, 1);
+  assert.equal(h.evaluate('currentUserId'), 'user-b');
+});
+
+test('cached authentication still expires and rejects malformed replacement tokens', async t => {
+  const h = harness(t);
+  h.w.Date.now = () => Date.now() + 7200000;
+  h.evaluate("captureReadHeaders('https://services.leadconnectorhq.com/contacts', liveReadHeaders)");
+  await assert.rejects(h.evaluate('requireVerifiedUser()'), /verified|expired/i);
+  h.evaluate("captureReadHeaders('https://services.leadconnectorhq.com/contacts', { authorization: 'Bearer invalid' })");
+  assert.equal(h.evaluate('currentUserId'), null);
+  await assert.rejects(h.evaluate('requireVerifiedUser()'), /verified|unreadable/i);
+});
 
 test('priority validation accepts stage but rejects unknown modes', t => {
   const h = harness(t);

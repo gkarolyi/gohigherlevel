@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      0.2.11
+// @version      0.2.12
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @match        https://go.pertamaproperty.com/*
 // @run-at       document-start
@@ -18,6 +18,7 @@
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
+  let refreshButtons = () => {};
   const SETTINGS_KEY = `pertama:settings:${LOCATION_ID}`;
   const CATALOG_KEY = `pertama:pipelines:${LOCATION_ID}`;
   const SETTINGS_DEFAULTS = {
@@ -78,6 +79,7 @@
     const pipelines = normalizePipelines(data);
     localStorage.setItem(CATALOG_KEY, JSON.stringify({ pipelines }));
     NAV_PIPELINES.splice(0, NAV_PIPELINES.length, ...pipelines);
+    refreshButtons();
   }
   try {
     const cached = JSON.parse(localStorage.getItem(CATALOG_KEY) || 'null');
@@ -98,7 +100,7 @@
   let currentUserId = null;
   let identityStatus = 'Awaiting CRM authentication headers';
   let identityExpires = 0;
-  window.pertamaUserDiagnostics = () => ({ version: '0.2.11', status: identityStatus,
+  window.pertamaUserDiagnostics = () => ({ version: '0.2.12', status: identityStatus,
     verified: Boolean(currentUserId) && identityExpires > Date.now() / 1000 });
   async function requireVerifiedUser() {
     if (!currentUserId || identityExpires <= Date.now() / 1000) {
@@ -146,6 +148,7 @@
   }
   // Generic request shape; captured CRM searches preserve the user's filters/order.
   const queryTemplates = {};
+  const persistedQueries = new Map();
   function defaultPipelineQuery(pipeline) {
     return {
       locationId: LOCATION_ID,
@@ -193,8 +196,9 @@
       for (const key of ['token-id', 'authorization']) {
         if (incoming.has(key)) safe[key] = incoming.get(key);
       }
+      const unchanged = liveReadHeaders && ['token-id', 'authorization'].every(key => liveReadHeaders[key] === safe[key]);
       liveReadHeaders = safe;
-      bindUserSession(safe);
+      if (!unchanged) bindUserSession(safe); // Expiry is still checked whenever identity is required.
     } catch { /* Never interfere with CRM traffic. */ }
   }
   function filterValues(filters, field) {
@@ -212,7 +216,13 @@
       && !JSON.stringify(body.filters).includes('TASK_CONTACT_ASSOCIATION')) key = 'tasks';
     if (key) {
       queryTemplates[key] = body;
-      try { localStorage.setItem(`pertama:query:${key}`, JSON.stringify(body)); } catch { /* Memory copy is enough. */ }
+      const serialized = JSON.stringify(body);
+      if (persistedQueries.get(key) !== serialized) {
+        try {
+          localStorage.setItem(`pertama:query:${key}`, serialized);
+          persistedQueries.set(key, serialized);
+        } catch { /* Memory copy is enough; a later capture may retry persistence. */ }
+      }
     }
   }
   function captureQuery(method, url, body) {
@@ -405,12 +415,14 @@
 
   function clearStageQueue() {
     stageQueue = null;
+    refreshButtons();
     sessionStorage.removeItem(STAGE_QUEUE_KEY);
   }
   function syncStageQueue() {
     if (stageQueuePath === location.pathname) return;
     stageQueuePath = location.pathname;
     stageRouteRevision++;
+    refreshButtons();
     stageResults.clear();
     stageRevision++;
     if (stageQueue?.contactId !== contactId() || !location.pathname.includes(`/location/${LOCATION_ID}/`)) clearStageQueue();
@@ -445,6 +457,7 @@
     }));
     sessionStorage.setItem(STAGE_QUEUE_KEY, JSON.stringify(queue));
     stageQueue = queue;
+    refreshButtons();
   }
   function stageQueueLabel() {
     const context = stageQueueContext();
@@ -990,7 +1003,7 @@
       else taskNotice(emptyQueueMessage());
     } catch (error) {
       timingResult = 'stopped';
-      console.error('[Pertama Next lead v0.2.11]', error);
+      console.error('[Pertama Next lead v0.2.12]', error);
       taskNotice(`Next lead stopped: ${error.message} No records were changed.`, true);
     } finally {
       finishWorkflowTiming(timingResult);
@@ -1073,7 +1086,7 @@
       }, `task "${title}" marked complete or removed from the pending list`);
       taskNotice(`Completed: ${title}`);
     } catch (error) {
-      const report = `Pertama call task — v0.2.11\nContact ID: ${id}\n${error.message}\n${attempted
+      const report = `Pertama call task — v0.2.12\nContact ID: ${id}\n${error.message}\n${attempted
         ? `Completion clicked for "${title}", but not verified. Inspect it before retrying.`
         : 'Task completion was not clicked.'}\nNo automatic retry.`;
       console.error(report, error);
@@ -1510,7 +1523,7 @@
       timingResult = 'stopped';
       finishWorkflowTiming(timingResult); // Do not count time spent reading the error alert.
       const report = [
-        'Pertama No answer — v0.2.11', `Stopped: ${step}`,
+        'Pertama No answer — v0.2.12', `Stopped: ${step}`,
         `Contact ID: ${startingContact}`, `Current path: ${location.pathname}`,
         '', error.message || String(error), '',
         'Completed actions (verification noted below):', completed.join('\n') || 'None confirmed.',
@@ -1640,15 +1653,17 @@
           if (!pipeline || !pipeline.stages[next.newLeadStage]) throw new Error(`${pipeline?.name || 'Unavailable pipeline'} has no ${next.newLeadStage} stage. Disable it or change the stage name.`);
         }
         localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); settings = next; close();
-        nextButton.textContent = nextLeadLabel(); taskNotice('Workflow settings saved.');
+        refreshButtons(); taskNotice('Workflow settings saved.');
       } catch (error) { dialog.querySelector('[data-error]').textContent = error.message; }
     });
     document.body.appendChild(dialog); dialog.showModal();
   }
 
   let runButton, nextButton;
+  let buttonsInitialized = false;
   function initializeButtons() {
-  if (document.getElementById('pertama-no-answer-button')) return;
+  if (buttonsInitialized) return;
+  buttonsInitialized = true;
   try {
     const savedNotice = JSON.parse(sessionStorage.getItem(SMS_NOTICE_KEY) || 'null');
     sessionStorage.removeItem(SMS_NOTICE_KEY);
@@ -1679,34 +1694,160 @@
   settingsButton.textContent = 'Workflow settings';
   settingsButton.style.cssText = 'display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:calc(100% - 20px);min-height:42px;margin:10px;padding:10px 8px;background:#155eef;color:white;border:1px solid #528bff;border-radius:8px;font:600 14px/1.25 sans-serif;white-space:normal;cursor:pointer;flex-shrink:0';
   settingsButton.addEventListener('click', openSettings);
-  // Keep the button immediately after Companies, including after SPA navigation.
-  function placeButton() {
-    recordNavigationReady();
-    syncStageQueue();
-    if (!busy) nextButton.textContent = nextLeadLabel();
-    const companies = document.getElementById('tb_business');
-    runButton.hidden = !contactId() || !visible(companies);
-    if (!runButton.hidden && companies.nextElementSibling !== runButton) {
-      companies.insertAdjacentElement('afterend', runButton);
+  // No idle polling. Discover once, then watch only the hosts and their ancestry.
+  let messageHub = null, settingsAnchor = null, companies = null;
+  let frame = null, discoveryTimer = null, discoveryExpired = false;
+  let discoveryActive = false, observedWidthTarget = null, observedWidth = null;
+  let lastPath = location.pathname;
+  const rootsToDiscover = new Set([document]);
+  const knownAnchors = new Set();
+  const owned = node => (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement)?.closest('[id^="pertama-"]');
+  function relevantMutations(records) {
+    if (document.hidden) return;
+    let changed = false;
+    for (const record of records) {
+      if (owned(record.target)) continue;
+      const nodes = [...record.addedNodes, ...record.removedNodes];
+      const removedControl = [...record.removedNodes].some(node =>
+        [runButton, nextButton, settingsButton].includes(node) && !node.isConnected);
+      if (record.type === 'childList' && nodes.length && nodes.every(owned) && !removedControl) continue;
+      changed = true;
+      for (const node of record.addedNodes) if (node.nodeType === Node.ELEMENT_NODE && !owned(node)) rootsToDiscover.add(node);
+      const target = record.target.nodeType === Node.ELEMENT_NODE ? record.target : record.target.parentElement;
+      const control = target?.closest('a, button');
+      if (control) rootsToDiscover.add(control);
+      else if (record.type === 'attributes' && target !== document.body && target !== document.documentElement) rootsToDiscover.add(target);
     }
-    const messageHub = all('a, button').find(el => /^message hub$/i.test(text(el)));
-    const settings = all('a, button').find(el => /^settings$/i.test(text(el)));
-    const inAccount = location.pathname.includes(`/location/${LOCATION_ID}/`);
-    nextButton.hidden = !inAccount || !(messageHub || settings);
-    nextButton.style.display = nextButton.hidden ? 'none' : 'flex';
-    settingsButton.hidden = !inAccount || !settings;
-    settingsButton.style.display = settingsButton.hidden ? 'none' : 'flex';
-    if (!settingsButton.hidden && settings.previousElementSibling !== settingsButton) settings.insertAdjacentElement('beforebegin', settingsButton);
-    if (!nextButton.hidden) {
-      if (messageHub && messageHub.nextElementSibling !== nextButton) messageHub.insertAdjacentElement('afterend', nextButton);
-      else if (!messageHub && settingsButton.previousElementSibling !== nextButton) settingsButton.insertAdjacentElement('beforebegin', nextButton);
-      const width = (messageHub || settings).getBoundingClientRect().width;
-      nextButton.style.fontSize = width < 100 ? '11px' : '15px';
-      settingsButton.style.fontSize = width < 100 ? '11px' : '14px';
+    if (changed) refreshButtons();
+  }
+  const hostObserver = new MutationObserver(relevantMutations);
+  const discoveryObserver = new MutationObserver(relevantMutations);
+  const widthObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => {
+    const entry = entries.find(item => item.target === observedWidthTarget);
+    if (entry && entry.contentRect.width !== observedWidth) {
+      observedWidth = entry.contentRect.width;
+      refreshButtons();
+    }
+  }) : null;
+  function stopDiscovery() {
+    discoveryObserver.disconnect(); discoveryActive = false;
+    clearTimeout(discoveryTimer); discoveryTimer = null;
+  }
+  function discover(root) {
+    if (!root?.isConnected && root !== document) return;
+    let needHub = !visible(messageHub), needSettings = !visible(settingsAnchor);
+    if (!needHub && !needSettings) return;
+    const candidates = root.matches?.('a, button') ? [root, ...root.querySelectorAll('a, button')] : root.querySelectorAll('a, button');
+    for (const el of candidates) {
+      if (owned(el)) continue;
+      const label = text(el);
+      if (needHub && /^message hub$/i.test(label) && visible(el)) { messageHub = el; knownAnchors.add(el); needHub = false; }
+      if (needSettings && /^settings$/i.test(label) && visible(el)) { settingsAnchor = el; knownAnchors.add(el); needSettings = false; }
+      if (!needHub && !needSettings) break;
     }
   }
+  function watchHosts() {
+    hostObserver.disconnect();
+    for (const el of knownAnchors) if (!el.isConnected) knownAnchors.delete(el);
+    const hosts = [companies, ...knownAnchors].filter(el => el?.isConnected);
+    // An anchor's parent could be the entire app. Only anchors and explicit navigation
+    // containers get subtree observation; all other ancestors get direct-child checks.
+    const localRoots = new Set(hosts);
+    for (const el of hosts) {
+      const nav = el.closest('nav, [role="navigation"]');
+      if (nav) localRoots.add(nav);
+    }
+    const ancestors = new Set([document.body]);
+    for (const el of hosts) for (let node = el; node; node = node.parentElement) ancestors.add(node);
+    for (const node of ancestors) hostObserver.observe(node, {
+      childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'], characterData: true,
+      subtree: localRoots.has(node) && node !== document.body && node !== document.documentElement,
+    });
+  }
+  function setDisplay(button, show, display) {
+    if (button.hidden !== !show) button.hidden = !show;
+    if (display && button.style.display !== (show ? display : 'none')) button.style.display = show ? display : 'none';
+  }
+  refreshButtons = () => {
+    if (document.hidden || frame !== null) return;
+    frame = requestAnimationFrame(() => { frame = null; placeButton(); });
+  };
+  function wakeDiscovery() {
+    stopDiscovery(); discoveryExpired = false;
+    rootsToDiscover.add(document);
+    refreshButtons();
+  }
+  function placeButton() {
+    if (document.hidden) return;
+    recordNavigationReady();
+    syncStageQueue();
+    if (lastPath !== location.pathname) {
+      lastPath = location.pathname;
+      stopDiscovery(); discoveryExpired = false;
+      rootsToDiscover.add(document);
+    }
+    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
+      setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
+      hostObserver.disconnect(); stopDiscovery(); widthObserver?.disconnect();
+      observedWidthTarget = null; observedWidth = null;
+      return;
+    }
+    const validHub = messageHub?.isConnected && /^message hub$/i.test(text(messageHub));
+    const validSettings = settingsAnchor?.isConnected && /^settings$/i.test(text(settingsAnchor));
+    const lostAnchor = messageHub && !validHub || settingsAnchor && !validSettings;
+    if (!validHub) messageHub = null;
+    if (!validSettings) settingsAnchor = null;
+    if (lostAnchor && !rootsToDiscover.size) rootsToDiscover.add(document);
+    for (const root of rootsToDiscover) discover(root);
+    rootsToDiscover.clear();
+    companies = document.getElementById('tb_business');
+
+    // Finish layout reads before any writes; never measure unrelated page controls.
+    const showRun = Boolean(contactId() && visible(companies));
+    const hub = visible(messageHub) ? messageHub : null;
+    const settings = visible(settingsAnchor) ? settingsAnchor : null;
+    const widthTarget = hub || settings;
+    if (widthTarget !== observedWidthTarget) {
+      widthObserver?.disconnect(); observedWidthTarget = widthTarget; observedWidth = null;
+      if (widthTarget) widthObserver?.observe(widthTarget);
+    }
+    const width = widthTarget ? (widthObserver ? observedWidth : null) ?? widthTarget.getBoundingClientRect().width : null;
+    if (widthTarget) observedWidth = width;
+    const label = nextLeadLabel();
+
+    if (!busy && nextButton.textContent !== label) nextButton.textContent = label;
+    setDisplay(runButton, showRun);
+    setDisplay(nextButton, Boolean(widthTarget), 'flex');
+    setDisplay(settingsButton, Boolean(settings), 'flex');
+    if (showRun && companies.nextElementSibling !== runButton) companies.insertAdjacentElement('afterend', runButton);
+    if (settings && settings.previousElementSibling !== settingsButton) settings.insertAdjacentElement('beforebegin', settingsButton);
+    if (hub && hub.nextElementSibling !== nextButton) hub.insertAdjacentElement('afterend', nextButton);
+    else if (!hub && settings && settingsButton.previousElementSibling !== nextButton) settingsButton.insertAdjacentElement('beforebegin', nextButton);
+    if (width !== null) {
+      const nextSize = width < 100 ? '11px' : '15px', settingsSize = width < 100 ? '11px' : '14px';
+      if (nextButton.style.fontSize !== nextSize) nextButton.style.fontSize = nextSize;
+      if (settingsButton.style.fontSize !== settingsSize) settingsButton.style.fontSize = settingsSize;
+    }
+    watchHosts();
+    const missingHosts = !widthTarget || Boolean(contactId() && !companies);
+    if (!missingHosts) stopDiscovery();
+    else if (!discoveryActive && !discoveryExpired) {
+      discoveryObserver.observe(document.body, { childList: true, subtree: true }); discoveryActive = true;
+      discoveryTimer = setTimeout(() => { stopDiscovery(); discoveryExpired = true; }, 30000);
+    }
+  }
+  window.addEventListener('resize', () => { observedWidth = null; rootsToDiscover.add(document); refreshButtons(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = null; stopDiscovery();
+    } else { observedWidth = null; wakeDiscovery(); }
+  });
+  document.addEventListener('click', () => {
+    if (location.pathname.includes(`/location/${LOCATION_ID}/`) &&
+      (!(messageHub?.isConnected || settingsAnchor?.isConnected) || contactId() && !companies?.isConnected)) wakeDiscovery();
+  }, true);
   placeButton();
-  setInterval(placeButton, 500);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initializeButtons, { once: true });
   else initializeButtons();

@@ -69,6 +69,6 @@ Install/reload, perform representative workflows, then inspect:
 console.table(window.pertamaWorkflowTimings)
 ```
 
-The last 50 records stay in this browser tab across reloads. `elapsedMs` is milliseconds; `Total` includes human confirmation/queue-selection time. Those waits have separate phases, so do not mistake them for CRM latency. `Navigation / Contact toolbar visible` is an approximate UI milestone sampled by button placement (up to 500 ms polling delay), not proof that every CRM panel is ready. Navigation markers expire after two minutes; records contain no contact IDs, phone numbers, message contents, or credentials.
+The last 50 records stay in this browser tab across reloads. `elapsedMs` is milliseconds; `Total` includes human confirmation/queue-selection time. Those waits have separate phases, so do not mistake them for CRM latency. `Navigation / Contact toolbar visible` is an approximate UI milestone observed during button placement, not proof that every CRM panel is ready. As of v0.2.12, placement is event-driven rather than polled every 500 ms. Navigation markers expire after two minutes; records contain no contact IDs, phone numbers, message contents, or credentials.
 
 Compare preparation, confirmation, saves, lookup, and navigation separately. Automation tests prove avoided clicks and overlapping waits, not live GHL speedups. Further response caching/navigation changes depend on these measurements and actual response/UI inspection.

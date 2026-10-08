@@ -14,7 +14,7 @@ const row = (action, phase, elapsedMs, result = 'ok') => ({ action, phase, elaps
 
 function harness(t, { route = ROUTE, session = {}, denied = false, hidden = false, now = 10000, origin = 5000 } = {}) {
   const dom = new JSDOM('<!doctype html><body><nav><a>Message hub</a><a>Settings</a></nav><button id="tb_business">Companies</button></body>', {
-    url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', virtualConsole: new VirtualConsole(),
+    url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: new VirtualConsole(),
   });
   t.after(() => dom.window.close());
   const w = dom.window;
