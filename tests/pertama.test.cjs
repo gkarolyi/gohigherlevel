@@ -489,3 +489,153 @@ test('mutation start and settlement do not drift the pinned original stage', t =
   h.evaluate('finishStageWrite(__write)');
   assert.deepEqual(plain(h.evaluate('stageQueueContext().queue')), queue);
 });
+
+// Advance only the polling clock/sleep boundary; exercise the real readiness loop.
+function fastPolling(h) {
+  h.w.__elapsed = 0;
+  h.w.Date.now = () => h.w.__elapsed;
+  const originalTimeout = h.w.setTimeout.bind(h.w);
+  h.w.setTimeout = (callback, ms, ...args) => {
+    if (ms !== 150) return originalTimeout(callback, ms, ...args);
+    h.w.__elapsed += ms;
+    queueMicrotask(() => callback(...args));
+    return 0;
+  };
+}
+function smsControls({ channel = 'SMS', internal = false, draft = 'Existing unsent draft' } = {}) {
+  return `<button id="conv-channel-bar-provider-trigger">${channel}</button>
+    <button id="conv-channel-bar-internal-comment-toggle" aria-pressed="${internal}">Internal comment</button>
+    <button id="contact-select-trigger">+628111111111</button>
+    <div data-to><span>To:</span> +628222222222</div>
+    <textarea id="conv-composer-textarea-input">${draft}</textarea>
+    <button id="conv-send-button-simple">Send</button>`;
+}
+function mountComposer(h, contents = smsControls()) {
+  const root = h.w.document.createElement('div');
+  root.id = 'composer-textarea'; root.innerHTML = contents;
+  h.w.document.body.append(root);
+  return root;
+}
+
+for (const eventName of ['focus', 'click']) {
+  test(`visible composer wrapper still activates its lazy editor on ${eventName}`, async t => {
+    const h = harness(t); fastPolling(h);
+    const root = mountComposer(h, '<textarea id="composer-input-contact-a" placeholder="Type a message"></textarea>');
+    const placeholder = root.querySelector('textarea');
+    let activations = 0;
+    placeholder.addEventListener(eventName, () => { activations++; root.innerHTML = smsControls(); });
+    const context = await h.evaluate('prepareSms()');
+    assert.equal(context.error, undefined, context.error);
+    assert.equal(activations, 1);
+    assert.equal(context.to, '+628222222222');
+    assert.equal(context.draft, 'Existing unsent draft');
+    assert.equal(h.requests.length, 0);
+  });
+}
+
+test('collapsed composer can expand then activate a second lazy textarea', async t => {
+  const h = harness(t); fastPolling(h);
+  const trigger = h.w.document.createElement('button');
+  trigger.id = 'conv-composer-inline-expand-trigger'; h.w.document.body.append(trigger);
+  let expansions = 0, activations = 0;
+  trigger.addEventListener('click', () => {
+    expansions++;
+    const root = mountComposer(h, '<textarea placeholder="Type a message"></textarea>');
+    root.querySelector('textarea').addEventListener('focus', () => {
+      activations++; root.innerHTML = smsControls();
+    });
+  });
+  const context = await h.evaluate('prepareSms()');
+  assert.equal(context.error, undefined, context.error);
+  assert.equal(expansions, 1, 'the still-visible expansion button must not be clicked again');
+  assert.equal(activations, 1);
+});
+
+test('ready composer is read without focusing, clicking or changing its draft', async t => {
+  const h = harness(t); fastPolling(h);
+  const root = mountComposer(h);
+  let interactions = 0;
+  root.addEventListener('focus', () => interactions++, true);
+  root.addEventListener('click', () => interactions++);
+  const context = await h.evaluate('prepareSms()');
+  assert.equal(context.error, undefined);
+  assert.equal(context.draft, 'Existing unsent draft');
+  assert.equal(interactions, 0);
+  assert.equal(h.w.__elapsed, 0);
+});
+
+test('failed activation has one short total budget and never toggles repeatedly', async t => {
+  const h = harness(t); fastPolling(h);
+  const root = mountComposer(h, '<button id="conv-composer-inline-expand-trigger">Expand</button>');
+  let clicks = 0;
+  root.querySelector('button').addEventListener('click', () => clicks++);
+  const context = await h.evaluate('prepareSms()');
+  assert.match(context.error, /timed out/i);
+  assert.equal(clicks, 1);
+  assert.ok(h.w.__elapsed <= 5250, `SMS preparation took ${h.w.__elapsed}ms`);
+  assert.equal(h.requests.length, 0);
+});
+
+test('absent composer uses the same short preparation budget', async t => {
+  const h = harness(t); fastPolling(h);
+  const context = await h.evaluate('prepareSms()');
+  assert.match(context.error, /timed out/i);
+  assert.ok(h.w.__elapsed <= 5250, `Missing composer took ${h.w.__elapsed}ms`);
+});
+
+test('disabled expansion control is never activated', async t => {
+  const h = harness(t); fastPolling(h);
+  const root = mountComposer(h, '<button id="conv-composer-inline-expand-trigger" aria-disabled="true">Expand</button>');
+  let interactions = 0;
+  root.addEventListener('focus', () => interactions++, true);
+  root.addEventListener('click', () => interactions++);
+  const context = await h.evaluate('prepareSms()');
+  assert.ok(context.error);
+  assert.equal(interactions, 0);
+});
+
+for (const options of [{ channel: 'Email' }, { internal: true }]) {
+  test(`composer preparation does not switch unsafe channel state: ${JSON.stringify(options)}`, async t => {
+    const h = harness(t); fastPolling(h);
+    const root = mountComposer(h, smsControls(options));
+    let clicks = 0;
+    root.addEventListener('click', () => clicks++);
+    const context = await h.evaluate('prepareSms()');
+    assert.match(context.error, /select SMS|Internal Comment/i);
+    assert.equal(clicks, 0);
+    assert.equal(h.w.__elapsed, 0);
+  });
+}
+
+for (const changed of ['recipient', 'draft']) {
+  test(`SMS send still refuses a changed ${changed} after approval`, async t => {
+    const h = harness(t); fastPolling(h);
+    const root = mountComposer(h);
+    h.w.__approvedSms = await h.evaluate('prepareSms()');
+    h.evaluate('startingContact = contactId()');
+    if (changed === 'recipient') root.querySelector('[data-to]').innerHTML = '<span>To:</span> +628333333333';
+    else root.querySelector('textarea').value = 'Changed draft';
+    let sends = 0;
+    root.querySelector('#conv-send-button-simple').addEventListener('click', () => sends++);
+    await assert.rejects(h.evaluate("sendSmsOnce(__approvedSms, 'Approved message')"), /changed.*confirmation/i);
+    assert.equal(sends, 0);
+  });
+}
+
+for (const clears of [true, false]) {
+  test(`SMS sends only once when composer ${clears ? 'clears' : 'does not clear'}`, async t => {
+    const h = harness(t); fastPolling(h);
+    const root = mountComposer(h);
+    h.w.__approvedSms = await h.evaluate('prepareSms()');
+    h.evaluate('startingContact = contactId()');
+    let sends = 0;
+    root.querySelector('#conv-send-button-simple').addEventListener('click', () => {
+      sends++;
+      if (clears) root.querySelector('textarea').value = '';
+    });
+    const sent = h.evaluate("sendSmsOnce(__approvedSms, 'Approved message')");
+    if (clears) await sent;
+    else await assert.rejects(sent, /may already have been sent/i);
+    assert.equal(sends, 1);
+  });
+}

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      0.2.9
+// @version      0.2.10
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @match        https://go.pertamaproperty.com/*
 // @run-at       document-start
@@ -98,7 +98,7 @@
   let currentUserId = null;
   let identityStatus = 'Awaiting CRM authentication headers';
   let identityExpires = 0;
-  window.pertamaUserDiagnostics = () => ({ version: '0.2.9', status: identityStatus,
+  window.pertamaUserDiagnostics = () => ({ version: '0.2.10', status: identityStatus,
     verified: Boolean(currentUserId) && identityExpires > Date.now() / 1000 });
   async function requireVerifiedUser() {
     if (!currentUserId || identityExpires <= Date.now() / 1000) {
@@ -910,7 +910,7 @@
       if (lead) openLead(lead);
       else taskNotice(emptyQueueMessage());
     } catch (error) {
-      console.error('[Pertama Next lead v0.2.9]', error);
+      console.error('[Pertama Next lead v0.2.10]', error);
       taskNotice(`Next lead stopped: ${error.message} No records were changed.`, true);
     } finally {
       busy = false;
@@ -992,7 +992,7 @@
       }, `task "${title}" marked complete or removed from the pending list`);
       taskNotice(`Completed: ${title}`);
     } catch (error) {
-      const report = `Pertama call task — v0.2.9\nContact ID: ${id}\n${error.message}\n${attempted
+      const report = `Pertama call task — v0.2.10\nContact ID: ${id}\n${error.message}\n${attempted
         ? `Completion clicked for "${title}", but not verified. Inspect it before retrying.`
         : 'Task completion was not clicked.'}\nNo automatic retry.`;
       console.error(report, error);
@@ -1027,21 +1027,29 @@
 
   async function prepareSms() {
     try {
-      const expanded = () => visible(document.getElementById('composer-textarea'));
-      // Wait for either state: the contact composer can mount after the rest of the page.
-      const target = await wait(() => expanded() ? { expanded: true } :
-        all('#conv-composer-inline-expand-trigger')[0] || all('[id^="composer-input-"]')[0],
-        'message composer or expansion trigger', () => controlState('#conv-composer-inline-expand-trigger'));
-      if (!target.expanded) {
-        target.click();
-        await wait(expanded, 'expanded message composer', () => controlState('#composer-textarea'));
-      }
-      await wait(() => {
+      const ready = () => {
         const root = document.getElementById('composer-textarea');
-        return visible(root?.querySelector('#conv-channel-bar-provider-trigger'))
-          && visible(root?.querySelector('#conv-composer-textarea-input'))
-          && visible(root?.querySelector('#conv-send-button-simple'));
-      }, 'message composer controls', () => controlState('#conv-composer-textarea-input'));
+        return visible(root) && visible(root.querySelector('#conv-channel-bar-provider-trigger'))
+          && visible(root.querySelector('#conv-composer-textarea-input'))
+          && visible(root.querySelector('#conv-send-button-simple'));
+      };
+      // The wrapper can exist before the editor is initialized. A real click also focuses
+      // the field; HTMLElement.click() alone does not. Never toggle an element twice.
+      const activated = new WeakSet();
+      await wait(() => {
+        if (ready()) return true;
+        const target = [
+          ...all('#conv-composer-inline-expand-trigger'),
+          ...all('[id^="composer-input-"]'),
+          ...all('#composer-textarea textarea'),
+        ].find(el => !activated.has(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+        if (target) {
+          activated.add(target);
+          target.focus({ preventScroll: true });
+          if (target.isConnected && !ready()) target.click();
+        }
+        return ready();
+      }, 'SMS composer activation', () => `${controlState('#conv-composer-textarea-input')}. Click the message field and reopen Save and next if SMS is needed.`, 5000);
       return smsContext();
     } catch (error) {
       return { error: error.message };
@@ -1271,6 +1279,7 @@
           .map(text).filter(t => t.length > 2).sort((a, b) => b.length - a.length)[0];
       }, 'contact owner in #owner-dropdown-trigger');
       const phone = nameInput('phone', 'Phone')?.value?.trim() || '';
+      progress('Preparing SMS…');
       const sms = await prepareSms();
       progress('Reading opportunity…');
       await openSidebar('sidebar-opportunities-icon');
@@ -1403,7 +1412,7 @@
 
     } catch (error) {
       const report = [
-        'Pertama No answer — v0.2.9', `Stopped: ${step}`,
+        'Pertama No answer — v0.2.10', `Stopped: ${step}`,
         `Contact ID: ${startingContact}`, `Current path: ${location.pathname}`,
         '', error.message || String(error), '',
         'Completed actions (verification noted below):', completed.join('\n') || 'None confirmed.',
