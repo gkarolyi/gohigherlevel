@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      0.2.10
+// @version      0.2.11
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @match        https://go.pertamaproperty.com/*
 // @run-at       document-start
@@ -98,7 +98,7 @@
   let currentUserId = null;
   let identityStatus = 'Awaiting CRM authentication headers';
   let identityExpires = 0;
-  window.pertamaUserDiagnostics = () => ({ version: '0.2.10', status: identityStatus,
+  window.pertamaUserDiagnostics = () => ({ version: '0.2.11', status: identityStatus,
     verified: Boolean(currentUserId) && identityExpires > Date.now() / 1000 });
   async function requireVerifiedUser() {
     if (!currentUserId || identityExpires <= Date.now() / 1000) {
@@ -382,6 +382,10 @@
       clearStageQueue();
       sessionStorage.removeItem(`pertama:origin:${lead.contactId}`);
     }
+    try {
+      sessionStorage.setItem(NAVIGATION_TIMING_KEY, JSON.stringify({ contactId: lead.contactId,
+        startedAt: Date.now(), sourceTimeOrigin: performance.timeOrigin }));
+    } catch { /* Optional timing must never prevent navigation. */ }
     location.assign(`/v2/location/${LOCATION_ID}/contacts/detail/${lead.contactId}`);
   }
 
@@ -650,6 +654,69 @@
   let pendingSave = '';
   let startingContact = '';
 
+  // Fixed phase labels and durations only: no names, IDs, credentials or message text.
+  const WORKFLOW_TIMINGS_KEY = `pertama:workflow-timings:${LOCATION_ID}`;
+  const NAVIGATION_TIMING_KEY = `pertama:navigation-timing:${LOCATION_ID}`;
+  const workflowTimings = [];
+  window.pertamaWorkflowTimings = workflowTimings;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(WORKFLOW_TIMINGS_KEY) || 'null');
+    for (const row of Array.isArray(saved) ? saved.slice(-50) : []) {
+      if (row && typeof row.action === 'string' && typeof row.phase === 'string'
+        && Number.isFinite(row.elapsedMs) && row.elapsedMs >= 0 && typeof row.result === 'string') {
+        const { action, phase, elapsedMs, result } = row;
+        workflowTimings.push({ action, phase, elapsedMs, result });
+      }
+    }
+  } catch { /* Timing history is optional. */ }
+  let activeWorkflowTiming = null;
+  function recordWorkflowTiming(action, phase, elapsedMs, result = 'ok') {
+    workflowTimings.push({ action, phase, elapsedMs: Math.max(0, Math.round(elapsedMs)), result });
+    if (workflowTimings.length > 50) workflowTimings.shift();
+    try { sessionStorage.setItem(WORKFLOW_TIMINGS_KEY, JSON.stringify(workflowTimings)); }
+    catch { /* In-memory measurements are enough if storage is unavailable. */ }
+  }
+  function startWorkflowTiming(action, phase) {
+    const now = performance.now();
+    activeWorkflowTiming = { action, phase, started: now, phaseStarted: now };
+  }
+  function markWorkflowTiming(phase) {
+    if (!activeWorkflowTiming) return;
+    const now = performance.now(), timing = activeWorkflowTiming;
+    recordWorkflowTiming(timing.action, timing.phase, now - timing.phaseStarted);
+    timing.phase = phase; timing.phaseStarted = now;
+  }
+  function finishWorkflowTiming(result) {
+    if (!activeWorkflowTiming) return;
+    const now = performance.now(), timing = activeWorkflowTiming;
+    activeWorkflowTiming = null;
+    recordWorkflowTiming(timing.action, timing.phase, now - timing.phaseStarted, result);
+    recordWorkflowTiming(timing.action, 'Total', now - timing.started, result);
+  }
+  function recordNavigationReady() {
+    try {
+      const raw = sessionStorage.getItem(NAVIGATION_TIMING_KEY);
+      if (!raw) return;
+      let pending;
+      try { pending = JSON.parse(raw); }
+      catch { sessionStorage.removeItem(NAVIGATION_TIMING_KEY); return; }
+      const elapsed = Date.now() - pending?.startedAt;
+      if (!pending || typeof pending.contactId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(pending.contactId)
+        || !Number.isFinite(pending.startedAt) || !Number.isFinite(pending.sourceTimeOrigin)
+        || elapsed < 0 || elapsed > 120000) {
+        sessionStorage.removeItem(NAVIGATION_TIMING_KEY); return;
+      }
+      // A visible toolbar in the source document is not a completed page load.
+      if (pending.sourceTimeOrigin === performance.timeOrigin) return;
+      if (!location.pathname.includes(`/location/${LOCATION_ID}/`) || pending.contactId !== contactId()) {
+        sessionStorage.removeItem(NAVIGATION_TIMING_KEY); return;
+      }
+      if (!visible(document.getElementById('tb_business'))) return;
+      sessionStorage.removeItem(NAVIGATION_TIMING_KEY);
+      recordWorkflowTiming('Navigation', 'Contact toolbar visible', elapsed);
+    } catch { /* Diagnostics must not interfere with the CRM or button placement. */ }
+  }
+
   function contactId() {
     return location.pathname.match(/\/(?:contacts|customers)\/detail\/([^/]+)/)?.[1];
   }
@@ -760,6 +827,7 @@
   }
 
   function progress(message) {
+    markWorkflowTiming(message);
     step = message;
     runButton.textContent = message;
   }
@@ -778,10 +846,16 @@
     return heading?.parentElement?.querySelector('input') || null;
   }
   async function readContactName() {
-    const selector = '#record-details-tabs div.hr-tabs-rail > div:nth-of-type(2) span';
-    (await wait(() => exact(selector, 'All fields'), 'All fields tab', () => controlState(selector))).click();
-    const first = await wait(() => nameInput('first_name', 'First name'), 'First name input in All fields');
-    const last = await wait(() => nameInput('last_name', 'Last name'), 'Last name input in All fields');
+    const inputs = () => {
+      const first = nameInput('first_name', 'First name'), last = nameInput('last_name', 'Last name');
+      return visible(first) && visible(last) ? { first, last } : null;
+    };
+    if (!inputs()) {
+      const selector = '#record-details-tabs div.hr-tabs-rail > div:nth-of-type(2) span';
+      (await wait(() => exact(selector, 'All fields'), 'All fields tab', () => controlState(selector))).click();
+    }
+    // Keep the contact/queue guards even when both inputs are already rendered.
+    const { first, last } = await wait(inputs, 'visible first and last name inputs');
     const firstName = first.value.trim();
     const name = [firstName, last.value.trim()].filter(Boolean).join(' ');
     if (!name) throw new Error('Contact name is empty.');
@@ -844,6 +918,7 @@
       if (opportunityId && pipeline) choices.set(opportunityId, pipeline);
     }
     if (!choices.size) throw new Error('Pipeline metadata is unavailable. Open the Opportunities board first.');
+    markWorkflowTiming('Awaiting queue selection…');
     const selected = await new Promise(resolve => {
       const previousFocus = document.activeElement;
       const dialog = document.createElement('dialog');
@@ -893,6 +968,7 @@
       document.body.appendChild(dialog); dialog.showModal();
       dialog.querySelector('[data-cancel]').focus();
     });
+    markWorkflowTiming('Checking stage queue…');
     if (!selected) return null;
     if (contactId() !== id || stageRouteRevision !== routeRevision || !location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Contact changed during stage queue selection. Nothing saved.');
     pinStageQueue(selected);
@@ -903,16 +979,21 @@
     if (busy) return;
     busy = true;
     nextButton.disabled = true;
+    let timingResult = 'ok';
+    startWorkflowTiming('Next lead', 'Checking navigation context');
     try {
       if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Open the Pertama account first.');
-      if (settings.priority === 'stage' && !await ensureStageQueue()) return;
+      if (settings.priority === 'stage' && !await ensureStageQueue()) { timingResult = 'cancelled'; return; }
+      markWorkflowTiming('Finding next lead');
       const lead = await findNextActionable();
-      if (lead) openLead(lead);
+      if (lead) { openLead(lead); timingResult = 'navigating'; }
       else taskNotice(emptyQueueMessage());
     } catch (error) {
-      console.error('[Pertama Next lead v0.2.10]', error);
+      timingResult = 'stopped';
+      console.error('[Pertama Next lead v0.2.11]', error);
       taskNotice(`Next lead stopped: ${error.message} No records were changed.`, true);
     } finally {
+      finishWorkflowTiming(timingResult);
       busy = false;
       nextButton.disabled = false;
       nextButton.textContent = nextLeadLabel();
@@ -992,7 +1073,7 @@
       }, `task "${title}" marked complete or removed from the pending list`);
       taskNotice(`Completed: ${title}`);
     } catch (error) {
-      const report = `Pertama call task — v0.2.10\nContact ID: ${id}\n${error.message}\n${attempted
+      const report = `Pertama call task — v0.2.11\nContact ID: ${id}\n${error.message}\n${attempted
         ? `Completion clicked for "${title}", but not verified. Inspect it before retrying.`
         : 'Task completion was not clicked.'}\nNo automatic retry.`;
       console.error(report, error);
@@ -1054,6 +1135,21 @@
     } catch (error) {
       return { error: error.message };
     }
+  }
+
+  async function readOwnerAndPrepareSms() {
+    // Only SMS preparation interacts with the UI. Owner lookup is a passive read.
+    // Drain both promises on failure so no activation continues after busy is released.
+    const results = await Promise.allSettled([
+      wait(() => {
+        const box = document.getElementById('owner-dropdown-trigger');
+        return [...(box?.querySelectorAll('*') || [])].filter(el => !el.children.length)
+          .map(text).filter(t => t.length > 2).sort((a, b) => b.length - a.length)[0];
+      }, 'contact owner in #owner-dropdown-trigger'),
+      prepareSms(),
+    ]);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
+    return { owner: results[0].value, sms: results[1].value };
   }
 
   async function sendSmsOnce(approved, message) {
@@ -1248,6 +1344,8 @@
     step = 'Checking contact page';
     guardedContact = contactId();
     startingContact = guardedContact || '(none)';
+    let timingResult = 'ok';
+    startWorkflowTiming('Save and next', step);
     try {
       if (!guardedContact || !location.pathname.includes(`/location/${LOCATION_ID}/`)) {
         throw new Error(`Expected a contact detail page in location ${LOCATION_ID}. Current path: ${location.pathname}`);
@@ -1266,21 +1364,16 @@
       if (settings.priority === 'stage') {
         progress('Checking stage queue…');
         const context = await ensureStageQueue();
-        if (!context) return;
+        if (!context) { timingResult = 'cancelled'; return; }
         // Refresh the action origin from the queue, including after a page reload.
         pinStageQueue(context.queue);
         guardedStageQueue = context.queue;
       }
       progress('Reading contact…');
       const { name, firstName } = await readContactName();
-      const owner = await wait(() => {
-        const box = document.getElementById('owner-dropdown-trigger');
-        return [...(box?.querySelectorAll('*') || [])].filter(el => !el.children.length)
-          .map(text).filter(t => t.length > 2).sort((a, b) => b.length - a.length)[0];
-      }, 'contact owner in #owner-dropdown-trigger');
       const phone = nameInput('phone', 'Phone')?.value?.trim() || '';
-      progress('Preparing SMS…');
-      const sms = await prepareSms();
+      progress('Reading owner and preparing SMS…');
+      const { owner, sms } = await readOwnerAndPrepareSms();
       progress('Reading opportunity…');
       await openSidebar('sidebar-opportunities-icon');
       const origin = readOrigin(startingContact);
@@ -1313,11 +1406,14 @@
       (await wait(() => exact('.hr-base-select-option p', stage), `current stage option ${stage}`)).click();
       let due = rule.days === null ? null : futureDate(rule.days);
       const taskTitle = renderTemplate(settings.task, { name, firstName });
+      progress('Awaiting confirmation…');
       const choices = await confirmActions({ name, firstName: firstName || name, phone, stage, rule, due, owner, taskTitle, sms, pipelineName, stageOptions });
       if (!choices) {
+        timingResult = 'cancelled';
         if (visible(document.getElementById('modal-header-modal-close-btn'))) await click('#modal-header-modal-close-btn');
         return;
       }
+      progress('Applying selected actions…');
       if (contactId() !== startingContact) throw new Error('Contact changed during confirmation. Nothing saved.');
       due = choices.due;
       if (choices.stage) {
@@ -1407,12 +1503,14 @@
       guardedContact = null; // Navigation is allowed only after the saves succeeded.
       guardedStageQueue = null;
       const next = await findNextActionable();
-      if (next) openLead(next);
+      if (next) { openLead(next); timingResult = 'navigating'; }
       else taskNotice(`Selected actions saved. ${emptyQueueMessage()}`);
 
     } catch (error) {
+      timingResult = 'stopped';
+      finishWorkflowTiming(timingResult); // Do not count time spent reading the error alert.
       const report = [
-        'Pertama No answer — v0.2.10', `Stopped: ${step}`,
+        'Pertama No answer — v0.2.11', `Stopped: ${step}`,
         `Contact ID: ${startingContact}`, `Current path: ${location.pathname}`,
         '', error.message || String(error), '',
         'Completed actions (verification noted below):', completed.join('\n') || 'None confirmed.',
@@ -1424,6 +1522,7 @@
       console.error(report, error);
       alert(report);
     } finally {
+      finishWorkflowTiming(timingResult);
       guardedContact = null;
       guardedStageQueue = null;
       busy = false;
@@ -1582,6 +1681,7 @@
   settingsButton.addEventListener('click', openSettings);
   // Keep the button immediately after Companies, including after SPA navigation.
   function placeButton() {
+    recordNavigationReady();
     syncStageQueue();
     if (!busy) nextButton.textContent = nextLeadLabel();
     const companies = document.getElementById('tb_business');

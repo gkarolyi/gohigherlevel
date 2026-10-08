@@ -361,6 +361,10 @@ test('Next lead uses pinned queue and shows stage-specific empty notice without 
   assert.match(h.w.document.querySelector('#pertama-task-notice').textContent, /No other matching leads.*Sales.*Attempted Contact/);
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
   assert.equal(h.w.document.querySelector('#pertama-next-lead-button').disabled, false);
+  const timing = h.w.pertamaWorkflowTimings.at(-1);
+  assert.equal(timing.action, 'Next lead');
+  assert.equal(timing.phase, 'Total');
+  assert.equal(timing.result, 'ok');
 });
 
 test('Next lead resolves missing context through actual picker before lookup', { timeout: 3000 }, async t => {
@@ -466,6 +470,13 @@ test(changeRoute ? 'Save and next refuses saves after leaving and returning duri
   if (changeRoute) { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
   form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
   await pending;
+  const timings = plain(h.w.pertamaWorkflowTimings);
+  for (const phase of ['Reading contact…', 'Reading owner and preparing SMS…', 'Reading opportunity…', 'Awaiting confirmation…']) {
+    assert.ok(timings.some(row => row.action === 'Save and next' && row.phase === phase), `missing timing: ${phase}`);
+  }
+  assert.equal(timings.at(-1).phase, 'Total');
+  assert.equal(timings.at(-1).result, changeRoute ? 'stopped' : 'navigating');
+  assert.doesNotMatch(JSON.stringify(timings), /Ada|contact-a|opp-a|stage-robot/);
   if (changeRoute) {
     assert.equal(h.requests.length, 0, 'a stale confirmation must not save anything');
     assert.match(h.alerts.join('\n'), /queue.*changed|changed.*queue/i);
@@ -488,6 +499,73 @@ test('mutation start and settlement do not drift the pinned original stage', t =
   assert.equal(h.evaluate('stageQueueContext().queue.stageId'), 'stage-atc');
   h.evaluate('finishStageWrite(__write)');
   assert.deepEqual(plain(h.evaluate('stageQueueContext().queue')), queue);
+});
+
+test('contact name uses already-visible inputs without opening All fields', async t => {
+  const h = harness(t); fastPolling(h);
+  h.w.document.body.insertAdjacentHTML('beforeend', '<input id="contact.first_name" value="Ada"><input id="contact.last_name" value="Test">');
+  const name = plain(await h.evaluate('readContactName()'));
+  assert.deepEqual(name, { firstName: 'Ada', name: 'Ada Test' });
+  assert.equal(h.w.__elapsed, 0);
+});
+
+test('contact name opens All fields once when inputs are hidden', async t => {
+  const h = harness(t); fastPolling(h);
+  h.w.document.body.insertAdjacentHTML('beforeend', `<div id="record-details-tabs"><div class="hr-tabs-rail"><div></div><div><span>All fields</span></div></div></div>
+    <input id="contact.first_name" value="" hidden><input id="contact.last_name" value="Test" hidden>`);
+  let clicks = 0;
+  h.w.document.querySelector('#record-details-tabs span').addEventListener('click', () => {
+    clicks++;
+    for (const input of h.w.document.querySelectorAll('input')) input.hidden = false;
+  });
+  assert.deepEqual(plain(await h.evaluate('readContactName()')), { firstName: '', name: 'Test' });
+  assert.equal(clicks, 1);
+});
+
+test('visible name inputs still enforce contact guards and reject an empty name', async t => {
+  const h = harness(t); fastPolling(h);
+  h.w.document.body.insertAdjacentHTML('beforeend', '<input id="contact.first_name"><input id="contact.last_name">');
+  await assert.rejects(h.evaluate('readContactName()'), /name is empty/i);
+  h.evaluate("guardedContact = 'different-contact'");
+  await assert.rejects(h.evaluate('readContactName()'), /contact changed/i);
+});
+
+test('SMS preparation begins while passive owner lookup is still waiting', async t => {
+  const h = harness(t);
+  h.w.document.body.insertAdjacentHTML('beforeend', '<div id="owner-dropdown-trigger"></div>');
+  h.evaluate("globalThis.__smsStarted = false; prepareSms = async () => { __smsStarted = true; return { error: 'No composer in fixture' }; }");
+  const pending = h.evaluate('readOwnerAndPrepareSms()');
+  await flush();
+  assert.equal(h.w.__smsStarted, true, 'SMS should not wait for owner text to load');
+  h.w.document.getElementById('owner-dropdown-trigger').innerHTML = '<span>Ada Owner</span>';
+  assert.deepEqual(plain(await pending), { owner: 'Ada Owner', sms: { error: 'No composer in fixture' } });
+});
+
+test('owner failure waits for SMS activation to settle before releasing the workflow', async t => {
+  const h = harness(t);
+  let release;
+  h.w.__smsGate = new Promise(resolve => { release = resolve; });
+  h.evaluate("guardedContact = 'different-contact'; prepareSms = () => __smsGate");
+  let settled = false;
+  const pending = h.evaluate('readOwnerAndPrepareSms()');
+  const outcome = pending.then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
+  await flush();
+  assert.equal(settled, false);
+  release({ error: 'Composer unavailable' });
+  assert.match((await outcome).error.message, /contact changed/i);
+});
+
+test('unexpected SMS failure also drains the passive owner lookup', async t => {
+  const h = harness(t);
+  h.w.document.body.insertAdjacentHTML('beforeend', '<div id="owner-dropdown-trigger"></div>');
+  h.evaluate("prepareSms = async () => { throw new Error('SMS preparation failed'); }");
+  let settled = false;
+  const pending = h.evaluate('readOwnerAndPrepareSms()');
+  const outcome = pending.then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
+  await flush();
+  assert.equal(settled, false);
+  h.w.document.getElementById('owner-dropdown-trigger').innerHTML = '<span>Ada Owner</span>';
+  assert.match((await outcome).error.message, /SMS preparation failed/);
 });
 
 // Advance only the polling clock/sleep boundary; exercise the real readiness loop.
