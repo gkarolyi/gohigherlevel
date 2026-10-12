@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.5
+// @version      1.0.6
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.5';
+  const VERSION = '1.0.6';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
