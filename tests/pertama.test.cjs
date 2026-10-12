@@ -67,6 +67,36 @@ function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = f
     respond(data) { response = data; }, route(value) { w.history.pushState({}, '', value); },
     pin(value = queue) { return evaluate(`pinStageQueue(${JSON.stringify(value)})`); } };
 }
+test('progress controller preserves evidence, blocks dismissal and reattaches stopped results', t => {
+  const h = harness(t);
+  const p = h.evaluate(`createSaveProgress({ name: '<b>Ada</b>', pipelineName: 'Sales', choices: { stage: true, note: true, task: true, sms: true } })`);
+  const d = h.w.document.querySelector('#pertama-save-progress');
+  const row = key => d.querySelector(`[data-action="${key}"]`);
+  assert.equal(d.open, true);
+  assert.equal(d.querySelector('b'), null);
+  assert.equal(row('complete'), null);
+  assert.equal(d.querySelector('[data-close]').hidden, true);
+  const cancel = new h.w.Event('cancel', { cancelable: true }); d.dispatchEvent(cancel);
+  assert.equal(cancel.defaultPrevented, true);
+  p.addCompletion(); p.addCompletion();
+  assert.equal(d.querySelectorAll('[data-action="complete"]').length, 1);
+  p.start('stage', 'Saving…'); p.dispatched('stage'); p.confirm('stage'); p.fail('stage');
+  assert.equal(row('stage').dataset.state, 'confirmed');
+  p.start('note'); p.fail('note'); assert.equal(row('note').dataset.state, 'failed');
+  p.dispatched('task'); p.created(); p.fail('task');
+  assert.match(row('task').textContent, /Created; contact link not sent/);
+  p.dispatched('task', 'link'); p.fail('task');
+  assert.match(row('task').textContent, /link unverified/);
+  p.dispatched('complete'); p.fail('complete');
+  assert.equal(row('complete').dataset.state, 'unverified');
+  p.remove(); p.remove(); assert.equal(d.isConnected, false);
+  p.stop('<img> navigation failed');
+  assert.equal(d.isConnected, true); assert.equal(row('sms').dataset.state, 'blocked');
+  assert.equal(d.querySelector('img'), null);
+  assert.equal(d.querySelector('[data-close]').hidden, false);
+  d.querySelector('[data-close]').click(); assert.equal(d.isConnected, false);
+});
+
 function hit(contactId = 'contact-b', opportunityId = 'opp-b', overrides = {}) {
   return { _id: opportunityId, _source: { contactId, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', locationId: LOCATION, ...overrides } };
 }
@@ -102,6 +132,33 @@ function installRouter(h, overrides = {}) {
   return { router, pushes };
 }
 const openNext = async h => h.evaluate(`openLead(${JSON.stringify(nextLeadData)})`);
+
+test('progress is removed at native route commit before old controls retire', async t => {
+  const h = harness(t); h.pin();
+  h.w.document.body.insertAdjacentHTML('beforeend', '<input id="contact.first_name">');
+  const old = h.w.document.getElementById('contact.first_name');
+  const { router } = installRouter(h, { async push(path) { h.route(path); router.currentRoute.value = { name: 'contact_detail-v2', path }; } });
+  h.evaluate(`globalThis.__progress = createSaveProgress({ name: 'Original Ada', pipelineName: 'Sales', choices: { note: true } }); __progress.confirm('note');`);
+  const pending = h.evaluate(`openLead(${JSON.stringify(nextLeadData)}, () => __progress.remove())`);
+  await flush();
+  assert.equal(old.isConnected, true);
+  assert.equal(h.w.document.querySelector('#pertama-save-progress'), null);
+  old.remove(); await pending;
+});
+
+test('progress reattaches original-contact results after committed navigation readiness failure', async t => {
+  const h = harness(t); h.pin(); fastPolling(h);
+  h.w.document.body.insertAdjacentHTML('beforeend', '<input id="contact.first_name">');
+  const { router } = installRouter(h, { async push(path) { h.route(path); router.currentRoute.value = { name: 'contact_detail-v2', path }; } });
+  h.evaluate(`globalThis.__progress = createSaveProgress({ name: 'Original Ada', pipelineName: 'Sales', choices: { note: true } }); __progress.confirm('note');`);
+  await h.evaluate(`openLead(${JSON.stringify(nextLeadData)}, () => __progress.remove()).catch(error => __progress.stop(error.message))`);
+  const d = h.w.document.querySelector('#pertama-save-progress');
+  assert.equal(h.w.location.pathname, NEXT_PATH);
+  assert.match(d.textContent, /Original Ada/);
+  assert.equal(d.querySelector('[data-action="note"]').dataset.state, 'confirmed');
+  assert.match(d.querySelector('[data-report]').textContent, /previous contact controls/);
+  d.querySelector('[data-close]').click(); assert.equal(d.isConnected, false);
+});
 
 test('next contact already open reports action required without invoking native navigation', async t => {
   const h = harness(t); h.pin();
@@ -799,7 +856,10 @@ for (const outcome of ['cancel', 'skip-writes', 'changed-contact', 'changed-stag
       form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
       await pending;
       assert.equal(h.w.__apiReads.filter(read => read.fresh).length, outcome === 'skip-writes' ? 3 : 2);
-      if (outcome.startsWith('changed')) assert.match(h.alerts.join('\n'), /changed.*confirmation|confirmation.*changed/i);
+      if (outcome.startsWith('changed')) {
+        assert.deepEqual(h.alerts, []);
+        assert.match(h.w.document.querySelector('#pertama-save-progress [data-report]').textContent, /changed.*confirmation|confirmation.*changed/i);
+      }
     }
     if (!outcome.startsWith('changed')) assert.deepEqual(h.alerts, []);
     assert.equal(h.requests.length, 0);
@@ -1077,6 +1137,8 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
     form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
     if (mode === 'stale-confirmation') { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
     form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+    assert.equal(h.w.document.querySelector('#pertama-save-progress').open, true, 'synchronous modal handoff');
+    assert.equal(dialog.isConnected, false);
     await pending;
     assert.equal(modalClicks, 0, 'existing opportunity editors must never be used');
     const timings = plain(h.w.pertamaWorkflowTimings);
@@ -1088,7 +1150,8 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
     if (beforeWriteFailure) {
       assert.equal(writes.length, 0, h.alerts.join('\n'));
       assert.equal(navigationAttempts, 0);
-      assert.ok(h.alerts.length);
+      assert.deepEqual(h.alerts, []);
+      assert.match(h.w.document.querySelector('#pertama-save-progress [data-report]').textContent, /Stopped:/);
       assert.equal(h.w.localStorage.getItem(checkpointKey), null, 'no attempted write to reconcile');
     } else if (['navigation-failure', 'sms-navigation-failure', 'link-failure', 'task-route-change'].includes(mode)) {
       assert.equal(writes.length, smsEnabled ? 5 : mode === 'link-failure' ? 4 : mode === 'task-route-change' ? 3 : 1, h.alerts.join('\n'));
@@ -1098,6 +1161,13 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
       if (mode === 'link-failure' || mode === 'task-route-change') {
         assert.match(h.w.localStorage.getItem(checkpointKey), /Task created.*task-created/);
       }
+      const progress = h.w.document.querySelector('#pertama-save-progress');
+      assert.equal(progress.querySelector('[data-action="stage"]').dataset.state, 'confirmed');
+      if (smsEnabled) assert.match(progress.querySelector('[data-action="sms"]').textContent, /Accepted by CRM; delivery not confirmed/);
+      if (mode === 'task-route-change') assert.match(progress.querySelector('[data-action="task"]').textContent, /Created; contact link not sent/);
+      if (mode === 'link-failure') assert.match(progress.querySelector('[data-action="task"]').textContent, /Created; contact link unverified/);
+      assert.deepEqual(h.alerts, []);
+      progress.querySelector('[data-close]').click();
       if (mode === 'task-route-change') h.route(CONTACT_PATH);
       const count = h.requests.length;
       await h.evaluate('run()');
@@ -1117,6 +1187,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
         assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), { ...queue, contactId: 'contact-b', opportunityId: 'opp-b' });
       }
       assert.equal(h.w.localStorage.getItem(checkpointKey), null);
+      assert.equal(h.w.document.querySelector('#pertama-save-progress'), null);
       if (smsEnabled) {
         assert.equal(h.requests.some(r => new URL(r.url).pathname.startsWith('/f1/conversations/')), false, 'SMS acknowledgment must not require history before navigation');
         assert.match(h.w.document.getElementById('pertama-task-notice').textContent, /accepted.*delivery not confirmed/i);
@@ -1236,7 +1307,8 @@ for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inven
     form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true })); await pending;
     if (mode === 'route-change') {
       assert.equal(h.w.__sentSms, undefined);
-      assert.match(h.alerts.join('\n'), /changed/i);
+      assert.deepEqual(h.alerts, []);
+      assert.match(h.w.document.querySelector('#pertama-save-progress [data-report]').textContent, /changed/i);
     } else {
       assert.deepEqual(plain(h.w.__sentSms), { from: '+15555550101', to: '+628123456789', message: 'Approved independent message' });
       assert.deepEqual(h.alerts, []);

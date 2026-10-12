@@ -445,7 +445,7 @@
       throw new Error('Previous contact controls are still mounted. Wait for the contact to finish switching or reload before using workflow actions.');
     }
   }
-  async function openLead(lead) {
+  async function openLead(lead, onCommitted = null) {
     requireContactControlsReady();
     if (!/^[a-zA-Z0-9_-]+$/.test(lead.contactId)) throw new Error('Invalid contact ID returned by lookup.');
     if (lead.contactId === contactId()) throw new Error('This is the next top lead; action it first.');
@@ -483,6 +483,7 @@
           throw new Error('Native contact navigation was cancelled or redirected. No automatic retry.');
         }
         recordWorkflowTiming('Navigation', phase, performance.now() - started);
+        onCommitted?.();
         phase = 'Previous contact controls released';
         const committedRevision = stageRouteRevision;
         await wait(() => {
@@ -964,6 +965,7 @@
         }
         stageObservation = observeStageRequest(method, wire.url);
       }
+      if (method !== 'GET') activeSaveProgress?.dispatched(action, operation);
       const response = await originalFetch.call(window, wire.url, { method, headers: { ...wire.headers, ...liveReadHeaders },
         redirect: 'error', ...(method === 'GET' ? { cache: 'no-store' } : { body: JSON.stringify(body) }), signal: controller.signal });
       diagnostic.status = response.status;
@@ -1006,6 +1008,7 @@
     requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === actionStageVersions.get(context)
       && (context.parallel || (saved.data.opportunity.assignedTo ?? '') === (approved.assignedTo ?? '')), 'saved opportunity account/version/owner did not match.');
     completed.push(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
+    activeSaveProgress?.confirm('stage');
     setPendingAction('stage', null);
     requireActionApproval('stage', context, 1);
     if (!context.parallel) context.epoch = contactReadEpoch;
@@ -1017,6 +1020,7 @@
     requireSaved(safeActionId(data.note?.id), 'unsafe note ID.');
     verifyNote(data, body, context.contact, context.noteText);
     completed.push(`Note saved (server confirmed; note ${data.note.id})`);
+    activeSaveProgress?.confirm('note');
     setPendingAction('note', null);
     requireActionApproval('note', context);
   }
@@ -1029,12 +1033,14 @@
     requireSaved(safeActionId(data.record?.id), 'unsafe task ID.');
     verifyTask(data, body, context.contact, context.taskTitle, context.due);
     context.taskId = data.record.id;
+    activeSaveProgress?.created();
     completed.push(`Task created: ${context.taskId}; ${context.due}, 11am WITA (server confirmed)`);
     setPendingAction('task', `Contact association for task ${context.taskId}`);
     requireActionApproval('task', context);
     const linked = await actionRequest('link', context);
     verifyTaskLink(linked.data, context.taskId, context.contact);
     completed.push('Task contact association: server confirmed');
+    activeSaveProgress?.confirm('task');
     setPendingAction('link', null);
     setPendingAction('task', null);
     requireActionApproval('task', context);
@@ -1047,6 +1053,7 @@
   const exact = (selector, label, root = document) => all(selector, root).find(el => text(el) === label);
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   let busy = false;
+  let activeSaveProgress = null;
   let guardedContact = null;
   let guardedStageQueue = null;
   let approvedActionContext = null;
@@ -1212,7 +1219,8 @@
   function progress(message) {
     markWorkflowTiming(message);
     step = message;
-    runButton.textContent = message;
+    runButton.textContent = activeSaveProgress ? message === 'Opening next lead…' ? message : 'Saving…' : message;
+    activeSaveProgress?.phase(message);
   }
 
   function nameInput(field, label) {
@@ -1430,6 +1438,7 @@
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
       requireCallTaskContext(context);
+      activeSaveProgress?.dispatched('complete');
       const response = await originalFetch.call(window, diagnostic.url, {
         method: 'PUT', headers: { ...CRM_HEADERS, 'content-type': 'application/json',
           developer_version: '', ...liveReadHeaders },
@@ -1531,6 +1540,7 @@
       phase = 'sending task completion or verifying its acknowledgment';
       attempted = true;
       await putCallTask(context, task.id);
+      activeSaveProgress?.start('complete', 'Verifying…');
       requireCallTaskContext(context);
       phase = 'verifying the completed task by its exact ID';
       let verified = false;
@@ -1548,6 +1558,7 @@
       }
       if (!verified) throw new Error('Task completion readback unavailable.');
       completed.push(`Call task completed and verified: ${task.id}: ${title}`);
+      activeSaveProgress?.confirm('complete');
       setPendingAction('complete', null);
       requireCallTaskContext(context);
       if (!fromSaveAndNext) {
@@ -1611,6 +1622,7 @@
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
       guard();
+      if (operation === 'send') activeSaveProgress?.dispatched('sms');
       const response = await originalFetch.call(window, `https://services.leadconnectorhq.com${path}`, {
         method, headers: { ...CRM_HEADERS, ...liveReadHeaders, ...(body ? { 'content-type': 'application/json' } : {}) },
         redirect: 'error', cache: 'no-store', signal: controller.signal, ...(body ? { body: JSON.stringify(body) } : {}),
@@ -1685,6 +1697,7 @@
     if (!safeActionId(acknowledgment.conversationId) || !safeActionId(acknowledgment.messageId)) throw new Error('SMS acknowledgment is unverified. No retry.');
     const identity = `SMS message ${acknowledgment.messageId}; conversation ${acknowledgment.conversationId}`;
     completed.push(`${identity}: accepted by CRM; delivery not confirmed.`);
+    activeSaveProgress?.confirm('sms');
     pendingSave = `${identity}: accepted; workflow continuation not yet approved`;
     saveCheckpoint();
     requireActionApproval('sms', context);
@@ -1703,7 +1716,87 @@
     } catch { /* Notification failures never authorize another send. */ }
   }
 
-  function confirmActions({ contact, name, firstName, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions }) {
+  function createSaveProgress({ name, pipelineName, choices }) {
+    document.getElementById('pertama-save-progress')?.remove();
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.id = 'pertama-save-progress';
+    dialog.setAttribute('aria-labelledby', 'pertama-save-progress-title');
+    dialog.style.cssText = 'width:min(510px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid #e4e7ec;border-radius:16px;padding:24px;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#182230;background:#fff';
+    dialog.innerHTML = `<style>
+      #pertama-save-progress::backdrop{background:#10182866}
+      #pertama-save-progress h2{margin:0;font-size:22px}
+      #pertama-save-progress [data-action]{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #eaecf0}
+      #pertama-save-progress [data-icon]{color:#667085;display:inline-block}
+      #pertama-save-progress [data-state=running] [data-icon]{color:#155eef;animation:pertama-save-spin 1s linear infinite}
+      #pertama-save-progress [data-state=confirmed] [data-icon]{color:#067647}
+      #pertama-save-progress [data-state=unverified] [data-icon]{color:#b54708}
+      #pertama-save-progress [data-state=failed] [data-icon]{color:#b42318}
+      #pertama-save-progress small{display:block;color:#667085}
+      #pertama-save-progress [data-report]{white-space:pre-wrap;overflow-wrap:anywhere}
+      #pertama-save-progress button{padding:8px 16px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;font:inherit;cursor:pointer}
+      @keyframes pertama-save-spin{to{transform:rotate(360deg)}}
+      @media(prefers-reduced-motion:reduce){#pertama-save-progress [data-icon]{animation:none!important}}
+      </style><h2 id="pertama-save-progress-title" tabindex="-1">Preparing actions…</h2><p data-contact></p><div data-rows></div><p data-live role="status" aria-live="polite"></p><p data-footer>The next lead will open automatically.</p><section data-report hidden aria-label="Stopped save details"></section><button type="button" data-close hidden>Close</button>`;
+    dialog.querySelector('[data-contact]').textContent = `${name} · ${pipelineName}`;
+    const rows = new Map(), container = dialog.querySelector('[data-rows]');
+    const labels = { stage: 'Stage', note: 'Note', complete: 'Existing Call task', task: 'Follow-up task', sms: 'SMS' };
+    let stopped = false;
+    const announce = message => { dialog.querySelector('[data-live]').textContent = message; };
+    function render(row) {
+      row.el.dataset.state = row.state;
+      row.el.querySelector('[data-icon]').textContent = { waiting: '○', running: '◌', confirmed: '✓', unverified: '⚠', failed: '×', blocked: '–' }[row.state];
+      row.el.querySelector('small').textContent = row.detail;
+      announce(`${labels[row.key]}: ${row.detail}`);
+    }
+    function add(key) {
+      if (rows.has(key)) return;
+      const el = document.createElement('div'); el.dataset.action = key;
+      el.innerHTML = '<span data-icon aria-hidden="true"></span><div><strong></strong><small></small></div>';
+      el.querySelector('strong').textContent = labels[key];
+      const row = { key, el, state: 'waiting', detail: key === 'sms' ? 'Waiting for saves' : key === 'task' ? 'Waiting for existing task check' : 'Waiting', dispatched: new Set(), created: false };
+      rows.set(key, row);
+      container.insertBefore(el, key === 'complete' ? rows.get('task')?.el || rows.get('sms')?.el || null : null);
+      render(row);
+    }
+    for (const key of ['stage', 'note', 'task', 'sms']) if (choices[key]) add(key);
+    function remove() { if (dialog.open) dialog.close(); dialog.remove(); }
+    function close() { remove(); (previousFocus?.isConnected ? previousFocus : runButton)?.focus(); }
+    dialog.querySelector('[data-close]').addEventListener('click', close);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); if (stopped) close(); });
+    dialog.addEventListener('keydown', event => event.stopPropagation());
+    function show() { if (!dialog.isConnected) document.body.append(dialog); if (!dialog.open) dialog.showModal(); dialog.querySelector('h2').focus(); }
+    function start(key, detail = 'Saving…') {
+      const row = rows.get(key); if (!row || row.state === 'confirmed') return;
+      row.state = 'running'; row.detail = detail; render(row);
+    }
+    show();
+    return {
+      addCompletion: () => add('complete'), start,
+      dispatched(key, operation = key) { rows.get(key)?.dispatched.add(operation); },
+      created() { const row = rows.get('task'); if (row) { row.created = true; start('task', 'Linking to contact…'); } },
+      confirm(key) { const row = rows.get(key); if (!row) return; row.state = 'confirmed'; row.detail = key === 'sms' ? 'Accepted by CRM; delivery not confirmed' : 'Confirmed'; render(row); },
+      fail(key) {
+        const row = rows.get(key); if (!row || row.state === 'confirmed') return;
+        row.state = row.dispatched.size ? 'unverified' : 'failed';
+        row.detail = row.created ? row.dispatched.has('link') ? 'Created; contact link unverified. Inspect the record.' : 'Created; contact link not sent. Inspect the record.'
+          : row.dispatched.size ? 'May already be saved. Inspect the record.' : 'Stopped before saving';
+        render(row);
+      },
+      phase(message) { dialog.querySelector('h2').textContent = message === 'Opening next lead…' ? message : /Rechecking|Preflighting/.test(message) ? 'Preparing actions…' : 'Saving actions'; announce(message); },
+      stop(report) {
+        stopped = true;
+        for (const row of rows.values()) if (['waiting', 'running'].includes(row.state)) { row.state = 'blocked'; row.detail = 'Not run'; render(row); }
+        dialog.querySelector('h2').textContent = 'Execution stopped';
+        dialog.querySelector('[data-footer]').textContent = 'No automatic retry. Check the record before running again.';
+        const details = dialog.querySelector('[data-report]'); details.textContent = report; details.hidden = false;
+        dialog.querySelector('[data-close]').hidden = false;
+        announce('Execution stopped. Results are ready to inspect.'); show();
+      }, remove,
+    };
+  }
+
+  function confirmActions({ contact, name, firstName, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions }, onConfirm = null) {
     return new Promise(resolve => {
       let closed = false, sms = null, smsLoading = false, smsError = '', smsLoadVersion = 0;
       const confirmationUser = currentUserId, confirmationRoute = stageRouteRevision;
@@ -1844,9 +1937,10 @@
         if (closed) return;
         closed = true;
         smsLoadVersion++;
+        if (result) onConfirm?.(result);
         dialog.close();
         dialog.remove();
-        previousFocus?.focus();
+        if (!result || !onConfirm) previousFocus?.focus();
         resolve(result);
       }
       form.addEventListener('change', updateFields);
@@ -1901,6 +1995,8 @@
 
   async function run() {
     if (busy) return;
+    document.getElementById('pertama-save-progress')?.remove();
+    let saveProgress = null;
     busy = true;
     runButton.disabled = true;
     completed = [];
@@ -1952,7 +2048,10 @@
       const due = rule.days === null ? null : futureDate(rule.days);
       const taskTitle = renderTemplate(settings.task, { name, firstName });
       progress('Awaiting confirmation…');
-      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions });
+      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions }, choices => {
+        saveProgress = createSaveProgress({ name, pipelineName, choices });
+        activeSaveProgress = saveProgress;
+      });
       if (!choices) { timingResult = 'cancelled'; return; }
       if (contactId() !== startingContact || stageRouteRevision !== startingRevision) throw new Error('Contact or original stage queue changed during confirmation. Nothing saved.');
       progress('Rechecking contact and opportunity…');
@@ -1980,27 +2079,38 @@
       if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => contact[key] !== preparedTask.contact[key])) {
         throw new Error('Contact changed during save preflight. Nothing saved.');
       }
+      if (preparedTask.task) saveProgress.addCompletion();
       // Every lane uses this preflight snapshot; in-flight requests cannot be recalled on failure.
       Object.assign(approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0, stopSaves: false });
       preparedTask.context.approval = approvedActionContext;
       progress('Saving selected actions concurrently…');
+      const trackAction = async (key, action, detail = 'Saving…') => {
+        saveProgress.start(key, detail);
+        try { return await action(); }
+        catch (error) { saveProgress.fail(key); throw error; }
+      };
       const saveLane = async action => {
         try { await action(); }
         catch (error) { approvedActionContext.stopSaves = true; throw error; }
       };
       await drainAll([
-        ...(choices.stage ? [saveLane(saveStageApi)] : []),
-        ...(choices.note ? [saveLane(saveNoteApi)] : []),
+        ...(choices.stage ? [saveLane(() => trackAction('stage', saveStageApi))] : []),
+        ...(choices.note ? [saveLane(() => trackAction('note', saveNoteApi))] : []),
         saveLane(async () => {
-          await completeCallTask(startingContact, { fromSaveAndNext: true, prepared: preparedTask });
-          if (choices.task) await createTaskApi();
+          const complete = () => completeCallTask(startingContact, { fromSaveAndNext: true, prepared: preparedTask });
+          if (preparedTask.task) await trackAction('complete', complete, 'Completing…');
+          else await complete();
+          if (choices.task) {
+            if (approvedActionContext.stopSaves) await createTaskApi();
+            else await trackAction('task', createTaskApi, 'Creating…');
+          }
         }),
       ]);
       assertApprovedActionContext();
 
       if (choices.sms) {
         progress('Sending SMS…');
-        await sendSmsApi();
+        await trackAction('sms', sendSmsApi, 'Sending…');
       }
 
       progress('Opening next lead…');
@@ -2008,8 +2118,8 @@
       guardedStageQueue = null;
       approvedActionContext = null;
       const next = await findNextActionable();
-      if (next) { await openLead(next); timingResult = 'navigating'; }
-      else taskNotice(`Selected actions saved. ${emptyQueueMessage()} Refresh the contact to update the CRM panels.`);
+      if (next) { await openLead(next, () => saveProgress.remove()); timingResult = 'navigating'; }
+      else { saveProgress.remove(); taskNotice(`Selected actions saved. ${emptyQueueMessage()} Refresh the contact to update the CRM panels.`); }
       localStorage.removeItem(checkpointKey(startingContact));
 
     } catch (error) {
@@ -2026,9 +2136,11 @@
         'The same report and technical error are in the browser console.',
       ].join('\n');
       console.error(report, error);
-      alert(report);
+      if (saveProgress) saveProgress.stop(report);
+      else alert(report);
     } finally {
       finishWorkflowTiming(timingResult);
+      activeSaveProgress = null;
       guardedContact = null;
       guardedStageQueue = null;
       approvedActionContext = null;

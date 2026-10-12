@@ -20,6 +20,8 @@ function harness(t, { oldTask = true } = {}) {
   const dom = new JSDOM('<!doctype html><body></body>', { url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', virtualConsole: new VirtualConsole() });
   const w = dom.window; t.after(() => w.close());
   for (const key of ['Request', 'Response', 'Headers', 'AbortController']) w[key] = globalThis[key];
+  w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  w.HTMLDialogElement.prototype.close = function () { this.open = false; };
   w.HTMLElement.prototype.getClientRects = () => [{ width: 200 }];
   const writes = [], reads = [], gates = { stage: deferred(), note: deferred(), complete: deferred(), task: deferred(), link: deferred() };
   let hook = () => {}, completed = false;
@@ -56,7 +58,7 @@ function harness(t, { oldTask = true } = {}) {
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'u1', sub: 'u1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
   e(`initializeButtons(); captureReadHeaders('https://services.leadconnectorhq.com/contacts/c1', ${JSON.stringify({ 'token-id': token })});
     pinStageQueue({ contactId: 'c1', opportunityId: 'o1', pipelineId: 'p1', stageId: 's1' });
-    confirmActions = async () => ({ stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3), sms: false });
+    confirmActions = async (context, accept) => { const choices = { stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3), sms: false }; accept(choices); return choices; };
     globalThis.__nextCalls = 0; findNextActionable = async () => { __nextCalls++; return null; };`);
   return { w, e, writes, reads, gates, alerts, run: () => e('run()'), hook: fn => { hook = fn; },
     checkpoint: () => JSON.parse(w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`) || 'null') };
@@ -70,16 +72,23 @@ for (const order of [['stage', 'note', 'complete'], ['stage', 'complete', 'note'
     assert.deepEqual(Object.keys(h.checkpoint().pendingActions).sort(), ['complete', 'note', 'stage']);
     assert.equal(h.e('busy'), true);
     assert.equal(h.e('__nextCalls'), 0);
+    const row = key => h.w.document.querySelector(`[data-action="${key}"]`);
+    assert.equal(row('task').dataset.state, 'waiting');
+    for (const key of order) assert.equal(row(key).dataset.state, 'running');
     for (const operation of order) {
       h.gates[operation].resolve(); await flush();
       assert.equal(Object.hasOwn(h.checkpoint().pendingActions, operation), false);
+      assert.equal(row(operation).dataset.state, 'confirmed');
       if (operation === 'complete') assert.equal(h.writes.some(r => r.operation === 'task'), true);
     }
     h.gates.task.resolve(); await flush();
     assert.equal(h.writes.at(-1).operation, 'link');
     assert.match(h.checkpoint().pendingSave, /association/i);
+    assert.equal(row('task').dataset.state, 'running');
+    assert.match(row('task').textContent, /Linking/);
     h.gates.link.resolve(); await pending;
     assert.equal(h.checkpoint(), null);
+    assert.equal(h.w.document.querySelector('#pertama-save-progress'), null);
     assert.equal(h.e('__nextCalls'), 1);
     assert.equal(h.e('busy'), false);
     assert.deepEqual(h.alerts, []);
@@ -97,9 +106,14 @@ for (const failed of ['stage', 'note', 'complete']) for (const reason of ['HTTP'
     assert.equal(h.e('busy'), true);
     assert.equal(h.e('__nextCalls'), 0);
     assert.equal(h.alerts.length, 0);
+    const d = h.w.document.querySelector('#pertama-save-progress');
+    assert.equal(d.querySelector(`[data-action="${failed}"]`).dataset.state, 'unverified');
+    assert.equal(d.querySelector('[data-close]').hidden, true);
     for (const operation of ['stage', 'note', 'complete']) if (operation !== failed) h.gates[operation].resolve();
     await pending;
     assert.equal(h.writes.length, 3);
+    assert.equal(d.querySelector('[data-close]').hidden, false);
+    assert.equal(d.querySelector('[data-action="task"]').dataset.state, 'blocked');
     assert.equal(h.e('busy'), false);
     assert.equal(h.e('contactWritesPending + stageWritesPending'), 0);
     assert.deepEqual(Object.keys(h.checkpoint().pendingActions), [failed]);
@@ -144,6 +158,73 @@ test('concurrent stage receipts retain the confirmed stage if automation changes
   assert.equal(h.checkpoint(), null);
 });
 
+test('progress SMS waits for saves and retains accepted receipt after continuation failure', async t => {
+  const h = harness(t), sms = deferred();
+  h.w.__contact = contact;
+  h.e(`confirmActions = async (context, accept) => {
+    const choices = { stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3), sms: true,
+      smsFrom: '+15555550101', smsTo: '+628123456789', smsText: 'Approved message' };
+    accept(choices); return choices;
+  }; prepareSmsApi = async () => ({ contact: __contact, from: '+15555550101', to: '+628123456789' });`);
+  h.hook(r => r.pathname === '/conversations/messages/spam/v2' ? { isSpam: false }
+    : r.pathname === '/conversations/messages' ? sms.promise : undefined);
+  const pending = h.run(); await flush();
+  const d = h.w.document.querySelector('#pertama-save-progress'), row = d.querySelector('[data-action="sms"]');
+  assert.equal(row.dataset.state, 'waiting');
+  assert.equal(h.reads.some(r => r.pathname === '/conversations/messages'), false);
+  for (const key of ['stage', 'note', 'complete', 'task', 'link']) h.gates[key].resolve();
+  await flush(); await flush();
+  assert.equal(row.dataset.state, 'running');
+  h.e('rejectCrmAuthorization()');
+  sms.resolve({ conversationId: 'conv1', messageId: 'msg1' }); await pending;
+  assert.equal(row.dataset.state, 'confirmed');
+  assert.match(row.textContent, /Accepted by CRM; delivery not confirmed/);
+  assert.equal(d.querySelector('[data-close]').hidden, false);
+  assert.equal(h.e('__nextCalls'), 0);
+  assert.deepEqual(h.alerts, []);
+});
+
+for (const failure of [false, true]) test(`progress navigation settles without extra clicks: failure=${failure}`, async t => {
+  const h = harness(t), navigation = deferred();
+  h.w.__navigation = navigation.promise;
+  h.e(`findNextActionable = async () => ({ contactId: 'c2' }); openLead = async (lead, committed) => { await __navigation; committed(); };`);
+  const pending = h.run(); await flush();
+  for (const key of ['stage', 'note', 'complete', 'task', 'link']) h.gates[key].resolve();
+  await flush(); await flush();
+  const d = h.w.document.querySelector('#pertama-save-progress');
+  assert.equal(d.querySelector('h2').textContent, 'Opening next lead…');
+  assert.equal(d.querySelector('[data-close]').hidden, true);
+  for (const key of ['stage', 'note', 'complete', 'task']) assert.equal(d.querySelector(`[data-action="${key}"]`).dataset.state, 'confirmed');
+  if (failure) navigation.reject(new Error('Navigation failed')); else navigation.resolve();
+  await pending;
+  assert.equal(d.isConnected, failure);
+  if (failure) {
+    assert.match(d.querySelector('[data-report]').textContent, /Opening next lead/);
+    assert.equal(d.querySelector('[data-close]').hidden, false);
+  }
+});
+
+test('full-page navigation keeps progress modal open until the old document unloads', async t => {
+  const h = harness(t), navigationErrors = [];
+  h.w._virtualConsole.on('jsdomError', error => navigationErrors.push(error));
+  h.e(`findNextActionable = async () => ({ contactId: 'c2' });`);
+  const pending = h.run(); await flush();
+  const d = h.w.document.querySelector('#pertama-save-progress');
+  for (const key of ['stage', 'note', 'complete', 'task', 'link']) h.gates[key].resolve();
+  await pending;
+  assert.equal(navigationErrors.length, 1);
+  assert.match(navigationErrors[0].message, /Not implemented: navigation/);
+  assert.equal(h.w.location.pathname, route);
+  assert.equal(h.writes.length, 5);
+  assert.equal(h.checkpoint(), null);
+  assert.deepEqual(h.alerts, []);
+  assert.equal(d.isConnected, true);
+  assert.equal(d.open, true);
+  assert.equal(d.querySelector('h2').textContent, 'Opening next lead…');
+  assert.equal(d.querySelector('[data-close]').hidden, true);
+  for (const key of ['stage', 'note', 'complete', 'task']) assert.equal(d.querySelector(`[data-action="${key}"]`).dataset.state, 'confirmed');
+});
+
 test('owned stage writes never make stale contact reads reusable', async t => {
   const h = harness(t); const pending = h.run(); await flush();
   await assert.rejects(h.e('readContactDetails()'), /pending|changed/i);
@@ -185,6 +266,10 @@ for (const change of ['external write', 'route', 'auth']) {
     assert.match(h.checkpoint().completed.join('\n'), /Stage:.*server confirmed/);
     assert.match(h.checkpoint().completed.join('\n'), /Note saved/);
     assert.match(h.checkpoint().completed.join('\n'), /completion accepted/);
+    const d = h.w.document.querySelector('#pertama-save-progress');
+    for (const key of ['stage', 'note']) assert.equal(d.querySelector(`[data-action="${key}"]`).dataset.state, 'confirmed');
+    assert.equal(d.querySelector('[data-action="complete"]').dataset.state, 'unverified');
+    assert.equal(d.querySelector('[data-action="task"]').dataset.state, 'blocked');
     assert.equal(h.e('contactWritesPending + stageWritesPending'), 0);
   });
 }
@@ -192,6 +277,7 @@ for (const change of ['external write', 'route', 'auth']) {
 test('no matching old task permits follow-up creation but never completion', async t => {
   const h = harness(t, { oldTask: false }); const pending = h.run(); await flush();
   assert.deepEqual(h.writes.map(r => r.operation).sort(), ['note', 'stage', 'task']);
+  assert.equal(h.w.document.querySelector('[data-action="complete"]'), null);
   for (const key of ['stage', 'note', 'task', 'link']) h.gates[key].resolve();
   await pending; assert.deepEqual(h.alerts, []);
 });
@@ -206,6 +292,8 @@ test('preflight failure drains reads and sends no writes', async t => {
   read.resolve({ customObjectRecords: [], total: 0 }); await pending;
   assert.equal(h.writes.length, 0);
   assert.equal(h.checkpoint(), null);
+  assert.deepEqual(h.alerts, []);
+  assert.equal(h.w.document.querySelector('[data-action="stage"]').dataset.state, 'blocked');
 });
 
 test('failure to persist one lane cannot erase an already dispatched lane', async t => {
@@ -223,4 +311,8 @@ test('failure to persist one lane cannot erase an already dispatched lane', asyn
   h.gates.stage.resolve(); await pending;
   assert.equal(h.e('__nextCalls'), 0);
   assert.match(h.checkpoint().completed.join('\n'), /Stage:.*server confirmed/);
+  const d = h.w.document.querySelector('#pertama-save-progress');
+  assert.equal(d.querySelector('[data-action="stage"]').dataset.state, 'confirmed');
+  assert.equal(d.querySelector('[data-action="note"]').dataset.state, 'failed');
+  assert.equal(d.querySelector('[data-action="task"]').dataset.state, 'blocked');
 });
