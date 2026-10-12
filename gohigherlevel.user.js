@@ -26,6 +26,7 @@
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
   let refreshButtons = () => {};
+  let hideStageIndicator = () => {};
   const SETTINGS_KEY = `pertama:settings:${LOCATION_ID}`;
   const CATALOG_KEY = `pertama:pipelines:${LOCATION_ID}`;
   const SETTINGS_DEFAULTS = {
@@ -611,6 +612,8 @@
   function invalidateContactReads() {
     contactReadEpoch++;
     contactReads.details = contactReads.opportunities = null;
+    hideStageIndicator();
+    refreshButtons();
   }
   function rejectCrmAuthorization() {
     liveReadHeaders = null;
@@ -654,7 +657,8 @@
         || o.contactId !== id || o.locationId !== LOCATION_ID || ids.has(o.id)) throw new Error('Invalid contact opportunity identity/account.');
       ids.add(o.id);
       return Object.freeze({ id: o.id, contactId: o.contactId, locationId: o.locationId,
-        pipelineId: o.pipelineId, pipelineStageId: o.pipelineStageId, assignedTo: optional(o.assignedTo) });
+        pipelineId: o.pipelineId, pipelineStageId: o.pipelineStageId, assignedTo: optional(o.assignedTo),
+        ...(o.status == null ? {} : { status: optional(o.status) }) });
     }));
   }
   function contactOpportunityQuery(id) {
@@ -675,6 +679,7 @@
       await requireVerifiedUser();
       if (!validContactRead(context)) throw new Error('Contact read became stale.');
       slot.value = normalizeContactRead(kind, data, context.id);
+      refreshButtons();
       return slot.value;
     })();
     try { return await slot.pending; }
@@ -723,6 +728,7 @@
     const existing = contactReads[observation.kind];
     if (!existing || !existing.pending && existing.context.started <= observation.context.started) {
       contactReads[observation.kind] = { context: observation.context, value, pending: null };
+      refreshButtons();
     }
   }
 
@@ -2013,6 +2019,7 @@
       runButton.disabled = false;
       runButton.textContent = 'Save and next';
       nextButton.textContent = nextLeadLabel();
+      refreshButtons();
     }
   }
 
@@ -2176,8 +2183,50 @@
   settingsButton.textContent = 'Workflow settings';
   settingsButton.style.cssText = 'display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:calc(100% - 20px);min-height:42px;margin:10px;padding:10px 8px;background:#155eef;color:white;border:1px solid #528bff;border-radius:8px;font:600 14px/1.25 sans-serif;white-space:normal;cursor:pointer;flex-shrink:0';
   settingsButton.addEventListener('click', openSettings);
+  const stageBadge = document.createElement('span');
+  stageBadge.id = 'pertama-contact-stage';
+  stageBadge.hidden = true;
+  stageBadge.style.cssText = 'flex:0 1 auto;min-width:0;max-width:50%;margin-left:6px;padding:2px 8px;border:1px solid #e4e7ec;border-radius:12px;background:#f2f4f7;color:#344054;font:500 12px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+  hideStageIndicator = () => { if (!stageBadge.hidden) stageBadge.hidden = true; };
+  let indicatorAttempt = '';
+  function updateStageIndicator(name) {
+    const context = contactReadContext();
+    if (!name || !validContactRead(context)) { hideStageIndicator(); return; }
+    const cached = kind => {
+      const slot = contactReads[kind];
+      return slot?.value && validContactRead(slot.context) ? slot.value : null;
+    };
+    const contact = cached('details'), opportunities = cached('opportunities');
+    if (!contact || !opportunities) {
+      hideStageIndicator();
+      const key = `${context.id}:${context.user}:${context.epoch}:${stageRouteRevision}`;
+      if (!busy && indicatorAttempt !== key) {
+        indicatorAttempt = key;
+        // Coalesce with native/workflow reads; drain both even if one fails. No idle retries.
+        drainAll([readContactDetails(), readContactOpportunities()]).catch(() => {}).finally(refreshButtons);
+      }
+      return;
+    }
+    const open = opportunities.filter(item => !item.status || item.status === 'open');
+    const origin = readOrigin(contact.id);
+    const opportunity = origin ? open.find(item => item.id === origin.opportunityId) : open.length === 1 ? open[0] : null;
+    const pipeline = opportunity && NAV_PIPELINES.find(item => item.id === opportunity.pipelineId);
+    const stage = pipeline && Object.keys(pipeline.stages).find(label => pipeline.stages[label] === opportunity.pipelineStageId);
+    const contactName = [contact.firstName.trim(), contact.lastName.trim()].filter(Boolean).join(' ').replace(/\s+/g, ' ');
+    if (!stage || !contactName || text(name).replace(/\s+/g, ' ') !== contactName
+      || origin && (origin.pipelineId ? origin.pipelineId !== pipeline.id : origin.pipeline && origin.pipeline !== pipeline.name)) {
+      hideStageIndicator(); return;
+    }
+    const anchor = name.parentElement?.style.display === 'contents' ? name.parentElement : name;
+    if (anchor.nextElementSibling !== stageBadge) anchor.insertAdjacentElement('afterend', stageBadge);
+    if (stageBadge.textContent !== stage) stageBadge.textContent = stage;
+    const label = `Stage: ${stage}`;
+    if (stageBadge.title !== label) stageBadge.title = label;
+    if (stageBadge.getAttribute('aria-label') !== label) stageBadge.setAttribute('aria-label', label);
+    if (stageBadge.hidden) stageBadge.hidden = false;
+  }
   // No idle polling. Discover once, then watch only the hosts and their ancestry.
-  let messageHub = null, settingsAnchor = null, companies = null;
+  let messageHub = null, settingsAnchor = null, companies = null, centralName = null;
   let frame = null, discoveryTimer = null, discoveryRetryTimer = null, discoveryExpired = false;
   let discoveryActive = false, observedWidthTarget = null, observedWidth = null;
   let lastPath = location.pathname;
@@ -2191,7 +2240,7 @@
       if (owned(record.target)) continue;
       const nodes = [...record.addedNodes, ...record.removedNodes];
       const removedControl = [...record.removedNodes].some(node =>
-        [runButton, nextButton, settingsButton].includes(node) && !node.isConnected);
+        [runButton, nextButton, settingsButton, stageBadge].includes(node) && !node.isConnected);
       if (record.type === 'childList' && nodes.length && nodes.every(owned) && !removedControl) continue;
       changed = true;
       for (const node of record.addedNodes) if (node.nodeType === Node.ELEMENT_NODE && !owned(node)) rootsToDiscover.add(node);
@@ -2232,15 +2281,18 @@
   function watchHosts() {
     hostObserver.disconnect();
     for (const el of knownAnchors) if (!el.isConnected) knownAnchors.delete(el);
-    const hosts = [companies, ...knownAnchors].filter(el => el?.isConnected);
-    // An anchor's parent could be the entire app. Only anchors and explicit navigation
-    // containers get subtree observation; all other ancestors get direct-child checks.
+    const hosts = [companies, centralName, ...knownAnchors].filter(el => el?.isConnected);
+    // A host's parent could be the entire app. Only controls, navigation and the name
+    // container get subtree observation; other ancestors get direct-child checks.
     const localRoots = new Set(hosts);
     for (const el of hosts) {
       const nav = el.closest('nav, [role="navigation"]');
       if (nav) localRoots.add(nav);
     }
+    const nameContainer = centralName?.parentElement?.style.display === 'contents' ? centralName.parentElement.parentElement : centralName?.parentElement;
+    if (nameContainer?.isConnected) localRoots.add(nameContainer);
     const ancestors = new Set([document.body]);
+    if (nameContainer?.isConnected) ancestors.add(nameContainer);
     for (const el of hosts) for (let node = el; node; node = node.parentElement) ancestors.add(node);
     for (const node of ancestors) hostObserver.observe(node, {
       childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'], characterData: true,
@@ -2292,9 +2344,11 @@
     for (const root of rootsToDiscover) discover(root);
     rootsToDiscover.clear();
     companies = document.getElementById('tb_business');
+    centralName = document.querySelector('[data-testid="CENTRALPANEL_NAME"]');
 
     // Finish layout reads before any writes; never measure unrelated page controls.
     const showRun = Boolean(contactId() && visible(companies));
+    const visibleName = visible(centralName) ? centralName : null;
     const hub = visible(messageHub) ? messageHub : null;
     const settings = visible(settingsAnchor) ? settingsAnchor : null;
     const widthTarget = hub || settings;
@@ -2319,10 +2373,12 @@
       if (nextButton.style.fontSize !== nextSize) nextButton.style.fontSize = nextSize;
       if (settingsButton.style.fontSize !== settingsSize) settingsButton.style.fontSize = settingsSize;
     }
+    updateStageIndicator(visibleName);
     watchHosts();
     const missingNavHosts = !widthTarget;
     const missingToolbar = Boolean(contactId() && !companies);
-    if (!missingNavHosts && !missingToolbar) stopDiscovery();
+    const missingName = Boolean(validContactRead(contactReadContext()) && !centralName);
+    if (!missingNavHosts && !missingToolbar && !missingName) stopDiscovery();
     else if (!discoveryExpired) {
       if (!discoveryTimer) discoveryTimer = setTimeout(() => { stopDiscovery(); discoveryExpired = true; }, 30000);
       if (missingNavHosts && !discoveryActive) {
@@ -2340,7 +2396,8 @@
   });
   document.addEventListener('click', () => {
     if (location.pathname.includes(`/location/${LOCATION_ID}/`) &&
-      (!(messageHub?.isConnected || settingsAnchor?.isConnected) || contactId() && !companies?.isConnected)) wakeDiscovery();
+      (!(messageHub?.isConnected || settingsAnchor?.isConnected)
+        || contactId() && (!companies?.isConnected || currentUserId && !centralName?.isConnected))) wakeDiscovery();
   }, true);
   placeButton();
   }
