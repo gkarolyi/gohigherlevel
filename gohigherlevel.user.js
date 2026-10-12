@@ -357,7 +357,7 @@
     group.options = { ...group.options, include: [pipeline.stages[stage]] };
     return opportunityFromResponse(await readList('/opportunities/search', body), pipeline, stage, excludedContact);
   }
-  function taskContactFromResponse(data) {
+  function taskContactFromResponse(data, dueBefore) {
     if (!Array.isArray(data.customObjectRecords)) throw new Error('Task list response is unreadable.');
     const task = data.customObjectRecords[0];
     if (!task) {
@@ -365,6 +365,8 @@
       throw new Error('Task list reports results but the first task is missing.');
     }
     if (task.locationId !== LOCATION_ID || ![false, 0].includes(task.properties?.completed)) throw new Error('Top task is not a pending task in this account.');
+    const due = typeof task.properties.dueDate === 'string' ? Date.parse(task.properties.dueDate) : NaN;
+    if (!Number.isFinite(due) || due > Date.parse(dueBefore)) throw new Error('Top task has no valid due date or is not due yet. No task was actioned.');
     const contacts = (task.relations || []).filter(r => r.associationId === 'TASK_CONTACT_ASSOCIATION' && r.objectKey === 'contact');
     if (contacts.length !== 1 || !contacts[0].recordId) throw new Error('The top task has no unique associated contact. No task was skipped or completed.');
     return { contactId: contacts[0].recordId };
@@ -401,7 +403,22 @@
     body.page = 1;
     const completedFilters = filterValues(body.filters, 'properties.completed');
     if (completedFilters.length !== 1 || completedFilters[0] !== 0) throw new Error('Saved task query is not restricted to pending tasks.');
-    return taskContactFromResponse(await readList('/objects/task/records/search', body));
+    function removeDateFilters(filters) {
+      return filters.flatMap(filter => {
+        if (filter.field === 'properties.dueDate') return [];
+        if (!filter.filters) return [filter];
+        const children = removeDateFilters(filter.filters);
+        return children.length || !filter.filters.length ? [{ ...filter, filters: children }] : [];
+      });
+    }
+    const dueBefore = new Date().toISOString();
+    // Captured date windows go stale. Preserve other filters, but always select due tasks as of this lookup.
+    const remaining = removeDateFilters(body.filters);
+    const filters = remaining.length === 1 && remaining[0].group === 'AND' ? remaining[0].filters : remaining;
+    body.filters = [{ group: 'AND', filters: [...filters,
+      { field: 'properties.dueDate', operator: 'range', value: { gte: '1901-01-01T00:00:00Z', lte: dueBefore } },
+    ] }];
+    return taskContactFromResponse(await readList('/objects/task/records/search', body), dueBefore);
   }
   function contactRouter(path) {
     const routers = new Set();
@@ -568,7 +585,7 @@
     return settings.priority === 'stage' ? `Next lead — ${stageQueueLabel()}` : 'Next lead';
   }
   function emptyQueueMessage() {
-    if (settings.priority !== 'stage') return 'You’re all caught up! No new leads or pending tasks match your selected queues. Nice work.';
+    if (settings.priority !== 'stage') return 'You’re all caught up! No new leads or due follow-up tasks match your selected queues. Nice work.';
     const context = stageQueueContext();
     return context ? `No other matching leads in ${context.pipeline.name} · ${context.stage}.`
       : 'The original stage queue is unavailable. Reopen the pipeline board.';
@@ -2063,7 +2080,7 @@
       <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option><option value="stage">Same stage only</option></select></label>
       <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; otherwise its current pipeline and stage are inferred automatically. You will only be asked to choose a queue if multiple opportunities make it ambiguous. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
       <label>New lead stage name<input name="newLeadStage" required></label>
-      <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups use your saved task-list filters. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
+      <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups preserve your other task-list filters and sorting, but only include tasks already due, with a fresh cutoff on every lookup. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
       <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Leave follow-up days blank to keep Add task off by default; you can still enable it when saving. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
       <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
     const form = dialog.querySelector('form');

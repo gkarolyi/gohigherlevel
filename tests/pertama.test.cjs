@@ -870,7 +870,7 @@ test('quick away-and-back navigation invalidates an in-flight lookup', async t =
 test('empty lead/task queues show an accurate congratulatory notice', t => {
   const h = harness(t);
   assert.equal(h.evaluate('emptyQueueMessage()'),
-    'You’re all caught up! No new leads or pending tasks match your selected queues. Nice work.');
+    'You’re all caught up! No new leads or due follow-up tasks match your selected queues. Nice work.');
 });
 
 test('Next lead uses pinned queue and shows stage-specific empty notice without tasks', async t => {
