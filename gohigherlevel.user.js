@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      0.2.12
+// @version      1.0.4
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
+// @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
+// @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @match        https://go.pertamaproperty.com/*
 // @run-at       document-start
 // @grant        none
@@ -11,10 +13,15 @@
 
 (() => {
   'use strict';
+  // Reading map: settings/catalog and queue lookup; CRM session/read observers;
+  // approved writes and checkpoints; Save-and-next/Call/SMS workflows; button placement.
+  // Save and next: run -> readActionContext -> confirmActions -> selected API saves
+  // -> findNextActionable -> openLead. Uncertain writes leave a checkpoint, never retry.
   if (window.__pertamaNoAnswerInstalled) return;
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
+  const VERSION = '1.0.4';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -24,7 +31,7 @@
   const SETTINGS_DEFAULTS = {
     note: 'No answer. Will contact again.', task: 'Call again {fullName}',
     sms: 'Hi {firstName}, following up on your property enquiry. Please let me know a convenient time to speak. Thanks!',
-    priority: 'leads', newLeadStage: 'New Lead', pipelineIds: [],
+    smsFrom: '', priority: 'leads', newLeadStage: 'New Lead', pipelineIds: [],
     rules: {
       'New Lead': { next: 'Attempted Contact', days: 1, updateStage: true },
       'Attempted Contact': { next: 'ATC 2', days: 3, updateStage: true },
@@ -52,7 +59,10 @@
         throw new Error('Each stage rule needs a destination and whole follow-up days from 0 to 36500, or no task.');
       }
     }
-    return value;
+    if (value.smsFrom != null && value.smsFrom !== '' && (typeof value.smsFrom !== 'string' || !/^\+[1-9]\d{6,14}$/.test(value.smsFrom))) {
+      throw new Error('Invalid SMS sender number.');
+    }
+    return { ...value, smsFrom: value.smsFrom || '' };
   }
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
@@ -100,7 +110,7 @@
   let currentUserId = null;
   let identityStatus = 'Awaiting CRM authentication headers';
   let identityExpires = 0;
-  window.pertamaUserDiagnostics = () => ({ version: '0.2.12', status: identityStatus,
+  window.pertamaUserDiagnostics = () => ({ version: VERSION, status: identityStatus,
     verified: Boolean(currentUserId) && identityExpires > Date.now() / 1000 });
   async function requireVerifiedUser() {
     if (!currentUserId || identityExpires <= Date.now() / 1000) {
@@ -120,6 +130,7 @@
     return { id: claims.user_id, expires: claims.exp };
   }
   function bindUserSession(headers) {
+    const previousUser = currentUserId;
     try {
       const user = userFromHeaders(headers);
       currentUserId = user.id;
@@ -130,6 +141,7 @@
       identityExpires = 0;
       identityStatus = error.message;
     }
+    if (previousUser !== currentUserId) invalidateContactReads();
   }
   function scopeLeadFilters(filters, id) {
     function removeUserFilters(items) {
@@ -241,9 +253,10 @@
   }
   // Keep exact wire URLs from the recordings, including trailing slashes.
   // Use endpoint-specific non-secret headers rather than the last request's metadata.
+  const CRM_HEADERS = { accept: 'application/json, text/plain, */*',
+    channel: 'APP', source: 'WEB_USER', version: '2021-07-28' };
   function wireRequest(method, path, body) {
-    const headers = { accept: 'application/json, text/plain, */*',
-      channel: 'APP', source: 'WEB_USER', version: '2021-07-28' };
+    const headers = { ...CRM_HEADERS };
     if (method !== 'GET') headers['content-type'] = 'application/json';
     if (method === 'POST' && !(path === '/opportunities/search' && body?.aggregations)) headers.developer_version = '';
     const wirePath = path === '/notes' || path === '/opportunities/search' && !body?.aggregations ? `${path}/` : path;
@@ -252,16 +265,20 @@
   // Diagnostics contain request metadata only, never tokens or message bodies.
   const requestDiagnostics = [];
   window.pertamaRequestDiagnostics = requestDiagnostics;
+  function recordRequest(diagnostic) {
+    requestDiagnostics.push(diagnostic);
+    if (requestDiagnostics.length > 30) requestDiagnostics.shift();
+  }
   async function crmRequest(method, path, body, saveDescription = '') {
-    if (method !== 'POST' || !['/opportunities/search', '/objects/task/records/search'].includes(path)
-      || body?.locationId !== LOCATION_ID || saveDescription) throw new Error('Direct requests are restricted to read-only lead/task searches.');
+    const contactRead = method === 'GET' && /^\/contacts\/[a-zA-Z0-9_-]+$/.test(path) && body === undefined;
+    const listRead = method === 'POST' && ['/opportunities/search', '/objects/task/records/search'].includes(path) && body?.locationId === LOCATION_ID;
+    if ((!contactRead && !listRead) || saveDescription) throw new Error('Direct requests are restricted to read-only contact/lead/task lookups.');
     await wait(() => liveReadHeaders, 'live CRM session',
       () => 'No session headers observed. Reload the CRM once after installing this script.', 30000);
     const wire = wireRequest(method, path, body);
-    const diagnostic = { method, url: wire.url, started: new Date().toISOString(), status: null,
+    const diagnostic = { method, url: contactRead ? 'https://services.leadconnectorhq.com/contacts/{id}' : wire.url, started: new Date().toISOString(), status: null,
       result: 'pending', requestFields: Object.keys(body || {}) };
-    requestDiagnostics.push(diagnostic);
-    if (requestDiagnostics.length > 30) requestDiagnostics.shift();
+    recordRequest(diagnostic);
     const started = Date.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
@@ -269,11 +286,12 @@
       const response = await originalFetch.call(window, wire.url, {
         method, headers: { ...wire.headers, ...liveReadHeaders },
         redirect: 'error',
+        ...(contactRead ? { cache: 'no-store' } : {}),
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: controller.signal,
       });
       diagnostic.status = response.status;
       if (!response.ok) {
-        if ([401, 403].includes(response.status)) liveReadHeaders = null;
+        if ([401, 403].includes(response.status)) rejectCrmAuthorization();
         throw new Error(`HTTP ${response.status}`);
       }
       const data = await response.json();
@@ -287,7 +305,7 @@
       console.error('Pertama request failed', diagnostic);
       const detail = diagnostic.status === null && error.name !== 'AbortError'
         ? ' Browser supplied no HTTP response. Inspect Network/Console for a connection, CORS or redirect error; the cause cannot be determined here.' : '';
-      throw new Error(`${method} ${new URL(wire.url).pathname}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : error.message}. Lookup failed.${detail} No automatic retry.`);
+      throw new Error(`${method} ${new URL(diagnostic.url).pathname}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : error.message}. Lookup failed.${detail} No automatic retry.`);
     } finally { diagnostic.elapsedMs = Date.now() - started; clearTimeout(timeout); }
   }
   function opportunityFromResponse(data, pipeline, stage, excludedContact) {
@@ -384,19 +402,100 @@
     if (completedFilters.length !== 1 || completedFilters[0] !== 0) throw new Error('Saved task query is not restricted to pending tasks.');
     return taskContactFromResponse(await readList('/objects/task/records/search', body));
   }
-  function openLead(lead) {
+  function contactRouter(path) {
+    const routers = new Set();
+    for (const root of document.querySelectorAll('[data-v-app]')) {
+      const router = root.__vue_app__?.config?.globalProperties?.$router;
+      if (typeof router?.push !== 'function' || typeof router?.resolve !== 'function') continue;
+      try {
+        const resolved = router.resolve(path);
+        const url = new URL(resolved.href, location.href);
+        if (resolved.name === 'contact_detail-v2' && url.origin === location.origin
+          && url.pathname === path && !url.search && !url.hash) routers.add(router);
+      } catch { /* This mounted app may not own contact routes. */ }
+    }
+    if (routers.size > 1) throw new Error('Multiple contact routers found. Navigation stopped.');
+    return routers.values().next().value || null;
+  }
+  let retiringContactControls = [];
+  function previousContactControlsGone() {
+    retiringContactControls = retiringContactControls.filter(node => node.isConnected);
+    return retiringContactControls.length === 0;
+  }
+  function requireContactControlsReady() {
+    if (!previousContactControlsGone()) {
+      throw new Error('Previous contact controls are still mounted. Wait for the contact to finish switching or reload before using workflow actions.');
+    }
+  }
+  async function openLead(lead) {
+    requireContactControlsReady();
     if (!/^[a-zA-Z0-9_-]+$/.test(lead.contactId)) throw new Error('Invalid contact ID returned by lookup.');
+    if (lead.contactId === contactId()) throw new Error('This is the next top lead; action it first.');
+    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Open the Pertama account first.');
+    const path = `/v2/location/${LOCATION_ID}/contacts/detail/${lead.contactId}`;
+    const router = contactRouter(path);
+    const sourcePath = location.pathname, sourceRevision = stageRouteRevision, previousQueue = stageQueue;
+    const originKey = `pertama:origin:${lead.contactId}`;
+    const previousOrigin = router ? sessionStorage.getItem(originKey) : null;
     if (lead.opportunityId) pinStageQueue({ contactId: lead.contactId, opportunityId: lead.opportunityId,
       pipelineId: lead.pipelineId, stageId: lead.stageId });
     else {
       clearStageQueue();
       sessionStorage.removeItem(`pertama:origin:${lead.contactId}`);
     }
+    if (router) {
+      // The live-tested native transition replaces name/owner controls. Track hidden
+      // controls too: opening a retained task/SMS panel must not expose the old record.
+      const details = document.getElementById('record-details-lhs') || document;
+      retiringContactControls = [...new Set([
+        nameInput('first_name', 'First name'), nameInput('last_name', 'Last name'), nameInput('phone', 'Phone'),
+        ...details.querySelectorAll('input[id="contact.first_name"], input[id="contact.last_name"], input[id="contact.phone"], input[id="first_name"], input[id="last_name"], input[id="phone"], input[name="first_name"], input[name="last_name"], input[name="phone"], input[name="contact.first_name"], input[name="contact.last_name"], input[name="contact.phone"]'),
+        ...document.querySelectorAll('#owner-dropdown-trigger, #tasks-list-container-contact, #conv-composer-textarea-input, #conv-send-button-simple'),
+      ].filter(node => node?.isConnected))];
+      const started = performance.now();
+      let phase = 'Native route committed';
+      try {
+        // Native navigation stays in this document; a retained toolbar is not a readiness signal.
+        try { sessionStorage.removeItem(NAVIGATION_TIMING_KEY); } catch { /* Optional timing only. */ }
+        const failure = await router.push(path);
+        const current = router.currentRoute?.value;
+        const resolved = current && router.resolve(current.path);
+        if (failure || location.pathname !== path || current?.name !== 'contact_detail-v2'
+          || new URL(resolved.href, location.href).pathname !== path) {
+          throw new Error('Native contact navigation was cancelled or redirected. No automatic retry.');
+        }
+        recordWorkflowTiming('Navigation', phase, performance.now() - started);
+        phase = 'Previous contact controls released';
+        const committedRevision = stageRouteRevision;
+        await wait(() => {
+          if (location.pathname !== path || stageRouteRevision !== committedRevision) {
+            throw new Error('Contact changed while waiting for native navigation. No automatic retry.');
+          }
+          return previousContactControlsGone();
+        }, 'previous contact controls to be replaced', () => 'Old controls remain mounted. Reload before using workflow actions.');
+        recordWorkflowTiming('Navigation', phase, performance.now() - started);
+        refreshButtons();
+        return;
+      } catch (error) {
+        // A cancelled push must not replace the source queue; unrelated navigation must not resurrect it.
+        if (location.pathname === sourcePath && stageRouteRevision === sourceRevision) {
+          retiringContactControls = [];
+          stageQueue = previousQueue;
+          if (previousQueue) sessionStorage.setItem(STAGE_QUEUE_KEY, JSON.stringify(previousQueue));
+          else sessionStorage.removeItem(STAGE_QUEUE_KEY);
+          if (previousOrigin === null) sessionStorage.removeItem(originKey);
+          else sessionStorage.setItem(originKey, previousOrigin);
+        }
+        recordWorkflowTiming('Navigation', phase, performance.now() - started, 'stopped');
+        refreshButtons();
+        throw error;
+      }
+    }
     try {
       sessionStorage.setItem(NAVIGATION_TIMING_KEY, JSON.stringify({ contactId: lead.contactId,
         startedAt: Date.now(), sourceTimeOrigin: performance.timeOrigin }));
     } catch { /* Optional timing must never prevent navigation. */ }
-    location.assign(`/v2/location/${LOCATION_ID}/contacts/detail/${lead.contactId}`);
+    location.assign(path);
   }
 
   // One tab-local queue, bound to the contact being viewed. Never derive it from a stage save.
@@ -422,6 +521,7 @@
     if (stageQueuePath === location.pathname) return;
     stageQueuePath = location.pathname;
     stageRouteRevision++;
+    invalidateContactReads();
     refreshButtons();
     stageResults.clear();
     stageRevision++;
@@ -467,7 +567,7 @@
     return settings.priority === 'stage' ? `Next lead — ${stageQueueLabel()}` : 'Next lead';
   }
   function emptyQueueMessage() {
-    if (settings.priority !== 'stage') return 'No leads or pending tasks match your selected queues and saved filters.';
+    if (settings.priority !== 'stage') return 'You’re all caught up! No new leads or pending tasks match your selected queues. Nice work.';
     const context = stageQueueContext();
     return context ? `No other matching leads in ${context.pipeline.name} · ${context.stage}.`
       : 'The original stage queue is unavailable. Reopen the pipeline board.';
@@ -504,47 +604,155 @@
     }
   }
 
-  // Observe session headers, list results and save receipts; leave CRM requests unchanged.
-  let receiptBatch = null;
-  function beginReceipts() {
-    receiptBatch = [];
-    return receiptBatch;
+  // Two bounded, tab-memory-only read slots. Epoch changes also retire pending reads.
+  let contactReadEpoch = 0;
+  let contactWritesPending = 0;
+  const contactReads = { details: null, opportunities: null };
+  function invalidateContactReads() {
+    contactReadEpoch++;
+    contactReads.details = contactReads.opportunities = null;
   }
+  function rejectCrmAuthorization() {
+    liveReadHeaders = null;
+    currentUserId = null; identityExpires = 0; identityStatus = 'CRM authorization rejected';
+    invalidateContactReads();
+  }
+  function contactReadContext() {
+    syncStageQueue();
+    return { id: contactId(), user: currentUserId, epoch: contactReadEpoch, started: Date.now(), blocked: contactWritesPending > 0 };
+  }
+  function validContactRead(context) {
+    syncStageQueue();
+    return context.id && /^[a-zA-Z0-9_-]+$/.test(context.id)
+      && location.pathname.includes(`/location/${LOCATION_ID}/`) && context.id === contactId()
+      && context.user && context.user === currentUserId && identityExpires > Date.now() / 1000
+      && context.epoch === contactReadEpoch && !context.blocked && !contactWritesPending;
+  }
+  function reusableContactRead(context) {
+    const age = Date.now() - context.started;
+    return age >= 0 && age < 5000 && validContactRead(context);
+  }
+  function normalizeContactRead(kind, data, id) {
+    const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(value);
+    const optional = value => {
+      if (value == null) return '';
+      if (typeof value !== 'string') throw new Error('Malformed contact read field.');
+      return value;
+    };
+    if (kind === 'details') {
+      const c = data?.contact;
+      if (!c || c.id !== id || c.locationId !== LOCATION_ID) throw new Error('Contact identity/account mismatch.');
+      return Object.freeze({ id: c.id, locationId: c.locationId, firstName: optional(c.firstName),
+        lastName: optional(c.lastName), phone: optional(c.phone), assignedTo: optional(c.assignedTo) });
+    }
+    if (!Array.isArray(data?.opportunities) || !Number.isInteger(data.total) || data.total !== data.opportunities.length) {
+      throw new Error('Contact opportunities are incomplete.');
+    }
+    const ids = new Set();
+    return Object.freeze(data.opportunities.map(o => {
+      if (!o || !['id', 'pipelineId', 'pipelineStageId'].every(key => safeId(o[key]))
+        || o.contactId !== id || o.locationId !== LOCATION_ID || ids.has(o.id)) throw new Error('Invalid contact opportunity identity/account.');
+      ids.add(o.id);
+      return Object.freeze({ id: o.id, contactId: o.contactId, locationId: o.locationId,
+        pipelineId: o.pipelineId, pipelineStageId: o.pipelineStageId, assignedTo: optional(o.assignedTo) });
+    }));
+  }
+  function contactOpportunityQuery(id) {
+    return { locationId: LOCATION_ID, page: 1, limit: 100, query: '', sort: [],
+      filters: [{ group: 'OR', filters: [{ field: 'contact_id', operator: 'eq', value: id }] }] };
+  }
+  async function readContactData(kind, fresh) {
+    const context = contactReadContext();
+    await requireVerifiedUser();
+    if (!validContactRead(context)) throw new Error('Contact read context changed or a save is pending.');
+    const cached = contactReads[kind];
+    if (cached && validContactRead(cached.context) && (cached.pending || !fresh && reusableContactRead(cached.context))) return cached.pending || cached.value;
+    const slot = { context, pending: null, value: null };
+    contactReads[kind] = slot;
+    slot.pending = (async () => {
+      const data = kind === 'details' ? await crmRequest('GET', `/contacts/${context.id}`)
+        : await crmRequest('POST', '/opportunities/search', contactOpportunityQuery(context.id));
+      await requireVerifiedUser();
+      if (!validContactRead(context)) throw new Error('Contact read became stale.');
+      slot.value = normalizeContactRead(kind, data, context.id);
+      return slot.value;
+    })();
+    try { return await slot.pending; }
+    catch (error) { if (contactReads[kind] === slot) contactReads[kind] = null; throw error; }
+    finally { slot.pending = null; }
+  }
+  function readContactDetails({ fresh = false } = {}) { return readContactData('details', fresh); }
+  function readContactOpportunities({ fresh = false } = {}) { return readContactData('opportunities', fresh); }
+  function safeContactSearch(raw, id) {
+    const body = jsonValue(raw);
+    if (!body || body.locationId !== LOCATION_ID || body.page !== 1 || body.query !== ''
+      || Object.keys(body).some(key => !['locationId', 'page', 'limit', 'query', 'sort', 'filters'].includes(key))
+      || !Array.isArray(body.filters) || body.filters.length !== 1) return false;
+    const group = body.filters[0];
+    if (!['OR', 'AND'].includes(group.group) || !Array.isArray(group.filters)) return false;
+    const contact = f => f.field === 'contact_id' && f.operator === 'eq' && f.value === id && !f.filters;
+    return group.filters.length === 1 && contact(group.filters[0])
+      || group.group === 'OR' && group.filters.length === 2 && group.filters.some(contact)
+        && group.filters.every(f => contact(f) || f.field === 'id' && f.operator === 'eq'
+          && Array.isArray(f.value) && f.value.length > 0 && f.value.every(id => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id)) && !f.filters);
+  }
+  function observeContactRequest(method, url, body) {
+    const parsed = new URL(url, location.href);
+    if (!['https://services.leadconnectorhq.com', 'https://backend.leadconnectorhq.com'].includes(parsed.origin)) return null;
+    const path = parsed.pathname.replace(/\/$/, '');
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && /^\/(contacts|opportunities)(\/|$)/.test(path)
+      && !/\/search$/.test(path)) {
+      invalidateContactReads(); contactWritesPending++;
+      return { write: true, finished: false };
+    }
+    const context = contactReadContext();
+    if (!validContactRead(context)) return null;
+    if (method === 'GET' && parsed.pathname === `/contacts/${context.id}` && !parsed.search) return { kind: 'details', context };
+    if (method === 'POST' && parsed.origin === 'https://services.leadconnectorhq.com' && path === '/opportunities/search') {
+      return { kind: 'opportunities', context, query: Promise.resolve(body()).then(raw => safeContactSearch(raw, context.id), () => false) };
+    }
+    return null;
+  }
+  function finishContactWrite(observation) {
+    if (!observation?.write || observation.finished) return;
+    observation.finished = true; contactWritesPending--; invalidateContactReads();
+  }
+  async function rememberContactRead(observation, data) {
+    if (!observation?.kind || observation.query && !await observation.query || !reusableContactRead(observation.context)) return;
+    const value = normalizeContactRead(observation.kind, data, observation.context.id);
+    const existing = contactReads[observation.kind];
+    if (!existing || !existing.pending && existing.context.started <= observation.context.started) {
+      contactReads[observation.kind] = { context: observation.context, value, pending: null };
+    }
+  }
+
+  // Observe session headers, read results and mutations; leave CRM requests unchanged.
   function jsonValue(value) {
     try { return typeof value === 'string' ? JSON.parse(value) : value; }
     catch { return null; }
   }
-  function observeRequest(method, url, body) {
-    if (!receiptBatch) return null;
-    const parsed = new URL(url, location.href);
-    const path = parsed.pathname.replace(/\/$/, '');
-    if (parsed.hostname !== 'services.leadconnectorhq.com'
-      || !(method === 'PUT' && /^\/opportunities\/[^/]+$/.test(path)
-        || method === 'POST' && ['/notes', '/objects/task/records', '/associations/relations/bulk'].includes(path))) return null;
-    const receipt = { method, path, request: null, requestReady: false, status: null, response: null, finished: false };
-    receiptBatch.push(receipt);
-    Promise.resolve().then(body).then(value => { receipt.request = jsonValue(value); receipt.requestReady = true; }, () => { receipt.requestReady = true; });
-    return receipt;
-  }
-  function finishReceipt(receipt, status, body) {
-    if (!receipt) return;
-    receipt.status = status;
-    receipt.response = jsonValue(body);
-    receipt.finished = true;
-  }
   const originalFetch = window.fetch;
   window.fetch = function(input, init) {
-    let receipt, stageObservation = null;
+    let stageObservation = null, contactObservation = null;
     try {
       const request = input instanceof Request ? input : null;
       stageObservation = observeStageRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input));
       captureReadHeaders(request?.url || String(input), init?.headers || request?.headers);
+      contactObservation = observeContactRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
+        () => init?.body ?? (request ? request.clone().text() : null));
       captureQuery((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
         () => init?.body ?? (request ? request.clone().text() : null));
-      receipt = observeRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
-        () => init?.body ?? (request ? request.clone().text() : null));
     } catch { /* Observing must never prevent the CRM request. */ }
-    const result = originalFetch.apply(this, arguments);
+    let result;
+    try { result = originalFetch.apply(this, arguments); }
+    catch (error) { finishContactWrite(contactObservation); finishStageWrite(stageObservation); throw error; }
+    if (contactObservation?.write) result.then(() => finishContactWrite(contactObservation), () => finishContactWrite(contactObservation));
+    else if (contactObservation) result.then(async response => {
+      if (contactObservation.query && !await contactObservation.query || !validContactRead(contactObservation.context)) return;
+      if ([401, 403].includes(response.status)) { rejectCrmAuthorization(); return; }
+      if (!response.ok || !reusableContactRead(contactObservation.context)) return;
+      return response.clone().json().then(data => rememberContactRead(contactObservation, data));
+    }).catch(() => {});
     if (stageObservation?.write) result.then(() => finishStageWrite(stageObservation), () => finishStageWrite(stageObservation));
     else if (typeof stageObservation === 'number') {
       result.then(response => response.ok ? response.clone().json().then(data => rememberStageResults(data, stageObservation)) : null).catch(() => {});
@@ -552,10 +760,6 @@
     if (pipelineListRequest(input instanceof Request ? input.url : String(input))) {
       result.then(response => response.ok ? response.clone().json().then(rememberPipelines) : null).catch(() => {});
     }
-    if (receipt) result.then(response => {
-      response.clone().text().then(body => finishReceipt(receipt, response.status, body),
-        () => finishReceipt(receipt, response.status, null));
-    }, () => finishReceipt(receipt, 0, null)).catch(() => finishReceipt(receipt, 0, null));
     return result;
   };
   const xhrInfo = new WeakMap();
@@ -574,10 +778,22 @@
     return originalOpen.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function(body) {
+    let contactObservation = null, stageObservation = null;
     try {
       const info = xhrInfo.get(this);
       if (info) { captureReadHeaders(info.url, info.headers); captureQuery(info.method, info.url, () => body); }
-      const stageObservation = info ? observeStageRequest(info.method, info.url) : null;
+      contactObservation = info ? observeContactRequest(info.method, info.url, () => body) : null;
+      if (contactObservation) this.addEventListener('loadend', async () => {
+        if (contactObservation.write) finishContactWrite(contactObservation);
+        else try {
+          if (contactObservation.query && !await contactObservation.query || !validContactRead(contactObservation.context)) return;
+          if ([401, 403].includes(this.status)) { rejectCrmAuthorization(); return; }
+          if (this.status >= 200 && this.status < 300 && reusableContactRead(contactObservation.context)) {
+            await rememberContactRead(contactObservation, this.responseType === 'json' ? this.response : JSON.parse(this.responseText));
+          }
+        } catch { /* Passive schema errors must not affect the CRM. */ }
+      }, { once: true });
+      stageObservation = info ? observeStageRequest(info.method, info.url) : null;
       if (stageObservation !== null) this.addEventListener('loadend', () => {
         if (stageObservation.write) finishStageWrite(stageObservation);
         else try {
@@ -587,29 +803,11 @@
       if (info && pipelineListRequest(info.url)) this.addEventListener('loadend', () => {
         try { if (this.status >= 200 && this.status < 300) rememberPipelines(this.responseType === 'json' ? this.response : JSON.parse(this.responseText)); } catch { /* Keep previous catalog. */ }
       }, { once: true });
-      const receipt = info && observeRequest(info.method, info.url, () => body);
-      if (receipt) this.addEventListener('loadend', () => {
-        try { finishReceipt(receipt, this.status, this.responseType === 'json' ? this.response : this.responseText); }
-        catch { finishReceipt(receipt, this.status, null); }
-      }, { once: true });
     } catch { /* Leave the CRM request unchanged. */ }
-    return originalSend.apply(this, arguments);
+    try { return originalSend.apply(this, arguments); }
+    catch (error) { finishContactWrite(contactObservation); finishStageWrite(stageObservation); throw error; }
   };
 
-  async function savedResponse(batch, description, matches, verify) {
-    const receipt = await wait(() => {
-      const found = batch.find(matches);
-      return found?.finished && found.requestReady ? found : null;
-    }, `server confirmation: ${description}`, () => batch.length
-      ? batch.map(r => `${r.method} ${r.path}: ${r.finished ? `HTTP ${r.status}` : 'response pending'}`).join('; ')
-      : 'No matching save requests were observed. Refresh once after installing this version so observation starts before the CRM loads.', 30000);
-    if (receipt.status < 200 || receipt.status >= 300) {
-      throw new Error(`${description}: server returned HTTP ${receipt.status}. Save not confirmed.`);
-    }
-    if (!receipt.response) throw new Error(`${description}: server response was not readable JSON. Save not confirmed.`);
-    verify(receipt.response, receipt.request);
-    return receipt.response;
-  }
   function requireSaved(condition, message) {
     if (!condition) throw new Error(`Server confirmation mismatch: ${message}`);
   }
@@ -653,6 +851,157 @@
       'task was created but its contact association was not confirmed.');
   }
 
+  // Action requests are deliberately separate from the read-only transport.
+  const actionAttempts = new WeakMap();
+  const actionStageVersions = new WeakMap();
+  function safeActionId(value) { return typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(value); }
+  function requireActionApproval(action, context = approvedActionContext, expectedWrites = 0) {
+    syncStageQueue();
+    if (!context || context !== approvedActionContext || context.actions?.[action] !== true
+      || !safeActionId(context.contact) || startingContact !== context.contact
+      || !location.pathname.includes(`/location/${LOCATION_ID}/`)
+      || context.contactRecord?.id !== context.contact || context.contactRecord.locationId !== LOCATION_ID
+      || !liveReadHeaders || userFromHeaders(liveReadHeaders).id !== context.user) {
+      throw new Error('A valid selected action and live approved contact/account/session are required.');
+    }
+    assertApprovedActionContext(expectedWrites);
+    return context;
+  }
+  async function recheckActionContact(action, context) {
+    requireActionApproval(action, context);
+    const fresh = await readContactDetails({ fresh: true });
+    requireActionApproval(action, context);
+    if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => fresh[key] !== context.contactRecord[key])) {
+      throw new Error('Contact changed after confirmation. Further saves stopped.');
+    }
+  }
+  function actionRequestShape(operation, context) {
+    if (operation === 'stageRead' || operation === 'stage') {
+      const o = context.opportunity;
+      if (!o || !['id', 'pipelineId', 'pipelineStageId'].every(key => safeActionId(o[key]))
+        || o.contactId !== context.contact || o.locationId !== LOCATION_ID
+        || !safeActionId(context.targetStageId) || typeof context.targetStageName !== 'string') throw new Error('Invalid approved opportunity/stage.');
+      const version = actionStageVersions.get(context);
+      if (operation === 'stage' && (!Number.isSafeInteger(version) || version < 1)) throw new Error('Fresh opportunity version is required.');
+      return { action: 'stage', method: operation === 'stageRead' ? 'GET' : 'PUT', path: `/opportunities/${o.id}`,
+        body: operation === 'stageRead' ? undefined : { pipelineStageId: context.targetStageId, indexVersion: version, isAttribute: false } };
+    }
+    if (operation === 'note') {
+      if (typeof context.noteText !== 'string' || !context.noteText.trim()) throw new Error('Approved note is empty.');
+      const escaped = context.noteText.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+      return { action: 'note', method: 'POST', path: `/notes/?locationId=${LOCATION_ID}`,
+        body: { body: `<p>${escaped.replace(/\r\n?|\n/g, '<br>\n')}</p>`, title: '', color: '#fef7c3', relations: [{ objectKey: 'contact', recordId: context.contact }] } };
+    }
+    if (operation === 'task') {
+      const due = typeof context.due === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(context.due) && new Date(`${context.due}T03:00:00Z`);
+      if (!safeActionId(context.ownerId) || context.ownerId !== context.contactRecord.assignedTo
+        || typeof context.taskTitle !== 'string' || !context.taskTitle.trim()
+        || !due || !Number.isFinite(due.getTime()) || due.toISOString().slice(0, 10) !== context.due || context.taskId !== null) throw new Error('Invalid approved task owner/title/deadline or task already created.');
+      return { action: 'task', method: 'POST', path: '/objects/task/records', body: { locationId: LOCATION_ID, owners: [context.ownerId],
+        properties: { title: context.taskTitle, dueDate: due.toISOString(), completed: false, description: '', contactId: context.contact } } };
+    }
+    if (operation === 'link' && safeActionId(context.taskId) && actionAttempts.get(context)?.has('task')) {
+      return { action: 'task', method: 'POST', path: '/associations/relations/bulk?updateFutureTasks=false',
+        body: { locationId: LOCATION_ID, add: [{ associationId: 'TASK_CONTACT_ASSOCIATION', firstRecordId: context.taskId, secondRecordId: context.contact }] } };
+    }
+    throw new Error('Action request is outside the approved operations.');
+  }
+  async function actionRequest(operation, context) {
+    if (!context || context !== approvedActionContext) throw new Error('Action approval is required.');
+    const { action, method, path, body } = actionRequestShape(operation, context);
+    requireActionApproval(action, context);
+    let attempts = actionAttempts.get(context);
+    if (!attempts) { attempts = new Set(); actionAttempts.set(context, attempts); }
+    if (attempts.has(operation) || pendingSave && operation !== 'link') throw new Error('Action already attempted or an unresolved save exists. No retry.');
+    const wire = wireRequest(method, path, body);
+    if (action !== 'task') delete wire.headers.developer_version;
+    if (method !== 'GET') {
+      pendingSave = operation === 'link' ? `Contact association for task ${context.taskId}`
+        : action === 'stage' ? `Stage: ${context.targetStageName} (${context.targetStageId}); opportunity ${context.opportunity.id}`
+        : action === 'note' ? `Note: ${context.noteText}`
+        : `Task: ${context.taskTitle}; ${context.due}, 11am WITA; owner ${context.ownerId}`;
+      saveCheckpoint(); // No request is allowed before this durable journal entry.
+      attempts.add(operation);
+    }
+    const diagnostic = { method, url: `https://services.leadconnectorhq.com${action === 'stage' ? '/opportunities/{id}' : path.split('?')[0]}`,
+      started: new Date().toISOString(), status: null, result: 'pending' };
+    recordRequest(diagnostic);
+    const controller = new AbortController(), started = Date.now();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    let contactObservation, stageObservation;
+    try {
+      // No await between this final approval/auth check and the native request.
+      requireActionApproval(action, context);
+      if (operation === 'stage') {
+        contactObservation = observeContactRequest(method, wire.url, () => body);
+        stageObservation = observeStageRequest(method, wire.url);
+      }
+      const response = await originalFetch.call(window, wire.url, { method, headers: { ...wire.headers, ...liveReadHeaders },
+        redirect: 'error', ...(method === 'GET' ? { cache: 'no-store' } : { body: JSON.stringify(body) }), signal: controller.signal });
+      diagnostic.status = response.status;
+      if ([401, 403].includes(response.status)) rejectCrmAuthorization();
+      if (!response.ok) throw new Error('HTTP failure');
+      const data = await response.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.errors?.length) throw new Error('Invalid response');
+      diagnostic.result = 'response received';
+      return { data, body };
+    } catch (error) {
+      diagnostic.result = error.name === 'AbortError' ? 'timeout' : 'response rejected';
+      // Do not propagate server text, URLs, bodies or native exception messages.
+      throw new Error(`API ${action}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : diagnostic.status ? `HTTP ${diagnostic.status}; response not verified` : 'No verified HTTP response'}. No automatic retry.`);
+    } finally {
+      finishContactWrite(contactObservation); finishStageWrite(stageObservation);
+      clearTimeout(timeout); diagnostic.elapsedMs = Date.now() - started;
+    }
+  }
+  async function saveStageApi() {
+    const context = requireActionApproval('stage');
+    const { data } = await actionRequest('stageRead', context);
+    requireActionApproval('stage', context);
+    const fresh = data.opportunity, approved = context.opportunity;
+    requireSaved(fresh && ['id', 'contactId', 'locationId', 'pipelineId', 'pipelineStageId'].every(key => fresh[key] === approved[key])
+      && (fresh.assignedTo ?? '') === (approved.assignedTo ?? ''), 'fresh opportunity changed after approval.');
+    requireSaved(Number.isSafeInteger(fresh.indexVersion) && fresh.indexVersion >= 0 && Number.isSafeInteger(fresh.indexVersion + 1), 'invalid opportunity version.');
+    // Captured increment, not a claim of atomic optimistic locking or safe replay.
+    actionStageVersions.set(context, fresh.indexVersion + 1);
+    const saved = await actionRequest('stage', context);
+    verifyStage(saved.data, saved.body, approved.id, context.contact, approved.pipelineId);
+    requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === fresh.indexVersion + 1
+      && (saved.data.opportunity.assignedTo ?? '') === (approved.assignedTo ?? ''), 'saved opportunity account/version/owner did not match.');
+    completed.push(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
+    pendingSave = ''; saveCheckpoint();
+    requireActionApproval('stage', context, 1);
+    context.epoch = contactReadEpoch;
+  }
+  async function saveNoteApi() {
+    const context = requireActionApproval('note');
+    await recheckActionContact('note', context);
+    const { data, body } = await actionRequest('note', context);
+    requireSaved(safeActionId(data.note?.id), 'unsafe note ID.');
+    verifyNote(data, body, context.contact, context.noteText);
+    completed.push(`Note saved (server confirmed; note ${data.note.id})`);
+    pendingSave = ''; saveCheckpoint();
+    requireActionApproval('note', context);
+  }
+  async function createTaskApi() {
+    const context = requireActionApproval('task');
+    actionRequestShape('task', context);
+    if (pendingSave || actionAttempts.get(context)?.has('task')) throw new Error('Task already attempted or unresolved save exists. No retry.');
+    await recheckActionContact('task', context);
+    const { data, body } = await actionRequest('task', context);
+    requireSaved(safeActionId(data.record?.id), 'unsafe task ID.');
+    verifyTask(data, body, context.contact, context.taskTitle, context.due);
+    context.taskId = data.record.id;
+    completed.push(`Task created: ${context.taskId}; ${context.due}, 11am WITA (server confirmed)`);
+    pendingSave = `Contact association for task ${context.taskId}`; saveCheckpoint();
+    requireActionApproval('task', context);
+    const linked = await actionRequest('link', context);
+    verifyTaskLink(linked.data, context.taskId, context.contact);
+    completed.push('Task contact association: server confirmed');
+    pendingSave = ''; saveCheckpoint();
+    requireActionApproval('task', context);
+  }
+
   // Small DOM helpers. Selectors come from the recordings and inspected CRM UI.
   const visible = el => el && el.getClientRects().length > 0;
   const all = (selector, root = document) => [...root.querySelectorAll(selector)].filter(visible);
@@ -662,6 +1011,7 @@
   let busy = false;
   let guardedContact = null;
   let guardedStageQueue = null;
+  let approvedActionContext = null;
   let step = '';
   let completed = [];
   let pendingSave = '';
@@ -751,11 +1101,6 @@
     throw new Error(`Timed out after ${timeout / 1000}s waiting for: ${description}.${detail ? `\nObserved: ${detail}` : ''}`);
   }
 
-  function controlState(selector, root = document) {
-    const matches = [...root.querySelectorAll(selector)];
-    return `${selector}: ${matches.length} found, ${matches.filter(visible).length} visible, ${matches.filter(el => visible(el) && !el.disabled).length} visible and enabled`;
-  }
-
   function checkpointKey(id) {
     return `pertama:no-answer:unfinished:${LOCATION_ID}:${id}`;
   }
@@ -791,52 +1136,19 @@
     }));
   }
 
-  async function click(selector, saveDescription = '') {
-    const el = await wait(() => all(selector).find(el => !el.disabled), `enabled control ${selector}`, () => controlState(selector));
-    el.scrollIntoView({ block: 'nearest' });
-    if (saveDescription) {
-      pendingSave = saveDescription;
-      saveCheckpoint(); // Persist before clicking; failure must block the save.
+  function assertApprovedActionContext(expectedWrites = 0) {
+    const context = approvedActionContext;
+    if (context && (contactId() !== context.contact || stageRouteRevision !== context.route
+      || currentUserId !== context.user || identityExpires <= Date.now() / 1000
+      || contactWritesPending || contactReadEpoch !== context.epoch + expectedWrites * 2)) {
+      throw new Error('Contact, opportunity or session changed after confirmation. Further saves stopped; review the record before trying again.');
     }
-    el.click();
   }
-
-  async function clickLabel(label, root = document) {
-    const el = await wait(() => exact('button', label, root), `visible button with exact text "${label}"`,
-      () => `Visible button labels: ${all('button', root).map(text).filter(Boolean).join(' | ').slice(0, 500) || '(none)'}`);
-    if (el.disabled) throw new Error(`The "${label}" button is disabled.`);
-    el.click();
-  }
-
-  function fill(input, value) {
-    input.focus();
-    const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(input, value);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.blur();
-  }
-
   function futureDate(days) {
     const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
       timeZone: 'Asia/Makassar', year: 'numeric', month: '2-digit', day: '2-digit',
     }).formatToParts(new Date()).map(p => [p.type, p.value]));
     return new Date(Date.UTC(+parts.year, +parts.month - 1, +parts.day + days)).toISOString().slice(0, 10);
-  }
-
-  async function openSidebar(icon) {
-    // Sidebar buttons toggle: clicking an already open panel would hide it.
-    const view = { 'sidebar-tasks-icon': 'tasks', 'sidebar-notes-icon': 'notes', 'sidebar-opportunities-icon': 'opportunities' }[icon];
-    if (view && new URL(location.href).searchParams.get('view') === view) return;
-    if (icon === 'sidebar-opportunities-icon' && all('.opportunities-pane-list').length) return;
-    if (icon === 'sidebar-notes-icon' && visible(document.getElementById('add-note-button'))) return;
-    if (icon === 'sidebar-tasks-icon' && (visible(document.getElementById('tasks-list-container-contact'))
-      || visible(document.getElementById('tasks-form-container')) || exact('button', 'Add task'))) return;
-    const el = await wait(() => all(`[id="${icon}"]`)[0], `sidebar icon #${icon}`, () => controlState(`[id="${icon}"]`));
-    const button = el.closest('button');
-    if (!button) throw new Error(`Sidebar icon #${icon} exists, but has no enclosing button. The sidebar selector needs updating.`);
-    if (button.disabled) throw new Error(`Sidebar button containing #${icon} is disabled.`);
-    button.click();
   }
 
   function progress(message) {
@@ -857,22 +1169,6 @@
       if (visible(target) && 'value' in target) return target;
     }
     return heading?.parentElement?.querySelector('input') || null;
-  }
-  async function readContactName() {
-    const inputs = () => {
-      const first = nameInput('first_name', 'First name'), last = nameInput('last_name', 'Last name');
-      return visible(first) && visible(last) ? { first, last } : null;
-    };
-    if (!inputs()) {
-      const selector = '#record-details-tabs div.hr-tabs-rail > div:nth-of-type(2) span';
-      (await wait(() => exact(selector, 'All fields'), 'All fields tab', () => controlState(selector))).click();
-    }
-    // Keep the contact/queue guards even when both inputs are already rendered.
-    const { first, last } = await wait(inputs, 'visible first and last name inputs');
-    const firstName = first.value.trim();
-    const name = [firstName, last.value.trim()].filter(Boolean).join(' ');
-    if (!name) throw new Error('Contact name is empty.');
-    return { firstName, name };
   }
 
   function selectedPipeline(root = document) {
@@ -917,18 +1213,12 @@
     const existing = stageQueueContext();
     if (existing) return existing;
     const routeRevision = stageRouteRevision;
-    await openSidebar('sidebar-opportunities-icon');
-    const links = await wait(() => {
-      const found = all('a[href*="/opportunities/"][href*="pipelineId="]');
-      return found.length ? found : null;
-    }, 'contact opportunities for stage queue selection');
+    const opportunities = await readContactOpportunities();
     if (contactId() !== id || stageRouteRevision !== routeRevision) throw new Error('Contact changed before stage queue selection.');
     const choices = new Map();
-    for (const link of links) {
-      const url = new URL(link.href, location.href);
-      const opportunityId = url.pathname.match(/\/opportunities\/([^/]+)\/?$/)?.[1];
-      const pipeline = NAV_PIPELINES.find(p => p.id === url.searchParams.get('pipelineId'));
-      if (opportunityId && pipeline) choices.set(opportunityId, pipeline);
+    for (const opportunity of opportunities) {
+      const pipeline = NAV_PIPELINES.find(p => p.id === opportunity.pipelineId);
+      if (pipeline) choices.set(opportunity.id, pipeline);
     }
     if (!choices.size) throw new Error('Pipeline metadata is unavailable. Open the Opportunities board first.');
     markWorkflowTiming('Awaiting queue selection…');
@@ -995,15 +1285,16 @@
     let timingResult = 'ok';
     startWorkflowTiming('Next lead', 'Checking navigation context');
     try {
+      requireContactControlsReady();
       if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) throw new Error('Open the Pertama account first.');
       if (settings.priority === 'stage' && !await ensureStageQueue()) { timingResult = 'cancelled'; return; }
       markWorkflowTiming('Finding next lead');
       const lead = await findNextActionable();
-      if (lead) { openLead(lead); timingResult = 'navigating'; }
+      if (lead) { await openLead(lead); timingResult = 'navigating'; }
       else taskNotice(emptyQueueMessage());
     } catch (error) {
       timingResult = 'stopped';
-      console.error('[Pertama Next lead v0.2.12]', error);
+      console.error(`[Pertama Next lead v${VERSION}]`, error);
       taskNotice(`Next lead stopped: ${error.message} No records were changed.`, true);
     } finally {
       finishWorkflowTiming(timingResult);
@@ -1013,23 +1304,84 @@
     }
   }
 
-  function pendingCallTask(card, expectedTitle) {
-    // Select the title beside the completion button, not description/due text.
-    const title = card.querySelector(':scope > div:first-child > div > p');
-    const button = card.querySelector('button[id="completed-action"]');
-    return title && text(title) === expectedTitle
-      && !title.classList.contains('line-through')
-      && button && !button.disabled
-      && button.querySelector('svg.text-gray-500') ? { card, title, button } : null;
+  function requireCallTaskContext(context) {
+    if (!validContactRead(context) || stageRouteRevision !== context.route
+      || settings.task !== context.template || !liveReadHeaders
+      || userFromHeaders(liveReadHeaders).id !== context.user) {
+      throw new Error('Call task context changed.');
+    }
+    requireContactControlsReady();
   }
 
-  function callStartButton(event) {
-    if (!event.isTrusted || !(event.target instanceof Element)) return null;
-    const button = event.target.closest('button[id="hr-button-v-1"]');
-    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return null;
-    const label = button.querySelector('[id="hr-button-v-1-label"]');
-    return label && /^Call:/.test(text(label.querySelector('.sr-only')))
-      && exact('p', 'Call', label) ? button : null;
+  function callTaskTitle(contact, template) {
+    const firstName = contact.firstName.trim();
+    const name = [firstName, contact.lastName.trim()].filter(Boolean).join(' ');
+    if (!name) throw new Error('Contact name is empty.');
+    return renderTemplate(template, { firstName, name }).replace(/\s+/g, ' ').trim();
+  }
+
+  async function readCallTasks(context) {
+    requireCallTaskContext(context);
+    const data = await crmRequest('POST', '/objects/task/records/search', {
+      filters: [{ group: 'OR', filters: [{ field: 'relations.TASK_CONTACT_ASSOCIATION', operator: 'eq', value: [context.id] }] }],
+      locationId: LOCATION_ID, sort: [{ field: 'properties.dueDate', direction: 'desc' }],
+      pageLimit: 20, includeRecurringTaskConfigs: true, ignoreAssignedToPermission: true, page: 1, query: '',
+    });
+    requireCallTaskContext(context);
+    const rows = data.customObjectRecords;
+    if (!Array.isArray(rows) || !Number.isInteger(data.total) || data.total < rows.length) throw new Error('Task lookup is incomplete.');
+    const ids = new Set();
+    for (const row of rows) {
+      if (!row || typeof row.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(row.id) || ids.has(row.id)
+        || row.locationId !== LOCATION_ID || row.objectKey !== 'task'
+        || typeof row.properties?.title !== 'string' || ![0, 1, false, true].includes(row.properties.completed)
+        || !Array.isArray(row.relations)) throw new Error('Task record is invalid.');
+      ids.add(row.id);
+      const contacts = row.relations.filter(r => r?.associationId === 'TASK_CONTACT_ASSOCIATION' || r?.objectKey === 'contact');
+      if (contacts.length !== 1 || contacts[0].associationId !== 'TASK_CONTACT_ASSOCIATION'
+        || contacts[0].objectKey !== 'contact' || contacts[0].recordId !== context.id
+        || typeof contacts[0].relationId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(contacts[0].relationId)) {
+        throw new Error('Task contact association is invalid.');
+      }
+    }
+    return { rows, total: data.total };
+  }
+
+  // Dedicated task completion write: never widen the read-only transport or use stage/note/task approval.
+  async function putCallTask(context, taskId) {
+    requireCallTaskContext(context);
+    if (!/^[a-zA-Z0-9_-]+$/.test(taskId)) throw new Error('Invalid task ID.');
+    const diagnostic = { method: 'PUT', url: `https://services.leadconnectorhq.com/locations/${LOCATION_ID}/tasks/bulk/update`,
+      started: new Date().toISOString(), status: null, result: 'pending', requestFields: ['completed', 'ids'] };
+    recordRequest(diagnostic);
+    const controller = new AbortController(), started = Date.now();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      requireCallTaskContext(context);
+      const response = await originalFetch.call(window, diagnostic.url, {
+        method: 'PUT', headers: { ...CRM_HEADERS, 'content-type': 'application/json',
+          developer_version: '', ...liveReadHeaders },
+        redirect: 'error', body: JSON.stringify({ completed: true, ids: [taskId] }), signal: controller.signal,
+      });
+      diagnostic.status = response.status;
+      if (!response.ok) {
+        if ([401, 403].includes(response.status)) rejectCrmAuthorization();
+        throw new Error('Completion HTTP response rejected.');
+      }
+      const data = await response.json();
+      if (data?.succeded !== true || data.error || data.errors?.length) throw new Error('Completion acknowledgment missing.');
+      diagnostic.result = 'completion accepted';
+      // Preserve known acceptance even if navigation/session changed while the request was in flight.
+      completed.push(`Call task completion accepted: ${taskId}; readback not yet verified.`);
+      saveCheckpoint();
+      requireCallTaskContext(context);
+    } catch (error) {
+      if (diagnostic.result !== 'completion accepted') diagnostic.result = error?.name === 'AbortError' ? 'timeout' : 'completion unverified';
+      throw new Error('Call task completion is unverified.');
+    } finally {
+      diagnostic.elapsedMs = Date.now() - started;
+      clearTimeout(timeout);
+    }
   }
 
   function taskNotice(message, failed = false) {
@@ -1048,161 +1400,250 @@
     }, 7000);
   }
 
-  async function completeCallTask(id) {
-    if (busy) {
+  async function completeCallTask(id, { fromSaveAndNext = false } = {}) {
+    if (busy && !fromSaveAndNext) {
       console.info('Call-task completion skipped: another script action is running.');
       return;
     }
-    busy = true;
-    guardedContact = id;
+    if (!fromSaveAndNext) {
+      busy = true;
+      guardedContact = id;
+    }
     let attempted = false;
-    let title = '';
+    let phase = 'checking contact/session and unfinished actions';
     try {
-      if (contactId() !== id) throw new Error('Contact changed before task lookup.');
-      await openSidebar('sidebar-notes-icon');
-      const { name, firstName } = await readContactName();
-      const expectedTitle = renderTemplate(settings.task, { name, firstName }).replace(/\s+/g, ' ').trim();
-
-      if (!visible(document.getElementById('tasks-list-container-contact'))) {
-        await openSidebar('sidebar-tasks-icon');
+      requireContactControlsReady();
+      const context = { ...contactReadContext(), route: stageRouteRevision, template: settings.task };
+      if (context.id !== id) throw new Error('Contact changed before task lookup.');
+      requireCallTaskContext(context);
+      if (!fromSaveAndNext && localStorage.getItem(checkpointKey(id))) {
+        taskNotice('Call task stopped: an unfinished action already exists. Inspect the CRM record, then use Settings to clear its checkpoint. No automatic retry.', true);
+        return;
       }
-      await wait(() => visible(document.getElementById('tasks-list-container-contact'))
-        || exact('button', 'Add task'), 'contact task list or empty task view');
-      const cards = all('#tasks-list-container-contact .tasks-card-container-style');
-      const task = cards.map(card => pendingCallTask(card, expectedTitle)).find(Boolean);
-      if (!task) return;
-      title = text(task.title);
-      if (contactId() !== id) throw new Error('Contact changed before task completion.');
+      if (!fromSaveAndNext) {
+        completed = [];
+        pendingSave = '';
+        startingContact = id;
+      }
+      phase = 'reading the current contact and exact pending task';
+      const contact = await readContactDetails({ fresh: true });
+      requireCallTaskContext(context);
+      const title = callTaskTitle(contact, context.template);
+      const lookup = await readCallTasks(context);
+      requireCallTaskContext(context);
+      const matchesTitle = row => row.properties.title.replace(/\s+/g, ' ').trim() === title;
+      const task = lookup.rows.find(row => matchesTitle(row) && [0, false].includes(row.properties.completed));
+      if (!task) {
+        if (lookup.total > lookup.rows.length) throw new Error('More tasks exist beyond the lookup.');
+        return;
+      }
+      phase = 'rechecking contact name, owner and exact task';
+      const fresh = await readContactDetails({ fresh: true });
+      requireCallTaskContext(context);
+      if (['id', 'locationId', 'firstName', 'lastName', 'assignedTo'].some(key => contact[key] !== fresh[key])
+        || callTaskTitle(fresh, context.template) !== title) throw new Error('Contact changed before completion.');
+      const latest = await readCallTasks(context);
+      requireCallTaskContext(context);
+      const target = latest.rows.find(row => row.id === task.id);
+      if (!target || !matchesTitle(target) || ![0, false].includes(target.properties.completed)
+        || target.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId
+          !== task.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId) throw new Error('Task changed before completion.');
+      phase = 'saving the completion checkpoint';
+      if (!fromSaveAndNext && localStorage.getItem(checkpointKey(id))) throw new Error('An unfinished action appeared.');
+      if (pendingSave) throw new Error('An unresolved save exists.');
+      pendingSave = `Complete Call task ${task.id}: ${task.properties.title}`;
+      saveCheckpoint(); // A storage failure must block the PUT.
+      requireCallTaskContext(context);
+      phase = 'sending task completion or verifying its acknowledgment';
       attempted = true;
-      task.button.click();
-      await wait(() => {
-        const current = all('#tasks-list-container-contact .tasks-card-container-style');
-        return current.some(card => {
-          const label = card.querySelector(':scope > div:first-child > div > p');
-          return text(label) === title && label.classList.contains('line-through');
-        }) || (!task.card.isConnected && !current.some(card =>
-          text(card.querySelector(':scope > div:first-child > div > p')) === title)
-          && (visible(document.getElementById('tasks-list-container-contact')) || exact('button', 'Add task')));
-      }, `task "${title}" marked complete or removed from the pending list`);
-      taskNotice(`Completed: ${title}`);
-    } catch (error) {
-      const report = `Pertama call task — v0.2.12\nContact ID: ${id}\n${error.message}\n${attempted
-        ? `Completion clicked for "${title}", but not verified. Inspect it before retrying.`
-        : 'Task completion was not clicked.'}\nNo automatic retry.`;
-      console.error(report, error);
-    } finally {
-      if (contactId() === id) {
-        try { await openSidebar('sidebar-notes-icon'); }
-        catch (error) { console.error('Could not leave Notes open after the call.', error); }
-      }
-      guardedContact = null;
-      busy = false;
-    }
-  }
-
-  function smsContext() {
-    const root = document.getElementById('composer-textarea');
-    if (!visible(root)) throw new Error('Open the SMS composer to enable sending.');
-    const channel = root.querySelector('#conv-channel-bar-provider-trigger');
-    if (text(channel) !== 'SMS') throw new Error('Select SMS in the composer to enable sending.');
-    if (root.querySelector('#conv-channel-bar-internal-comment-toggle')?.getAttribute('aria-pressed') !== 'false') {
-      throw new Error('Turn off Internal Comment to enable SMS.');
-    }
-    const from = text(root.querySelector('#contact-select-trigger'));
-    const toLabel = exact('span', 'To:', root);
-    const to = text(toLabel?.parentElement).replace(/^To:\s*/, '');
-    const validPhone = value => /^\+[\d ()-]{7,24}$/.test(value);
-    if (!validPhone(from) || !validPhone(to)) throw new Error('SMS From or To number could not be read.');
-    const input = root.querySelector('#conv-composer-textarea-input');
-    const send = root.querySelector('#conv-send-button-simple');
-    if (!visible(input) || !visible(send)) throw new Error('SMS message field or Send button is unavailable.');
-    return { from, to, draft: input.value, input, send };
-  }
-
-  async function prepareSms() {
-    try {
-      const ready = () => {
-        const root = document.getElementById('composer-textarea');
-        return visible(root) && visible(root.querySelector('#conv-channel-bar-provider-trigger'))
-          && visible(root.querySelector('#conv-composer-textarea-input'))
-          && visible(root.querySelector('#conv-send-button-simple'));
-      };
-      // The wrapper can exist before the editor is initialized. A real click also focuses
-      // the field; HTMLElement.click() alone does not. Never toggle an element twice.
-      const activated = new WeakSet();
-      await wait(() => {
-        if (ready()) return true;
-        const target = [
-          ...all('#conv-composer-inline-expand-trigger'),
-          ...all('[id^="composer-input-"]'),
-          ...all('#composer-textarea textarea'),
-        ].find(el => !activated.has(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
-        if (target) {
-          activated.add(target);
-          target.focus({ preventScroll: true });
-          if (target.isConnected && !ready()) target.click();
+      await putCallTask(context, task.id);
+      requireCallTaskContext(context);
+      phase = 'verifying the completed task by its exact ID';
+      let verified = false;
+      for (let check = 0; check < 3; check++) {
+        if (check && fromSaveAndNext) await sleep(check * 500);
+        const result = await readCallTasks(context);
+        requireCallTaskContext(context);
+        const saved = result.rows.find(row => row.id === task.id);
+        if (saved && matchesTitle(saved) && [1, true].includes(saved.properties.completed)
+          && saved.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId
+            === task.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId) {
+          verified = true;
+          break;
         }
-        return ready();
-      }, 'SMS composer activation', () => `${controlState('#conv-composer-textarea-input')}. Click the message field and reopen Save and next if SMS is needed.`, 5000);
-      return smsContext();
-    } catch (error) {
-      return { error: error.message };
+      }
+      if (!verified) throw new Error('Task completion readback unavailable.');
+      completed.push(`Call task completed and verified: ${task.id}: ${title}`);
+      pendingSave = '';
+      saveCheckpoint();
+      requireCallTaskContext(context);
+      if (!fromSaveAndNext) {
+        localStorage.removeItem(checkpointKey(id));
+        taskNotice(`Completed: ${title}`);
+      }
+    } catch {
+      // Never surface arbitrary native/network errors, which can include credentials or response data.
+      console.error('Pertama call task stopped', { phase, attempted });
+      if (fromSaveAndNext) throw new Error(`Call task stopped while ${phase}. ${attempted
+        ? 'Completion may already be saved; inspect the task before clearing the checkpoint.'
+        : 'No task completion was sent.'} No automatic retry.`);
+      taskNotice(`Call task stopped while ${phase}. ${attempted
+        ? 'Completion may already be saved. Inspect the task and unfinished-action checkpoint before clearing it in Settings.'
+        : 'No task completion was sent. Check the contact, session and task data before trying again.'} No automatic retry. The native call was not blocked.`, true);
+    } finally {
+      if (attempted) invalidateContactReads();
+      if (!fromSaveAndNext) {
+        guardedContact = null;
+        busy = false;
+      }
     }
   }
 
-  async function readOwnerAndPrepareSms() {
-    // Only SMS preparation interacts with the UI. Owner lookup is a passive read.
-    // Drain both promises on failure so no activation continues after busy is released.
-    const results = await Promise.allSettled([
-      wait(() => {
-        const box = document.getElementById('owner-dropdown-trigger');
-        return [...(box?.querySelectorAll('*') || [])].filter(el => !el.children.length)
-          .map(text).filter(t => t.length > 2).sort((a, b) => b.length - a.length)[0];
-      }, 'contact owner in #owner-dropdown-trigger'),
-      prepareSms(),
-    ]);
-    for (const result of results) if (result.status === 'rejected') throw result.reason;
-    return { owner: results[0].value, sms: results[1].value };
+  function canonicalSmsPhone(value) {
+    const number = typeof value === 'string' ? value.replace(/[\s()-]/g, '') : '';
+    if (!/^\+[1-9]\d{6,14}$/.test(number)) throw new Error('A valid international SMS phone number is required.');
+    return number;
   }
-
-  async function sendSmsOnce(approved, message) {
-    const current = smsContext();
-    if (contactId() !== startingContact || current.to !== approved.to || current.from !== approved.from) {
-      throw new Error('SMS contact or From/To number changed after confirmation. Send was not clicked.');
-    }
-    if (current.draft !== approved.draft) throw new Error('The SMS draft changed after confirmation. Send was not clicked.');
-    if (!message.trim()) throw new Error('SMS message is empty. Send was not clicked.');
-    fill(current.input, message); // Input/change events only; never an Enter key.
-    await wait(() => document.getElementById('conv-composer-textarea-input')?.value === message,
-      'SMS composer containing the approved message');
-    const ready = smsContext();
-    if (contactId() !== startingContact || ready.to !== approved.to || ready.from !== approved.from
-      || ready.input.value !== message || ready.send.getAttribute('aria-disabled') === 'true'
-      || ready.send.hasAttribute('disabled')) throw new Error('SMS composer changed or Send is disabled. Send was not clicked.');
-    // The misleading aria-label is not used as a readiness check.
-    pendingSave = `SMS Send clicked for ${approved.to}; acceptance/delivery not yet verified`;
-    saveCheckpoint();
-    ready.send.click(); // Exactly one attempt, never an automatic retry.
-    await wait(() => document.getElementById('conv-composer-textarea-input')?.value === '',
-      'SMS composer to clear after the single Send click',
-      () => 'The SMS may already have been sent. Inspect the conversation before retrying.');
-    completed.push(`SMS Send clicked; composer cleared (${approved.to}). Delivery not verified.`);
-    const notice = `SMS submitted to ${approved.to}.`;
-    taskNotice(notice);
-    // Carry the status across the next contact's page load.
+  function guardSmsRead(context) {
+    if (!validContactRead(context) || context.route !== stageRouteRevision || context.path !== location.pathname
+      || !liveReadHeaders || userFromHeaders(liveReadHeaders).id !== context.user) throw new Error('SMS contact/account/session changed.');
+  }
+  // Closed endpoint inventory: no arbitrary URL or native draft writes.
+  async function smsApiRequest(operation, context, sms, acknowledgment) {
+    const reading = operation === 'inventory' || operation === 'drafts';
+    const guard = () => reading ? guardSmsRead(context) : requireActionApproval('sms', context);
+    guard();
+    let path, body, diagnosticPath;
+    if (operation === 'inventory') {
+      path = `/phone-system/numbers/v2/location/${LOCATION_ID}?includeRcsSenderIds=true`;
+      diagnosticPath = '/phone-system/numbers/v2/location/{location}';
+    } else if (operation === 'drafts') {
+      path = `/conversations/messages/drafts/${LOCATION_ID}/contacts/${context.id}`;
+      diagnosticPath = '/conversations/messages/drafts/{location}/contacts/{id}';
+    } else if (operation === 'spam' || operation === 'send') {
+      if (!sms || ['from', 'to', 'message'].some(key => sms[key] !== context.sms?.[key])) throw new Error('SMS approval changed.');
+      path = operation === 'spam' ? '/conversations/messages/spam/v2' : '/conversations/messages';
+      diagnosticPath = path;
+      body = operation === 'spam' ? { text: sms.message, locationId: LOCATION_ID, contactId: context.contact }
+        : { contactId: context.contact, locationId: LOCATION_ID, message: sms.message, fromNumber: sms.from,
+          toNumber: sms.to, type: 'SMS', channel: 'sms', fromOneToOneConversation: true, attachments: [] };
+    } else if (operation === 'history' && safeActionId(acknowledgment?.conversationId) && safeActionId(acknowledgment?.messageId)) {
+      path = `/f1/conversations/${acknowledgment.conversationId}/messages?limit=20`;
+      diagnosticPath = '/f1/conversations/{id}/messages';
+    } else throw new Error('SMS operation is not permitted.');
+    const method = body ? 'POST' : 'GET';
+    const diagnostic = { method, url: `https://services.leadconnectorhq.com${diagnosticPath}`, status: null, result: 'pending' };
+    recordRequest(diagnostic);
+    const controller = new AbortController(), started = Date.now();
+    const timeout = setTimeout(() => controller.abort(), 30000);
     try {
+      guard();
+      const response = await originalFetch.call(window, `https://services.leadconnectorhq.com${path}`, {
+        method, headers: { ...CRM_HEADERS, ...liveReadHeaders, ...(body ? { 'content-type': 'application/json' } : {}) },
+        redirect: 'error', cache: 'no-store', signal: controller.signal, ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      diagnostic.status = response.status;
+      if ([401, 403].includes(response.status)) rejectCrmAuthorization();
+      if (!response.ok) throw new Error('HTTP failure');
+      const data = await response.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.errors?.length) throw new Error('Invalid response');
+      diagnostic.result = 'response received';
+      // Send/history outcomes must be journaled by the caller before its post-await guard.
+      if (reading || operation === 'spam') guard();
+      return data;
+    } catch (error) {
+      diagnostic.result = error.name === 'AbortError' ? 'timeout' : 'response rejected';
+      throw new Error(`API SMS ${operation}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : diagnostic.status ? `HTTP ${diagnostic.status}; response not verified` : 'No verified HTTP response'}. No automatic retry.`);
+    } finally { clearTimeout(timeout); diagnostic.elapsedMs = Date.now() - started; }
+  }
+  async function prepareSmsApi() {
+    const context = { ...contactReadContext(), route: stageRouteRevision, path: location.pathname };
+    guardSmsRead(context);
+    let contact;
+    try { contact = await readContactDetails({ fresh: true }); }
+    catch { throw new Error('SMS contact lookup failed. No automatic retry.'); }
+    guardSmsRead(context);
+    const to = canonicalSmsPhone(contact.phone);
+    const reads = await Promise.allSettled([smsApiRequest('inventory', context), smsApiRequest('drafts', context)]);
+    guardSmsRead(context);
+    const failure = reads.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
+    const inventory = reads[0].value, drafts = reads[1].value;
+    if (!Array.isArray(inventory.numbers) || !Number.isSafeInteger(inventory.total) || inventory.total !== inventory.numbers.length
+      || !Array.isArray(drafts.drafts)) throw new Error('SMS inventory or draft lookup is incomplete.');
+    const seen = new Set(), fromNumbers = [];
+    for (const record of inventory.numbers) {
+      const number = canonicalSmsPhone(record?.phoneNumber);
+      if (seen.has(number) || record.linkedUser != null && typeof record.linkedUser !== 'string'
+        || record.capabilities != null && (typeof record.capabilities !== 'object' || Array.isArray(record.capabilities))
+        || record.isDefaultNumber != null && typeof record.isDefaultNumber !== 'boolean'
+        || record.isDisabled != null && typeof record.isDisabled !== 'boolean'
+        || record.status != null && typeof record.status !== 'string') throw new Error('Malformed or duplicate SMS inventory number.');
+      seen.add(number);
+      if (record.capabilities?.sms !== true || record.isDisabled === true || record.status === 'disabled') continue;
+      if (record.linkedUser !== context.user) continue;
+      fromNumbers.push({ number, label: number });
+    }
+    const from = fromNumbers.length === 1 ? fromNumbers[0].number
+      : fromNumbers.some(item => item.number === settings.smsFrom) ? settings.smsFrom : null;
+    return { contact, to, from, fromNumbers, savedDraftCount: drafts.drafts.length };
+  }
+  const smsAttempts = new WeakSet();
+  async function sendSmsApi() {
+    const context = requireActionApproval('sms');
+    if (pendingSave || smsAttempts.has(context)) throw new Error('SMS already attempted or an unresolved save exists. No retry.');
+    const sms = { ...context.sms };
+    if (canonicalSmsPhone(sms.from) !== sms.from || canonicalSmsPhone(sms.to) !== sms.to
+      || typeof sms.message !== 'string' || !sms.message.trim()) throw new Error('Explicit SMS sender, recipient and message approval are required.');
+    // Reserve the approval before any await, also preventing concurrent sends.
+    smsAttempts.add(context);
+    const fresh = await prepareSmsApi();
+    requireActionApproval('sms', context);
+    if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => fresh.contact[key] !== context.contactRecord[key])
+      || fresh.to !== sms.to || fresh.from !== sms.from) throw new Error('SMS contact or sender changed after confirmation.');
+    const spam = await smsApiRequest('spam', context, sms);
+    requireActionApproval('sms', context);
+    if (spam.isSpam !== false) throw new Error('SMS spam preflight did not approve the message.');
+    if (pendingSave) throw new Error('An unresolved save exists. No retry.');
+    pendingSave = `SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance/delivery not yet verified`;
+    saveCheckpoint();
+    const acknowledgment = await smsApiRequest('send', context, sms);
+    if (!safeActionId(acknowledgment.conversationId) || !safeActionId(acknowledgment.messageId)) throw new Error('SMS acknowledgment is unverified. No retry.');
+    const identity = `SMS message ${acknowledgment.messageId}; conversation ${acknowledgment.conversationId}`;
+    completed.push(`${identity}: acknowledged, delivery not verified.`);
+    pendingSave = `${identity}: history not yet verified`;
+    saveCheckpoint();
+    requireActionApproval('sms', context);
+    const history = await smsApiRequest('history', context, sms, acknowledgment);
+    const matches = Array.isArray(history.messages?.messages) ? history.messages.messages.filter(item => item?.id === acknowledgment.messageId) : [];
+    const message = matches[0];
+    if (matches.length !== 1 || message.conversationId !== acknowledgment.conversationId || message.contactId !== context.contact
+      || message.locationId !== LOCATION_ID || message.type !== 2 || message.direction !== 'outbound' || message.body !== sms.message
+      || message.meta?.from !== sms.from || message.meta?.to !== sms.to
+      || !['pending', 'queued', 'sent', 'delivered', 'read', 'failed', 'undelivered', 'accepted', 'scheduled'].includes(message.status)) {
+      throw new Error('SMS history identity or status is unverified. Inspect the conversation; no retry.');
+    }
+    completed.push(`${identity}: verified outbound SMS; status ${message.status}.`);
+    const unresolved = pendingSave;
+    pendingSave = '';
+    try { saveCheckpoint(); } catch (error) { pendingSave = unresolved; throw error; }
+    requireActionApproval('sms', context);
+    if (['failed', 'undelivered'].includes(message.status)) throw new Error(`SMS ${message.status}. Inspect the conversation before clearing the unfinished action. No automatic retry.`);
+    const notice = `SMS to ${sms.to}: ${message.status}.`;
+    try {
+      taskNotice(notice);
       const savedNotice = JSON.stringify({ message: notice, time: Date.now() });
       sessionStorage.setItem(SMS_NOTICE_KEY, savedNotice);
       setTimeout(() => {
         if (sessionStorage.getItem(SMS_NOTICE_KEY) === savedNotice) sessionStorage.removeItem(SMS_NOTICE_KEY);
       }, 7000);
-    } catch { /* A notification failure must not turn a send into a retry. */ }
-    pendingSave = '';
-    saveCheckpoint();
+    } catch { /* Notification failures never authorize another send. */ }
   }
 
-  function confirmActions({ name, firstName, phone, stage, rule, due, owner, taskTitle, sms, pipelineName, stageOptions }) {
+  function confirmActions({ contact, name, firstName, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions }) {
     return new Promise(resolve => {
+      let closed = false, sms = null, smsLoading = false, smsError = '', smsLoadVersion = 0;
+      const confirmationUser = currentUserId, confirmationRoute = stageRouteRevision;
       const previousFocus = document.activeElement;
       const dialog = document.createElement('dialog');
       dialog.id = 'pertama-confirm-actions';
@@ -1265,7 +1706,8 @@
       missingStage.value = ''; missingStage.textContent = 'Select a stage…';
       field('targetStage').appendChild(missingStage);
       field('targetStage').value = stageOptions.includes(rule.next) ? rule.next : '';
-      if (!stageOptions.includes(rule.next)) dialog.querySelector('[data-stage]').textContent += ` · Suggested stage ${rule.next} is unavailable; choose a destination to update.`;
+      if (!rule.next) dialog.querySelector('[data-stage]').textContent += ' · No rule for this stage. Stage update is off by default; choose a destination to turn it on.';
+      else if (!stageOptions.includes(rule.next)) dialog.querySelector('[data-stage]').textContent += ` · Suggested stage ${rule.next} is unavailable; choose a destination to update.`;
       field('taskDays').value = due ? String(rule.days) : '';
       dialog.querySelector('[data-task-days]').hidden = !due;
       function taskDate() {
@@ -1282,21 +1724,43 @@
         const date = due ? taskDate() : null;
         dialog.querySelector('[data-task]').textContent = !due
           ? 'No follow-up task at the Robot stage.'
+          : !ownerId ? 'No valid contact owner assigned. Task creation is unavailable.'
           : date ? `${taskTitle}\n${date} at 11am WITA · ${owner}` : 'Enter a whole number of days, 0 or greater.';
       }
       field('taskDays').addEventListener('input', updateTaskDate);
-      dialog.querySelector('[data-recipient]').textContent = sms.error
-        ? `Recipient: ${name}${phone ? ` · ${phone}` : ''}` : `To: ${name} · ${sms.to}\nFrom: ${sms.from}`;
-      dialog.querySelector('[data-sms-status]').textContent = sms.error || 'Off by default. Turning this on sends the message once when you confirm. Delivery is not verified.';
+      dialog.querySelector('[data-recipient]').textContent = `To: ${name}${phone ? ` · ${phone}` : ''}`;
       field('sms').checked = false;
-      field('sms').disabled = Boolean(sms.error);
+      async function loadSmsOptions() {
+        const version = ++smsLoadVersion;
+        sms = null; smsError = ''; smsLoading = true;
+        updateFields();
+        try {
+          const prepared = await prepareSmsApi();
+          if (closed || version !== smsLoadVersion || !field('sms').checked) return;
+          if (contactId() !== contact.id || currentUserId !== confirmationUser || stageRouteRevision !== confirmationRoute
+            || ['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => prepared.contact[key] !== contact[key])) {
+            throw new Error('Contact or session changed while loading SMS options. Reopen confirmation.');
+          }
+          if (!prepared.from) throw new Error('Choose your SMS sender in Workflow settings before sending.');
+          sms = prepared;
+          dialog.querySelector('[data-recipient]').textContent = `To: ${name} · ${sms.to}`;
+        } catch (error) {
+          if (!closed && version === smsLoadVersion) { sms = null; smsError = error.message || 'SMS options unavailable.'; }
+        } finally {
+          if (!closed && version === smsLoadVersion) { smsLoading = false; updateFields(); }
+        }
+      }
+      field('sms').addEventListener('change', () => {
+        if (field('sms').checked) void loadSmsOptions();
+        else { smsLoadVersion++; sms = null; smsLoading = false; smsError = ''; updateFields(); }
+      });
       field('smsText').value = renderTemplate(settings.sms, { firstName, name });
       dialog.querySelector('[data-next]').textContent = settings.priority === 'stage'
         ? `After saving — ${stageQueueLabel()}. No other queues or tasks will be used.`
         : 'After saving: open the next lead using your selected pipelines and lead priority.';
       field('noteText').value = renderTemplate(settings.note, { firstName, name });
-      field('task').checked = Boolean(due);
-      field('task').disabled = !due;
+      field('task').checked = Boolean(due && ownerId);
+      field('task').disabled = !due || !ownerId;
       function updateFields() {
         field('targetStage').disabled = !field('stage').checked;
         field('taskDays').disabled = !field('task').checked || !due;
@@ -1304,14 +1768,22 @@
         updateTaskDate();
         field('noteText').disabled = !field('note').checked;
         field('noteText').required = field('note').checked;
-        field('smsText').hidden = !field('sms').checked;
-        field('smsText').disabled = !field('sms').checked;
-        field('smsText').required = field('sms').checked;
+        const enabled = field('sms').checked;
+        field('smsText').hidden = !enabled;
+        field('smsText').disabled = !enabled;
+        field('smsText').required = enabled;
+        form.querySelector('[type="submit"]').disabled = enabled && (smsLoading || !sms);
+        dialog.querySelector('[data-sms-status]').textContent = !enabled
+          ? 'Off by default. SMS details load only when enabled.'
+          : smsLoading ? 'Loading SMS sender options…'
+          : smsError ? `${smsError} Turn SMS off to continue with other actions.`
+          : sms ? `From: ${sms.from}. Native drafts are kept untouched (${sms.savedDraftCount} saved). This sends a separate message once; delivery is not guaranteed.`
+          : 'SMS options are unavailable.';
       }
-      let closed = false;
       function finish(result) {
         if (closed) return;
         closed = true;
+        smsLoadVersion++;
         dialog.close();
         dialog.remove();
         previousFocus?.focus();
@@ -1322,6 +1794,7 @@
       dialog.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
       form.addEventListener('submit', event => {
         event.preventDefault();
+        if (field('sms').checked && (smsLoading || !sms)) return;
         const selectedDue = field('task').checked && due ? taskDate() : null;
         field('taskDays').setCustomValidity(field('task').checked && due && !selectedDue
           ? 'Enter a whole number of days, 0 or greater, within the supported date range.' : '');
@@ -1333,8 +1806,8 @@
         field('noteText').setCustomValidity(field('note').checked && !noteText ? 'Enter a note or turn Add note off.' : '');
         if (!form.reportValidity()) return;
         finish({ stage: field('stage').checked, targetStage, note: field('note').checked,
-          task: field('task').checked && Boolean(due), due: selectedDue, noteText,
-          sms: field('sms').checked && !field('sms').disabled, smsText });
+          task: field('task').checked && !field('task').disabled && Boolean(due), due: selectedDue, noteText,
+          sms: field('sms').checked, smsText, smsFrom: sms?.from, smsTo: sms?.to });
       });
       field('targetStage').addEventListener('change', () => field('targetStage').setCustomValidity(''));
       field('noteText').addEventListener('input', () => field('noteText').setCustomValidity(''));
@@ -1348,6 +1821,23 @@
   }
 
   // One procedural sequence. Nothing runs until the user presses the button.
+  async function readActionContext(options = {}) {
+    const results = await Promise.allSettled([readContactDetails(options), readContactOpportunities(options)]);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
+    const contact = results[0].value, opportunities = results[1].value;
+    const origin = readOrigin(contact.id);
+    const opportunity = origin ? opportunities.find(item => item.id === origin.opportunityId)
+      : opportunities.length === 1 ? opportunities[0] : null;
+    if (!opportunity) throw new Error('Original opportunity is not unique. Open the contact from its pipeline board or choose a stage queue. Nothing saved.');
+    const pipeline = NAV_PIPELINES.find(p => p.id === opportunity.pipelineId);
+    if (!pipeline || origin && (origin.pipelineId ? origin.pipelineId !== pipeline.id : origin.pipeline !== pipeline.name)) {
+      throw new Error('Original opportunity/pipeline could not be verified. Nothing saved.');
+    }
+    const stage = Object.keys(pipeline.stages).find(name => pipeline.stages[name] === opportunity.pipelineStageId);
+    if (!stage) throw new Error('Current opportunity stage is missing from the pipeline catalog. Open the Opportunities board to refresh it. Nothing saved.');
+    return { contact, opportunity, pipeline, stage };
+  }
+
   async function run() {
     if (busy) return;
     busy = true;
@@ -1357,9 +1847,11 @@
     step = 'Checking contact page';
     guardedContact = contactId();
     startingContact = guardedContact || '(none)';
+    const startingRevision = stageRouteRevision, startingUser = currentUserId;
     let timingResult = 'ok';
     startWorkflowTiming('Save and next', step);
     try {
+      requireContactControlsReady();
       if (!guardedContact || !location.pathname.includes(`/location/${LOCATION_ID}/`)) {
         throw new Error(`Expected a contact detail page in location ${LOCATION_ID}. Current path: ${location.pathname}`);
       }
@@ -1382,148 +1874,78 @@
         pinStageQueue(context.queue);
         guardedStageQueue = context.queue;
       }
-      progress('Reading contact…');
-      const { name, firstName } = await readContactName();
-      const phone = nameInput('phone', 'Phone')?.value?.trim() || '';
-      progress('Reading owner and preparing SMS…');
-      const { owner, sms } = await readOwnerAndPrepareSms();
-      progress('Reading opportunity…');
-      await openSidebar('sidebar-opportunities-icon');
-      const origin = readOrigin(startingContact);
-      const selector = 'a[href*="/opportunities/"][href*="pipelineId="]';
-      await wait(() => all(selector).length, 'linked opportunities', () =>
-        `View: ${new URL(location.href).searchParams.get('view') || '(none)'}; ${controlState('.opportunities-pane-list')}; ${controlState(selector)}`);
-      const links = all(selector);
-      const linkId = link => new URL(link.href).pathname.match(/\/opportunities\/([^/]+)\/?$/)?.[1];
-      const link = origin ? links.find(item => linkId(item) === origin.opportunityId) : links.length === 1 ? links[0] : null;
-      if (!link) throw new Error('Original opportunity is not unique. Open the contact from its pipeline board. Nothing saved.');
-      const opportunityId = linkId(link);
-      const originalPipelineId = new URL(link.href).searchParams.get('pipelineId');
-      const pipeline = NAV_PIPELINES.find(p => p.id === originalPipelineId);
-      if (!opportunityId || !pipeline || origin && (origin.pipelineId ? origin.pipelineId !== pipeline.id : origin.pipeline !== pipeline.name)) throw new Error('Original opportunity/pipeline could not be verified. Nothing saved.');
+      progress('Reading contact and opportunity…');
+      const context = await readActionContext();
+      if (contactId() !== startingContact || stageRouteRevision !== startingRevision) throw new Error('Contact changed during preparation. Nothing saved.');
+      const { contact, opportunity, pipeline, stage } = context;
+      const firstName = contact.firstName.trim(), name = [firstName, contact.lastName.trim()].filter(Boolean).join(' ');
+      if (!name) throw new Error('Contact name is empty. Nothing saved.');
+      const phone = contact.phone;
       const pipelineName = pipeline.name;
-      link.click();
-      const stageControl = await wait(() => all('#OpportunityStage')[0], 'opportunity stage #OpportunityStage');
-      const modalPipeline = selectedPipeline(stageControl.closest('#modal, [role="dialog"]') || stageControl.parentElement);
-      if (modalPipeline && modalPipeline !== pipelineName) throw new Error('Opportunity form pipeline differs from the original pipeline. Nothing saved.');
-      const stage = text(stageControl.querySelector('.hr-base-selection-input__content'));
-      const rule = Object.hasOwn(settings.rules, stage) ? settings.rules[stage] : null;
-      if (!rule) throw new Error(`Unsupported stage: "${stage}". Nothing saved.`);
-      // Read the actual pipeline's stage names so the dropdown includes all CRM stages.
-      await click('#OpportunityStage .hr-base-selection-label');
-      const stageOptions = await wait(() => {
-        const names = [...new Set(all('.hr-base-select-option p').map(text).filter(Boolean))];
-        return names.length ? names : null;
-      }, `available stages including ${rule.next}`);
-      // Selecting the existing stage closes the CRM dropdown without saving anything.
-      (await wait(() => exact('.hr-base-select-option p', stage), `current stage option ${stage}`)).click();
-      let due = rule.days === null ? null : futureDate(rule.days);
+      const stageOptions = Object.keys(pipeline.stages);
+      const rule = Object.hasOwn(settings.rules, stage) ? settings.rules[stage]
+        : { next: '', days: 2, updateStage: false };
+      const ownerId = typeof contact.assignedTo === 'string' && /^[a-zA-Z0-9_-]+$/.test(contact.assignedTo) ? contact.assignedTo : '';
+      const owner = ownerId ? `Contact owner · ${ownerId}` : '';
+      const due = rule.days === null ? null : futureDate(rule.days);
       const taskTitle = renderTemplate(settings.task, { name, firstName });
       progress('Awaiting confirmation…');
-      const choices = await confirmActions({ name, firstName: firstName || name, phone, stage, rule, due, owner, taskTitle, sms, pipelineName, stageOptions });
-      if (!choices) {
-        timingResult = 'cancelled';
-        if (visible(document.getElementById('modal-header-modal-close-btn'))) await click('#modal-header-modal-close-btn');
-        return;
+      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions });
+      if (!choices) { timingResult = 'cancelled'; return; }
+      if (contactId() !== startingContact || stageRouteRevision !== startingRevision) throw new Error('Contact or original stage queue changed during confirmation. Nothing saved.');
+      progress('Rechecking contact and opportunity…');
+      const approvedEpoch = contactReadEpoch;
+      const latest = await readActionContext({ fresh: true });
+      if (contactId() !== startingContact || stageRouteRevision !== startingRevision || currentUserId !== startingUser || contactReadEpoch !== approvedEpoch
+        || ['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => contact[key] !== latest.contact[key])
+        || ['id', 'contactId', 'locationId', 'pipelineId', 'pipelineStageId', 'assignedTo'].some(key => opportunity[key] !== latest.opportunity[key])
+        || choices.stage && pipeline.stages[choices.targetStage] !== latest.pipeline.stages[choices.targetStage]) {
+        throw new Error('Contact or opportunity changed after confirmation. Nothing saved; review the updated record before trying again.');
       }
+      approvedActionContext = { contact: startingContact, route: startingRevision, user: startingUser, epoch: approvedEpoch,
+        contactRecord: contact, opportunity, targetStageId: pipeline.stages[choices.targetStage], targetStageName: choices.targetStage,
+        ownerId, noteText: choices.noteText, taskTitle, due: choices.due,
+        actions: { stage: choices.stage, note: choices.note, task: choices.task, sms: choices.sms }, taskId: null,
+        sms: { from: choices.smsFrom, to: choices.smsTo, message: choices.smsText } };
+      assertApprovedActionContext();
+      if (choices.task && (!ownerId || !choices.due)) throw new Error('A valid contact owner and deadline are required for the task. Nothing saved.');
       progress('Applying selected actions…');
-      if (contactId() !== startingContact) throw new Error('Contact changed during confirmation. Nothing saved.');
-      due = choices.due;
       if (choices.stage) {
         if (!stageOptions.includes(choices.targetStage)) throw new Error('Selected stage is not available in this pipeline. Nothing saved.');
         progress('Saving stage…');
-        await click('#OpportunityStage .hr-base-selection-label');
-        (await wait(() => exact('.hr-base-select-option p', choices.targetStage), `stage option ${choices.targetStage}`)).click();
-        await wait(() => text(stageControl.querySelector('.hr-base-selection-input__content')) === choices.targetStage, `selected stage ${choices.targetStage}`);
-        const batch = beginReceipts();
-        await click('#CreateUpdateOpportunity', `Stage: ${stage} → ${choices.targetStage}`);
-        await savedResponse(batch, `stage ${choices.targetStage}`, r => r.method === 'PUT' && r.path === `/opportunities/${opportunityId}`,
-          (data, sent) => verifyStage(data, sent, opportunityId, startingContact, originalPipelineId));
-        completed.push(`Stage: ${choices.targetStage} (server confirmed; opportunity ${opportunityId})`);
-        pendingSave = '';
-        saveCheckpoint();
+        await saveStageApi();
       }
-      if (visible(document.getElementById('modal-header-modal-close-btn'))) await click('#modal-header-modal-close-btn');
       if (choices.note) {
         progress('Saving note…');
-        await openSidebar('sidebar-notes-icon');
-        await click('#add-note-button');
-        const editor = await wait(() => all('#common-rich-text-editor [contenteditable="true"]')[0], 'note editor');
-        editor.focus();
-        const range = document.createRange();
-        range.selectNodeContents(editor);
-        const selection = window.getSelection();
-        selection.removeAllRanges();
-        selection.addRange(range);
-        if (!document.execCommand('insertText', false, choices.noteText)) throw new Error('Note insertion failed. Save not clicked.');
-        const batch = beginReceipts();
-        await click('#notes-form-save-btn', `Note: ${choices.noteText}`);
-        const saved = await savedResponse(batch, 'note creation', r => r.method === 'POST' && r.path === '/notes'
-          && r.request?.relations?.some(rel => rel.objectKey === 'contact' && rel.recordId === startingContact),
-          (data, sent) => verifyNote(data, sent, startingContact, choices.noteText));
-        completed.push(`Note saved (server confirmed; note ${saved.note.id})`);
-        pendingSave = '';
-        saveCheckpoint();
+        await saveNoteApi();
       }
-      if (choices.task && due) {
+      progress('Completing existing Call task…');
+      await completeCallTask(startingContact, { fromSaveAndNext: true });
+      approvedActionContext.epoch = contactReadEpoch;
+      if (choices.task) {
         progress('Creating follow-up…');
-        await openSidebar('sidebar-tasks-icon');
-        await wait(() => all('input').some(el => el.placeholder === 'Search by title'), 'task list');
-        if (exact('button', 'Add task')) await clickLabel('Add task');
-        else await clickLabel('Add');
-        const form = await wait(() => document.getElementById('tasks-form-container'), 'task form');
-        await wait(() => form.innerText.includes(owner), `task owner ${owner}`);
-        fill(await wait(() => form.querySelector('#add-task-title input, input[placeholder="Enter"]'), 'task title input'), taskTitle);
-        const time = await wait(() => all('div.hr-time-picker input', form).find(el => !el.disabled), 'task time input');
-        time.scrollIntoView({ block: 'nearest' });
-        time.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
-        time.focus();
-        time.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0 }));
-        time.click();
-        await wait(() => all('div.hours-column > div').length, 'time dropdown');
-        (await wait(() => exact('div.hours-column > div:nth-of-type(11)', '11'), 'hour option 11')).click();
-        await click('#task-due-date-time-form-item > label');
-        await wait(() => /^11:00$/.test(time.value), 'time 11:00');
-        if (!all('.hr-base-selection-input', form).some(el => text(el) === 'AM')) throw new Error('Task time is not AM. Save not clicked.');
-        const date = await wait(() => form.querySelector('input[aria-label="Select Date"], .hr-datepicker__trigger-wrapper input'), 'task date input');
-        fill(date, due);
-        date.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-        const batch = beginReceipts();
-        await click('#tasks-form-save-btn', `Task: ${taskTitle}; ${due}, 11am WITA; owner ${owner}`);
-        const saved = await savedResponse(batch, 'follow-up task creation', r => r.method === 'POST' && r.path === '/objects/task/records'
-          && r.request?.properties?.contactId === startingContact,
-          (data, sent) => verifyTask(data, sent, startingContact, taskTitle, due));
-        const taskId = saved.record.id;
-        completed.push(`Task created: ${taskId}; ${due}, 11am WITA (server confirmed)`);
-        pendingSave = `Contact association for task ${taskId}`;
-        saveCheckpoint();
-        await savedResponse(batch, 'task linked to contact', r => r.method === 'POST' && r.path === '/associations/relations/bulk'
-          && r.request?.add?.some(rel => rel.firstRecordId === taskId && rel.secondRecordId === startingContact),
-          data => verifyTaskLink(data, taskId, startingContact));
-        completed.push('Task contact association: server confirmed');
-        pendingSave = '';
-        saveCheckpoint();
+        await createTaskApi();
       }
 
       if (choices.sms) {
         progress('Sending SMS…');
-        await sendSmsOnce(sms, choices.smsText);
+        await sendSmsApi();
       }
 
-      receiptBatch = null;
-      localStorage.removeItem(checkpointKey(startingContact));
       progress('Opening next lead…');
       guardedContact = null; // Navigation is allowed only after the saves succeeded.
       guardedStageQueue = null;
+      approvedActionContext = null;
       const next = await findNextActionable();
-      if (next) { openLead(next); timingResult = 'navigating'; }
-      else taskNotice(`Selected actions saved. ${emptyQueueMessage()}`);
+      if (next) { await openLead(next); timingResult = 'navigating'; }
+      else taskNotice(`Selected actions saved. ${emptyQueueMessage()} Refresh the contact to update the CRM panels.`);
+      localStorage.removeItem(checkpointKey(startingContact));
 
     } catch (error) {
       timingResult = 'stopped';
       finishWorkflowTiming(timingResult); // Do not count time spent reading the error alert.
       const report = [
-        'Pertama No answer — v0.2.12', `Stopped: ${step}`,
+        `Pertama No answer — v${VERSION}`, `Stopped: ${step}`,
         `Contact ID: ${startingContact}`, `Current path: ${location.pathname}`,
         '', error.message || String(error), '',
         'Completed actions (verification noted below):', completed.join('\n') || 'None confirmed.',
@@ -1538,8 +1960,8 @@
       finishWorkflowTiming(timingResult);
       guardedContact = null;
       guardedStageQueue = null;
+      approvedActionContext = null;
       busy = false;
-      receiptBatch = null;
       runButton.disabled = false;
       runButton.textContent = 'Save and next';
       nextButton.textContent = nextLeadLabel();
@@ -1580,7 +2002,9 @@
       <label>Default note<textarea name="note" rows="2" required></textarea></label>
       <label>Task title template<input name="task" required></label>
       <label>Default SMS<textarea name="sms" rows="4" required></textarea></label>
-      <p>Call-task completion matches the current task title template exactly. Tasks created with an older template will need manual completion.</p>
+      <label>SMS sender number<select name="smsFrom" disabled><option value="">Open a contact to load your numbers…</option></select></label>
+      <p data-sms-settings-status>SMS is available only with a number linked to your CRM user.</p>
+      <p>Save and next completes a matching existing Call task before creating a new follow-up. Tasks created with an older title template need manual completion.</p>
       <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option><option value="stage">Same stage only</option></select></label>
       <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; if it was not captured, you will be asked to choose it. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
       <label>New lead stage name<input name="newLeadStage" required></label>
@@ -1605,6 +2029,22 @@
       ? `CRM user: ${currentUserId} · identified from current CRM authentication`
       : 'CRM user: awaiting verification. Waiting for the CRM to load authenticated data.';
     for (const key of ['note', 'task', 'sms', 'priority', 'newLeadStage']) form.elements.namedItem(key).value = settings[key];
+    const senderSelect = form.elements.namedItem('smsFrom');
+    if (contactId() && location.pathname.includes(`/location/${LOCATION_ID}/`)) {
+      void prepareSmsApi().then(prepared => {
+        if (!dialog.isConnected) return;
+        senderSelect.replaceChildren(new Option('Select your number…', ''));
+        for (const sender of prepared.fromNumbers) senderSelect.add(new Option(sender.label, sender.number));
+        senderSelect.value = prepared.from || '';
+        senderSelect.disabled = prepared.fromNumbers.length < 2;
+        dialog.querySelector('[data-sms-settings-status]').textContent = !prepared.fromNumbers.length
+          ? 'No number is linked to your CRM user; SMS is unavailable.'
+          : prepared.fromNumbers.length === 1 ? `Your number ${prepared.from} is selected automatically.`
+          : 'Choose a default number before sending SMS.';
+      }).catch(() => {
+        if (dialog.isConnected) dialog.querySelector('[data-sms-settings-status]').textContent = 'Could not load your SMS numbers. Open a contact and try again.';
+      });
+    }
     const pipelineRoot = dialog.querySelector('[data-pipelines]');
     const orderedIds = [...settings.pipelineIds, ...NAV_PIPELINES.map(p => p.id).filter(id => !settings.pipelineIds.includes(id))];
     for (const id of orderedIds) {
@@ -1642,6 +2082,7 @@
       try {
         const next = { rules: Object.create(null), pipelineIds: [...pipelineRoot.children].filter(row => row.querySelector('input').checked).map(row => row.dataset.pipelineId) };
         for (const key of ['note', 'task', 'sms', 'priority', 'newLeadStage']) next[key] = form.elements.namedItem(key).value.trim();
+        next.smsFrom = senderSelect.value || (senderSelect.disabled ? settings.smsFrom : '');
         for (const row of ruleRoot.children) {
           const stage = row.querySelector('[data-stage]').value.trim(), rawDays = row.querySelector('[data-days]').value.trim();
           if (Object.hasOwn(next.rules, stage)) throw new Error(`Duplicate stage rule: ${stage}`);
@@ -1670,13 +2111,6 @@
     if (savedNotice && Date.now() - savedNotice.time < 30000) taskNotice(savedNotice.message);
   } catch { /* Optional status only. */ }
   document.addEventListener('click', rememberBoardContact, true);
-  // Observe only the user's actual Call click; never initiate or block a call.
-  document.addEventListener('click', event => {
-    if (!callStartButton(event) || !contactId()
-      || !location.pathname.includes(`/location/${LOCATION_ID}/`)) return;
-    const id = contactId();
-    setTimeout(() => completeCallTask(id), 0);
-  }, true);
   runButton = document.createElement('button');
   runButton.id = 'pertama-no-answer-button';
   runButton.textContent = 'Save and next';
@@ -1696,7 +2130,7 @@
   settingsButton.addEventListener('click', openSettings);
   // No idle polling. Discover once, then watch only the hosts and their ancestry.
   let messageHub = null, settingsAnchor = null, companies = null;
-  let frame = null, discoveryTimer = null, discoveryExpired = false;
+  let frame = null, discoveryTimer = null, discoveryRetryTimer = null, discoveryExpired = false;
   let discoveryActive = false, observedWidthTarget = null, observedWidth = null;
   let lastPath = location.pathname;
   const rootsToDiscover = new Set([document]);
@@ -1732,6 +2166,7 @@
   function stopDiscovery() {
     discoveryObserver.disconnect(); discoveryActive = false;
     clearTimeout(discoveryTimer); discoveryTimer = null;
+    clearTimeout(discoveryRetryTimer); discoveryRetryTimer = null;
   }
   function discover(root) {
     if (!root?.isConnected && root !== document) return;
@@ -1776,6 +2211,14 @@
     stopDiscovery(); discoveryExpired = false;
     rootsToDiscover.add(document);
     refreshButtons();
+  }
+  function scheduleDiscoveryRetry(scanDocument) {
+    if (discoveryExpired || discoveryRetryTimer) return;
+    discoveryRetryTimer = setTimeout(() => {
+      discoveryRetryTimer = null;
+      if (scanDocument) rootsToDiscover.add(document);
+      refreshButtons();
+    }, 1000);
   }
   function placeButton() {
     if (document.hidden) return;
@@ -1829,11 +2272,15 @@
       if (settingsButton.style.fontSize !== settingsSize) settingsButton.style.fontSize = settingsSize;
     }
     watchHosts();
-    const missingHosts = !widthTarget || Boolean(contactId() && !companies);
-    if (!missingHosts) stopDiscovery();
-    else if (!discoveryActive && !discoveryExpired) {
-      discoveryObserver.observe(document.body, { childList: true, subtree: true }); discoveryActive = true;
-      discoveryTimer = setTimeout(() => { stopDiscovery(); discoveryExpired = true; }, 30000);
+    const missingNavHosts = !widthTarget;
+    const missingToolbar = Boolean(contactId() && !companies);
+    if (!missingNavHosts && !missingToolbar) stopDiscovery();
+    else if (!discoveryExpired) {
+      if (!discoveryTimer) discoveryTimer = setTimeout(() => { stopDiscovery(); discoveryExpired = true; }, 30000);
+      if (missingNavHosts && !discoveryActive) {
+        discoveryObserver.observe(document.body, { childList: true, subtree: true }); discoveryActive = true;
+      }
+      scheduleDiscoveryRetry(missingNavHosts);
     }
   }
   window.addEventListener('resize', () => { observedWidth = null; rootsToDiscover.add(document); refreshButtons(); });

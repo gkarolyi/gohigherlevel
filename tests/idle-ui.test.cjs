@@ -5,18 +5,21 @@ const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
 
 const ROOT = path.resolve(__dirname, '..');
-const source = fs.readFileSync(path.join(ROOT, 'pertama.js'), 'utf8');
+const source = fs.readFileSync(path.join(ROOT, 'gohigherlevel.user.js'), 'utf8');
 const LOCATION = '3QixdLNutDXye95tTBK0';
 const CONTACT = `/v2/location/${LOCATION}/contacts/detail/contact-a`;
 const RUN = 'pertama-no-answer-button';
 const NEXT = 'pertama-next-lead-button';
 const SETTINGS = 'pertama-settings-button';
-const hosts = '<aside id="sidebar"><nav><a id="hub">Message hub</a><a id="settings-anchor">Settings</a></nav></aside><header><button id="tb_business">Companies</button></header>';
+const sidebarHosts = '<aside id="sidebar"><nav><a id="hub">Message hub</a><a id="settings-anchor">Settings</a></nav></aside>';
+const toolbarHost = '<header><button id="tb_business">Companies</button></header>';
+const hosts = `${sidebarHosts}${toolbarHost}`;
 const noise = Array.from({ length: 600 }, (_, i) => `<${i % 2 ? 'a' : 'button'}>Unrelated ${i}</${i % 2 ? 'a' : 'button'}>`).join('');
 
-function harness(t, { mounted = true, route = CONTACT, hidden = false, resize = true, flat = false } = {}) {
-  const flatHosts = '<a id="hub">Message hub</a><a id="settings-anchor">Settings</a><button id="tb_business">Companies</button>';
-  const dom = new JSDOM(`<!doctype html><body><div id="app">${mounted ? flat ? flatHosts : hosts : ''}<main>${noise}</main></div></body>`, {
+function harness(t, { mounted = true, toolbar = true, route = CONTACT, hidden = false, resize = true, flat = false } = {}) {
+  const flatHosts = `<a id="hub">Message hub</a><a id="settings-anchor">Settings</a>${toolbar ? '<button id="tb_business">Companies</button>' : ''}`;
+  const mountedHosts = flat ? flatHosts : `${sidebarHosts}${toolbar ? toolbarHost : ''}`;
+  const dom = new JSDOM(`<!doctype html><body><div id="app">${mounted ? mountedHosts : ''}<main>${noise}</main></div></body>`, {
     url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only',
     pretendToBeVisual: true, virtualConsole: new VirtualConsole(),
   });
@@ -287,9 +290,27 @@ test('delayed host mounting is discovered and broad discovery observation discon
   assert.equal(h.counts.scans, 0, 'discovery must inspect added subtrees instead of rescanning the whole page');
 });
 
-test('missing hosts do not leave a broad discovery observer alive beyond 30 seconds', async t => {
+test('missing contact toolbar does not observe the whole document during CRM boot', async t => {
+  const h = harness(t, { toolbar: false }); await h.flush();
+  assert.equal(broadObservers(h).length, 0, 'toolbar-only waiting must not watch all CRM boot mutations');
+  h.reset();
+  for (let i = 0; i < 50; i++) h.d.querySelector('main').append(h.d.createElement('section'));
+  await h.flush();
+  assert.deepEqual(h.counts, { scans: 0, visibility: 0, geometry: 0, observerRecords: 0 });
+});
+
+test('missing contact toolbar is found by bounded retries without mutation observation', async t => {
+  const h = harness(t, { toolbar: false }); await h.flush(); h.reset();
+  const header = h.d.createElement('header'); header.innerHTML = '<button id="tb_business">Companies</button>';
+  h.d.getElementById('app').append(header);
+  await h.advance(1000);
+  assertPlacement(h);
+  assert.equal(broadObservers(h).length, 0);
+});
+
+test('missing navigation hosts do not leave a broad discovery observer alive beyond 30 seconds', async t => {
   const h = harness(t, { mounted: false }); await h.flush();
-  assert.ok(broadObservers(h).length, 'missing hosts need temporary discovery observation');
+  assert.ok(broadObservers(h).length, 'missing navigation hosts need temporary discovery observation');
   await h.advance(30001);
   assert.equal(broadObservers(h).length, 0);
 });

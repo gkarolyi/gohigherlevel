@@ -9,7 +9,7 @@ const ROOT = path.resolve(__dirname, '..');
 // This option proves RED against the committed baseline even during concurrent source edits.
 const source = process.env.PERTAMA_TEST_BASELINE === '1'
   ? execFileSync('git', ['show', 'd429293:pertama.js'], { cwd: ROOT, encoding: 'utf8' })
-  : fs.readFileSync(path.join(ROOT, 'pertama.js'), 'utf8');
+  : fs.readFileSync(path.join(ROOT, 'gohigherlevel.user.js'), 'utf8');
 const LOCATION = '3QixdLNutDXye95tTBK0';
 const CONTACT_PATH = `/v2/location/${LOCATION}/contacts/detail/contact-a`;
 const BOARD_PATH = `/v2/location/${LOCATION}/opportunities`;
@@ -19,13 +19,15 @@ const pipelines = [{ id: 'pipe-a', name: 'Sales', stages: { 'New Lead': 'stage-n
 const plain = value => JSON.parse(JSON.stringify(value));
 function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = false } = {}) {
   const virtualConsole = new VirtualConsole();
+  const navigationErrors = [];
+  virtualConsole.on('jsdomError', error => { if (/navigation/i.test(error.message)) navigationErrors.push(error); });
   const dom = new JSDOM('<!doctype html><body><nav><a>Message hub</a><a>Settings</a></nav><button id="tb_business">Companies</button></body>', {
     url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole,
   });
   t.after(() => dom.window.close());
   const w = dom.window;
   for (const key of ['Headers', 'Request', 'Response', 'AbortController']) w[key] = globalThis[key];
-  w.HTMLElement.prototype.getClientRects = function () { return this.hidden ? [] : [{ width: 200 }]; };
+  w.HTMLElement.prototype.getClientRects = function () { return this.closest('[hidden]') ? [] : [{ width: 200 }]; };
   w.HTMLElement.prototype.scrollIntoView = function () {};
   w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
   w.HTMLDialogElement.prototype.close = function () { this.open = false; };
@@ -53,7 +55,7 @@ function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = f
   const claims = { user_id: 'user-a', sub: 'user-a', locations: [LOCATION], exp: Math.floor(Date.now() / 1000) + 3600 };
   const token = `test.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.test`;
   evaluate(`captureReadHeaders('https://services.leadconnectorhq.com/opportunities/search', { authorization: ${JSON.stringify(`Bearer ${token}`)} })`);
-  return { w, evaluate, requests, xhrRequests, alerts,
+  return { w, evaluate, requests, xhrRequests, alerts, navigationErrors,
     finishXhr(request, data, status = 200) {
       Object.defineProperties(request, {
         status: { configurable: true, value: status },
@@ -75,6 +77,247 @@ function result(hits, stageId = 'stage-atc') {
 function fields(filters, name) {
   return filters.flatMap(f => f.filters ? fields(f.filters, name) : f.field === name ? [f] : []);
 }
+
+const nextLeadData = { contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' };
+const NEXT_PATH = `/v2/location/${LOCATION}/contacts/detail/contact-b`;
+function installRouter(h, overrides = {}) {
+  const pushes = [];
+  const router = {
+    currentRoute: { value: { name: 'contact_detail-v2', path: h.w.location.pathname } },
+    resolve(path) { return { name: 'contact_detail-v2', href: path }; },
+    async push(path) {
+      pushes.push(path);
+      h.route(path);
+      router.currentRoute.value = { name: 'contact_detail-v2', path };
+      for (const id of ['contact.first_name', 'contact.last_name', 'contact.phone', 'owner-dropdown-trigger',
+        'tasks-list-container-contact', 'conv-composer-textarea-input', 'conv-send-button-simple']) {
+        h.w.document.getElementById(id)?.remove();
+      }
+    },
+    ...overrides,
+  };
+  const root = h.w.document.createElement('div'); root.setAttribute('data-v-app', '');
+  root.__vue_app__ = { config: { globalProperties: { $router: router } } };
+  h.w.document.body.append(root);
+  return { router, pushes };
+}
+const openNext = async h => h.evaluate(`openLead(${JSON.stringify(nextLeadData)})`);
+
+test('next contact already open reports action required without invoking native navigation', async t => {
+  const h = harness(t); h.pin();
+  const { pushes } = installRouter(h);
+  await assert.rejects(h.evaluate("openLead({ contactId: 'contact-a', opportunityId: 'opp-a', pipelineId: 'pipe-a', stageId: 'stage-atc' })"), /next top lead.*action it first/i);
+  assert.deepEqual(pushes, []);
+  assert.equal(h.w.location.pathname, CONTACT_PATH);
+  assert.equal(h.evaluate('stageQueueContext().queue.contactId'), 'contact-a');
+});
+test('native navigation uses exact contact path, preserves stage queue and avoids document reload', async t => {
+  const h = harness(t); h.pin();
+  const emptyRoot = h.w.document.createElement('div'); emptyRoot.setAttribute('data-v-app', ''); h.w.document.body.append(emptyRoot);
+  const { pushes } = installRouter(h);
+  await openNext(h);
+  assert.deepEqual(pushes, [NEXT_PATH]);
+  assert.equal(h.w.location.pathname, NEXT_PATH);
+  assert.equal(h.navigationErrors.length, 0);
+  assert.equal(h.w.sessionStorage.getItem(`pertama:navigation-timing:${LOCATION}`), null);
+  assert.equal(h.evaluate('stageQueueContext().queue.contactId'), 'contact-b');
+  assert.equal(h.evaluate('stageQueueContext().queue.stageId'), 'stage-atc');
+  const timing = plain(h.w.pertamaWorkflowTimings).find(row => row.action === 'Navigation');
+  assert.equal(timing.phase, 'Native route committed');
+  h.route(CONTACT_PATH);
+  assert.equal(h.evaluate('stageQueueContext()'), null, 'manual navigation must still clear the queue');
+});
+
+test('repeated Next lead transitions keep the original stage without reinitializing the script', async t => {
+  const h = harness(t); h.pin(); h.evaluate("settings.priority = 'stage'");
+  const { pushes } = installRouter(h);
+  let current = 'contact-a';
+  for (const next of ['contact-b', 'contact-c', 'contact-d']) {
+    h.respond(result([hit(current, `opp-${current}`), hit(next, `opp-${next}`)]));
+    await h.evaluate('nextLead()');
+    assert.equal(h.evaluate('stageQueueContext().queue.contactId'), next);
+    assert.equal(h.evaluate('stageQueueContext().queue.stageId'), 'stage-atc');
+    assert.equal(h.evaluate('busy'), false);
+    current = next;
+  }
+  assert.equal(pushes.length, 3);
+  assert.equal(h.navigationErrors.length, 0);
+  assert.equal(h.requests.length, 3);
+});
+
+for (const mode of ['throw', 'failure value', 'no transition']) {
+  test(`native navigation ${mode} restores source queue without retry or reload`, async t => {
+    const h = harness(t); h.pin(); let attempts = 0;
+    installRouter(h, { async push() { attempts++; if (mode === 'throw') throw new Error('blocked'); return mode === 'failure value' ? new Error('aborted') : undefined; } });
+    await assert.rejects(openNext(h));
+    assert.equal(attempts, 1);
+    assert.equal(h.navigationErrors.length, 0);
+    assert.deepEqual(plain(h.evaluate('stageQueueContext().queue')), queue);
+    assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
+    assert.equal(h.w.sessionStorage.getItem('pertama:origin:contact-b'), null);
+    assert.equal(plain(h.w.pertamaWorkflowTimings).some(row => row.action === 'Navigation' && row.result === 'ok'), false);
+  });
+}
+
+for (const mode of ['redirect', 'away and back']) {
+  test(`native ${mode} never restores a stale queue`, async t => {
+    const h = harness(t); h.pin();
+    installRouter(h, { async push() {
+      h.route(`/v2/location/${LOCATION}/contacts/detail/contact-c`);
+      if (mode === 'away and back') h.route(CONTACT_PATH);
+      throw new Error('navigation interrupted');
+    } });
+    await assert.rejects(openNext(h));
+    assert.equal(h.evaluate('stageQueueContext()'), null);
+    assert.equal(h.navigationErrors.length, 0);
+  });
+}
+
+test('router redirect or stale router state is not reported as successful navigation', async t => {
+  const h = harness(t); h.pin();
+  installRouter(h, { async push() { h.route(NEXT_PATH); } });
+  await assert.rejects(openNext(h));
+  assert.equal(h.navigationErrors.length, 0);
+});
+
+test('multiple matching routers fail closed before changing the queue', async t => {
+  const h = harness(t); h.pin();
+  const first = installRouter(h), second = installRouter(h);
+  await assert.rejects(openNext(h), /router/i);
+  assert.deepEqual(first.pushes, []); assert.deepEqual(second.pushes, []);
+  assert.deepEqual(plain(h.evaluate('stageQueueContext().queue')), queue);
+  assert.equal(h.navigationErrors.length, 0);
+});
+
+test('unavailable native router preserves full-document fallback', async t => {
+  const h = harness(t);
+  await openNext(h);
+  assert.equal(h.navigationErrors.length, 1);
+  assert.equal(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)).contactId, 'contact-b');
+});
+
+test('Next lead waits for native navigation and refuses a concurrent workflow', async t => {
+  const h = harness(t); h.pin(); h.respond(result([hit()]));
+  h.evaluate("settings.priority = 'stage'");
+  let release, started;
+  const pending = new Promise(resolve => { release = resolve; });
+  const began = new Promise(resolve => { started = resolve; });
+  const { router, pushes } = installRouter(h);
+  const push = router.push;
+  router.push = async path => { started(); await pending; return push(path); };
+  const navigation = h.evaluate('nextLead()');
+  // Bounded turn drain also fails against the old synchronous/full-page implementation.
+  for (let i = 0; i < 30 && !h.navigationErrors.length; i++) await Promise.resolve();
+  assert.equal(h.navigationErrors.length, 0, 'must use native navigation');
+  await began;
+  assert.equal(h.evaluate('busy'), true);
+  await h.evaluate('nextLead(); run()');
+  assert.equal(h.requests.length, 1);
+  release(); await navigation;
+  assert.deepEqual(pushes, [NEXT_PATH]);
+  assert.equal(h.evaluate('busy'), false);
+});
+
+function retainedContactFixture(h, { hidden = false } = {}) {
+  const root = h.w.document.createElement('section');
+  root.hidden = hidden;
+  root.innerHTML = `<input id="contact.first_name" value="Old"><input id="contact.last_name" value="Lead">
+    <div id="owner-dropdown-trigger"><span>Old Owner</span></div>
+    <div id="tasks-list-container-contact"><div class="tasks-card-container-style"><div><div><p>Call again Old Lead</p></div>
+      <button id="completed-action"><svg class="text-gray-500"></svg></button></div></div></div>
+    <textarea id="conv-composer-textarea-input">Old draft</textarea><button id="conv-send-button-simple">Send</button>`;
+  h.w.document.body.append(root);
+  let clicks = 0;
+  root.querySelectorAll('button').forEach(button => button.addEventListener('click', () => { clicks++; }));
+  let now = Date.now();
+  h.w.Date.now = () => now;
+  const sleeps = [], originalTimeout = h.w.setTimeout.bind(h.w);
+  h.w.setTimeout = (callback, delay, ...args) => {
+    if (delay === 150) { sleeps.push(callback); return 0; }
+    return originalTimeout(callback, delay, ...args);
+  };
+  const { router } = installRouter(h, { async push(path) {
+    h.route(path); router.currentRoute.value = { name: 'contact_detail-v2', path };
+  } });
+  h.pin(); h.respond(result([hit()])); h.evaluate("settings.priority = 'stage'");
+  return { root, sleeps, clicks: () => clicks, advance(ms) { now += ms; sleeps.splice(0).forEach(callback => callback()); } };
+}
+
+test('native transition blocks automation until old contact, task and SMS controls are disconnected', async t => {
+  const h = harness(t), fixture = retainedContactFixture(h);
+  const navigation = h.evaluate('nextLead()');
+  await flush();
+  assert.equal(h.w.location.pathname, NEXT_PATH);
+  assert.equal(h.evaluate('busy'), true, 'route commitment is not contact readiness');
+  await h.evaluate("completeCallTask('contact-b'); run(); nextLead()");
+  assert.equal(fixture.clicks(), 0);
+  assert.equal(h.requests.length, 1);
+  // Replaced names alone do not make retained task/SMS controls safe.
+  for (const id of ['contact.first_name', 'contact.last_name', 'owner-dropdown-trigger']) h.w.document.getElementById(id).remove();
+  fixture.advance(150); await flush();
+  assert.equal(h.evaluate('busy'), true);
+  fixture.root.hidden = true;
+  fixture.advance(150); await flush();
+  assert.equal(h.evaluate('busy'), true, 'hidden old controls must not be treated as replaced');
+  fixture.root.remove(); fixture.advance(150);
+  await navigation;
+  assert.equal(h.evaluate('busy'), false);
+  assert.equal(fixture.clicks(), 0);
+  assert.equal(h.navigationErrors.length, 0);
+  assert.ok(plain(h.w.pertamaWorkflowTimings).some(row => row.phase === 'Previous contact controls released' && row.result === 'ok'));
+});
+
+test('controls hidden before native navigation remain blocked if revealed for the next contact', async t => {
+  const h = harness(t), fixture = retainedContactFixture(h, { hidden: true });
+  const navigation = h.evaluate('nextLead()'); await flush();
+  assert.equal(h.w.location.pathname, NEXT_PATH);
+  assert.equal(h.evaluate('busy'), true, 'initially hidden source controls also need retirement');
+  fixture.root.hidden = false;
+  await h.evaluate("completeCallTask('contact-b'); run(); nextLead()");
+  assert.equal(fixture.clicks(), 0);
+  assert.equal(h.requests.length, 1);
+  fixture.root.remove(); fixture.advance(150);
+  await navigation;
+  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.navigationErrors.length, 0);
+});
+
+test('retained controls remain blocked after navigation readiness timeout and unblock only after removal', async t => {
+  const h = harness(t), fixture = retainedContactFixture(h);
+  const navigation = h.evaluate('nextLead()'); await flush();
+  assert.equal(h.evaluate('busy'), true);
+  assert.ok(fixture.sleeps.length);
+  fixture.advance(30001); await navigation;
+  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.w.location.pathname, NEXT_PATH);
+  h.evaluate('globalThis.__sidebarTouches = 0; globalThis.openSidebar = async () => { __sidebarTouches++; }; openSidebar = globalThis.openSidebar;');
+  await h.evaluate("completeCallTask('contact-b')");
+  await h.evaluate('run()');
+  await h.evaluate('nextLead()');
+  assert.equal(fixture.clicks(), 0, 'old task and Send controls must never be clicked');
+  assert.equal(h.evaluate('__sidebarTouches'), 0, 'must reject before manipulating old panels');
+  assert.equal(h.requests.length, 1, 'must not navigate again while old controls remain');
+  assert.match(h.alerts.join('\n'), /previous contact controls/i);
+  assert.equal(h.navigationErrors.length, 0);
+  fixture.root.remove();
+  h.respond(result([hit('contact-c', 'opp-c')]));
+  await h.evaluate('nextLead()');
+  assert.equal(h.w.location.pathname, `/v2/location/${LOCATION}/contacts/detail/contact-c`);
+  assert.equal(h.requests.length, 2);
+});
+
+test('manual route change during control retirement cancels navigation without reviving the source queue', async t => {
+  const h = harness(t), fixture = retainedContactFixture(h);
+  const navigation = h.evaluate('nextLead()'); await flush();
+  assert.equal(h.evaluate('busy'), true);
+  h.route(CONTACT_PATH); h.route(NEXT_PATH);
+  fixture.root.remove(); fixture.advance(150);
+  await navigation;
+  assert.equal(h.evaluate('stageQueueContext()'), null);
+  assert.equal(h.evaluate('busy'), false);
+  assert.equal(plain(h.w.pertamaWorkflowTimings).at(-1).result, 'stopped');
+  assert.equal(h.navigationErrors.length, 0);
+});
 
 test('unchanged captured queries do not repeatedly write localStorage', t => {
   const h = harness(t);
@@ -200,9 +443,9 @@ test('changing account clears pinned queue', t => {
   assert.equal(h.w.sessionStorage.getItem(QUEUE_KEY), null);
 });
 
-test('openLead pins IDs before navigation and intentional handoff survives route sync', t => {
+test('openLead pins IDs before navigation and intentional handoff survives route sync', async t => {
   const h = harness(t); h.pin();
-  h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })");
+  await h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })");
   const expected = { ...queue, contactId: 'contact-b', opportunityId: 'opp-b' };
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), expected);
   // jsdom cannot perform location.assign; emulate the browser reaching its destination.
@@ -317,7 +560,7 @@ test('settings dialog offers and saves same-stage priority', t => {
 });
 
 test('explicit picker requires stage choice and pins chosen opportunity before resolving', { timeout: 3000 }, async t => {
-  const h = harness(t);
+  const h = harness(t); apiContactFixture(h);
   h.w.document.body.insertAdjacentHTML('beforeend', `<div class="opportunities-pane-list"><a href="/v2/location/${LOCATION}/opportunities/opp-a?pipelineId=pipe-a">Sales opportunity</a></div>`);
   const pending = h.evaluate('ensureStageQueue()');
   await new Promise(resolve => setImmediate(resolve));
@@ -339,11 +582,156 @@ test('explicit picker requires stage choice and pins chosen opportunity before r
   assert.equal(h.requests.length, 0);
 });
 
+function apiContactFixture(h) {
+  h.w.__apiContact = { id: 'contact-a', locationId: LOCATION, firstName: 'Ada', lastName: 'Test', phone: '+628123456789', assignedTo: 'owner-a' };
+  h.w.__apiOpportunities = [{ id: 'opp-a', contactId: 'contact-a', locationId: LOCATION, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', assignedTo: 'owner-a' }];
+  h.w.__apiReads = [];
+  h.evaluate(`globalThis.readContactDetails = async (options = {}) => {
+    __apiReads.push({ kind: 'contact', fresh: Boolean(options.fresh) });
+    return JSON.parse(JSON.stringify(__apiContact));
+  }; readContactDetails = globalThis.readContactDetails;
+  globalThis.readContactOpportunities = async (options = {}) => {
+    __apiReads.push({ kind: 'opportunities', fresh: Boolean(options.fresh) });
+    return JSON.parse(JSON.stringify(__apiOpportunities));
+  }; readContactOpportunities = globalThis.readContactOpportunities;`);
+}
 function opportunityFixture(h) {
+  apiContactFixture(h);
   h.w.document.body.insertAdjacentHTML('beforeend', `<div class="opportunities-pane-list"><a href="/v2/location/${LOCATION}/opportunities/opp-a?pipelineId=pipe-a">Sales opportunity</a></div>`);
   h.w.document.querySelector('.opportunities-pane-list a').addEventListener('click', event => event.preventDefault());
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('Save and next reaches confirmation through the real API providers without contact or opportunity DOM', async t => {
+  const h = harness(t, { fetchResponse: request => request.method === 'GET'
+    ? { contact: { id: 'contact-a', locationId: LOCATION, firstName: 'Api', lastName: 'Contact', phone: '+628123456789', assignedTo: 'owner-a' } }
+    : { opportunities: [{ id: 'opp-a', contactId: 'contact-a', locationId: LOCATION, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', assignedTo: 'owner-a' }], total: 1 } });
+  h.pin();
+  fastPolling(h); // Missing owner UI must never hold up API-backed confirmation.
+  h.evaluate("globalThis.openSidebar = async () => { throw new Error('No sidebar reads allowed'); }; openSidebar = globalThis.openSidebar;");
+  const pending = h.evaluate('run()'); await flush();
+  const dialog = h.w.document.getElementById('pertama-confirm-actions');
+  assert.ok(dialog, h.alerts.join('\n'));
+  assert.match(dialog.textContent, /Api Contact/);
+  assert.match(dialog.querySelector('[data-stage]').textContent, /Attempted Contact/);
+  assert.deepEqual(h.requests.map(request => request.method).sort(), ['GET', 'POST']);
+  assert.equal(h.requests.find(request => request.method === 'GET').url, 'https://services.leadconnectorhq.com/contacts/contact-a');
+  assert.equal(h.requests.find(request => request.method === 'POST').url, 'https://services.leadconnectorhq.com/opportunities/search/');
+  dialog.querySelector('[data-cancel]').click(); await pending;
+  assert.deepEqual(h.alerts, []);
+});
+
+test('unconfigured stage allows manual stage update and defaults follow-up to two days', async t => {
+  const h = harness(t); apiContactFixture(h); h.pin();
+  h.w.__apiOpportunities[0].pipelineStageId = 'stage-robot';
+  h.w.__selectedActions = [];
+  h.evaluate(`saveStageApi = async () => { __selectedActions.push({ action: 'stage', target: approvedActionContext.targetStageId }); };
+    createTaskApi = async () => { __selectedActions.push({ action: 'task', due: approvedActionContext.due }); };
+    completeCallTask = async () => {}; findNextActionable = async () => null;`);
+  const pending = h.evaluate('run()'); await flush();
+  const dialog = h.w.document.getElementById('pertama-confirm-actions');
+  assert.ok(dialog, h.alerts.join('\n'));
+  const form = dialog.querySelector('form');
+  assert.equal(form.elements.namedItem('stage').checked, false);
+  assert.equal(form.elements.namedItem('targetStage').disabled, true);
+  assert.match(dialog.querySelector('[data-stage]').textContent, /no (automatic )?rule/i);
+  assert.equal(form.elements.namedItem('task').checked, true);
+  assert.equal(form.elements.namedItem('taskDays').value, '2');
+  form.elements.namedItem('note').checked = false;
+  form.elements.namedItem('stage').checked = true;
+  form.elements.namedItem('targetStage').value = 'New Lead';
+  form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+  await pending;
+  assert.deepEqual(plain(h.w.__selectedActions), [
+    { action: 'stage', target: 'stage-new' }, { action: 'task', due: h.evaluate('futureDate(2)') },
+  ]);
+  assert.deepEqual(h.alerts, []);
+});
+
+test('API action context requires a unique opportunity unless the original ID is pinned', async t => {
+  const h = harness(t); apiContactFixture(h);
+  h.w.__apiOpportunities.unshift({ ...h.w.__apiOpportunities[0], id: 'opp-other', pipelineStageId: 'stage-robot' });
+  await assert.rejects(h.evaluate('readActionContext()'), /not unique/i);
+  h.pin();
+  const context = await h.evaluate('readActionContext()');
+  assert.equal(context.opportunity.id, 'opp-a');
+  assert.equal(context.stage, 'Attempted Contact');
+});
+
+for (const mismatch of ['pipeline', 'stage']) {
+  test(`API action context rejects unknown ${mismatch} instead of inferring from the queue`, async t => {
+    const h = harness(t); apiContactFixture(h); h.pin();
+    h.w.__apiOpportunities[0][mismatch === 'pipeline' ? 'pipelineId' : 'pipelineStageId'] = 'missing';
+    await assert.rejects(h.evaluate('readActionContext()'), /pipeline|stage/i);
+    assert.deepEqual(plain(h.evaluate('stageQueueContext().queue')), queue);
+    assert.equal(h.requests.length, 0);
+  });
+}
+
+test('API context failure drains the other read before releasing the workflow', async t => {
+  const h = harness(t); apiContactFixture(h);
+  let release;
+  h.w.__pendingOpportunities = new Promise(resolve => { release = resolve; });
+  h.evaluate(`readContactDetails = async () => { throw new Error('Contact read failed'); };
+    readContactOpportunities = () => __pendingOpportunities;`);
+  let settled = false;
+  const pending = h.evaluate('run()').finally(() => { settled = true; });
+  await flush();
+  assert.equal(settled, false);
+  assert.equal(h.evaluate('busy'), true);
+  release(h.w.__apiOpportunities); await pending;
+  assert.equal(h.evaluate('busy'), false);
+  assert.match(h.alerts.join('\n'), /Contact read failed/);
+});
+
+test('unknown stage queue uses API opportunity choices without opening the CRM sidebar', async t => {
+  const h = harness(t); apiContactFixture(h);
+  h.evaluate("globalThis.openSidebar = async () => { throw new Error('Sidebar discovery forbidden'); }; openSidebar = globalThis.openSidebar;");
+  const pending = h.evaluate('ensureStageQueue()').catch(error => ({ error }));
+  await flush();
+  const dialog = h.w.document.getElementById('pertama-stage-queue');
+  assert.ok(dialog, 'API data must suffice to present the queue picker');
+  assert.equal(dialog.querySelector('[name="stage"]').value, '');
+  dialog.querySelector('[data-cancel]').click();
+  assert.equal(await pending, null);
+  assert.deepEqual(plain(h.w.__apiReads), [{ kind: 'opportunities', fresh: false }]);
+});
+
+for (const outcome of ['cancel', 'skip-writes', 'changed-contact', 'changed-stage', 'changed-owner']) {
+  test(`API preparation without contact inputs or opportunity panels: ${outcome}`, async t => {
+    const h = harness(t); apiContactFixture(h);
+    h.pin({ ...queue, stageId: 'stage-new' });
+    h.w.document.body.insertAdjacentHTML('beforeend', '<div id="owner-dropdown-trigger"><span>Ada Owner</span></div>');
+    h.evaluate(`globalThis.openSidebar = async () => { throw new Error('Sidebar discovery forbidden'); }; openSidebar = globalThis.openSidebar;
+      findNextActionable = async () => null; completeCallTask = async () => {};`);
+    const pending = h.evaluate('run()'); await flush();
+    const dialog = h.w.document.getElementById('pertama-confirm-actions');
+    assert.ok(dialog, h.alerts.join('\n'));
+    assert.match(dialog.textContent, /Ada Test/);
+    assert.match(dialog.querySelector('[data-stage]').textContent, /Attempted Contact/);
+    assert.equal(h.evaluate('stageQueueContext().stage'), 'New Lead', 'original queue is not the current stage');
+    assert.equal(h.w.document.getElementById('OpportunityStage'), null);
+    if (outcome === 'cancel') {
+      dialog.querySelector('[data-cancel]').click(); await pending;
+      assert.equal(h.w.__apiReads.length, 2);
+    } else {
+      if (outcome === 'changed-contact') h.w.__apiContact.firstName = 'Changed';
+      if (outcome === 'changed-owner') h.w.__apiContact.assignedTo = 'owner-b';
+      if (outcome === 'changed-stage') h.w.__apiOpportunities[0].pipelineStageId = 'stage-robot';
+      const form = dialog.querySelector('form');
+      for (const field of ['stage', 'note', 'task', 'sms']) form.elements.namedItem(field).checked = false;
+      form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+      form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+      await pending;
+      assert.equal(h.w.__apiReads.filter(read => read.fresh).length, 2);
+      if (outcome.startsWith('changed')) assert.match(h.alerts.join('\n'), /changed.*confirmation|confirmation.*changed/i);
+    }
+    if (!outcome.startsWith('changed')) assert.deepEqual(h.alerts, []);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.navigationErrors.length, 0);
+  });
+}
 
 for (const action of ['cancel', 'contact change', 'navigate away and back']) {
   test(`picker ${action} never pins a queue or searches`, { timeout: 3000 }, async t => {
@@ -402,6 +790,12 @@ test('quick away-and-back navigation invalidates an in-flight lookup', async t =
   release(result([hit()]));
   await rejected;
   assert.equal(h.w.sessionStorage.getItem(QUEUE_KEY), null);
+});
+
+test('empty lead/task queues show an accurate congratulatory notice', t => {
+  const h = harness(t);
+  assert.equal(h.evaluate('emptyQueueMessage()'),
+    'You’re all caught up! No new leads or pending tasks match your selected queues. Nice work.');
 });
 
 test('Next lead uses pinned queue and shows stage-specific empty notice without tasks', async t => {
@@ -488,62 +882,166 @@ test('overlapping writes reject snapshots before and during writes, even after s
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
 });
 
-for (const changeRoute of [false, true]) {
-test(changeRoute ? 'Save and next refuses saves after leaving and returning during confirmation'
-  : 'Save and next preserves original queue through confirmed stage save and excludes current contact', { timeout: 3000 }, async t => {
-  const h = harness(t, { fetchResponse: request => request.method === 'PUT'
-    ? { opportunity: { id: 'opp-a', contactId: 'contact-a', pipelineId: 'pipe-a', pipelineStageId: 'stage-robot' } }
-    : result([hit('contact-a', 'opp-a'), hit()]) });
-  h.pin(); opportunityFixture(h);
-  h.evaluate("settings.priority = 'stage'; settings.rules['Attempted Contact'].next = 'Robot'; prepareSms = async () => ({ error: 'No SMS composer in fixture' })");
-  h.w.document.body.insertAdjacentHTML('beforeend', `
-    <div id="record-details-tabs"><div class="hr-tabs-rail"><div></div><div><span>All fields</span></div></div></div>
-    <input id="contact.first_name" value="Ada"><input id="contact.last_name" value="Test">
-    <div id="owner-dropdown-trigger"><span>Ada Owner</span></div>
-    <div id="modal"><span>Sales</span><div id="OpportunityStage"><button class="hr-base-selection-label">Stage</button><span class="hr-base-selection-input__content">Attempted Contact</span></div>
-    <div class="hr-base-select-option"><p>Attempted Contact</p></div><div class="hr-base-select-option"><p>Robot</p></div>
-    <button id="CreateUpdateOpportunity">Save</button><button id="modal-header-modal-close-btn">Close</button></div>`);
-  for (const option of h.w.document.querySelectorAll('.hr-base-select-option p')) {
-    option.addEventListener('click', () => { h.w.document.querySelector('.hr-base-selection-input__content').textContent = option.textContent; });
-  }
-  h.w.document.querySelector('#CreateUpdateOpportunity').addEventListener('click', () => {
-    void h.w.fetch('https://services.leadconnectorhq.com/opportunities/opp-a', {
-      method: 'PUT', body: JSON.stringify({ pipelineId: 'pipe-a', pipelineStageId: 'stage-robot' }),
-    });
+for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mismatch', 'stale-confirmation', 'navigation-failure', 'stage-mismatch', 'retained-modal',
+  'mutation-after-recheck', 'user-after-recheck', 'route-after-recheck', 'stage-owner-automation', 'link-failure', 'task-route-change', 'empty-queue']) {
+  test(`API Save and next without CRM forms: ${mode}`, { timeout: 3000 }, async t => {
+    const contact = { id: 'contact-a', locationId: LOCATION, firstName: 'Ada', lastName: 'Test', phone: '+628123456789', assignedTo: 'owner-a' };
+    const opportunity = { id: 'opp-a', contactId: 'contact-a', locationId: LOCATION, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', assignedTo: 'owner-a', indexVersion: 7, isAttribute: true };
+    const smsEnabled = ['all-actions-sms', 'sms-readback-mismatch'].includes(mode);
+    const allActions = smsEnabled || ['all-actions', 'stage-owner-automation', 'link-failure', 'task-route-change'].includes(mode);
+    let sentSms;
+    const writes = [];
+    const checkpointKey = `pertama:no-answer:unfinished:${LOCATION}:contact-a`;
+    const h = harness(t, { fetchResponse: request => {
+      const url = new URL(request.url), body = request.body;
+      if (request.method === 'GET' && url.pathname === '/contacts/contact-a') return { contact };
+      if (url.pathname === `/phone-system/numbers/v2/location/${LOCATION}`) return { isUnderGhl: true, total: 2, page: 0, pageSize: 1000,
+        numbers: [{ phoneNumber: '+15555550101', sid: 'pn-a', linkedUser: 'user-a', isDefaultNumber: true, capabilities: { sms: true } },
+          { phoneNumber: '+15555550102', sid: 'pn-b', linkedUser: 'owner-a', isDefaultNumber: false, capabilities: { sms: true } }], rcsSenderIds: [] };
+      if (url.pathname.startsWith('/conversations/messages/drafts/')) { assert.equal(request.method, 'GET'); return { drafts: [] }; }
+      if (url.pathname === '/conversations/messages/spam/v2') { assert.equal(body.text, 'Approved API message'); return { isSpam: false }; }
+      if (url.pathname === '/f1/conversations/conv-created/messages') return { messages: { lastMessageId: 'msg-created', messages: [{
+        id: mode === 'sms-readback-mismatch' ? 'other-message' : 'msg-created', conversationId: 'conv-created', contactId: 'contact-a', locationId: LOCATION,
+        type: 2, direction: 'outbound', status: 'sent', body: sentSms.message, meta: { from: sentSms.fromNumber, to: sentSms.toNumber },
+      }] } };
+      if (url.pathname.replace(/\/$/, '') === '/opportunities/search') {
+        return body.aggregations ? result(mode === 'empty-queue' ? [] : [hit('contact-a', 'opp-a'), hit()])
+          : { opportunities: [opportunity], total: 1 };
+      }
+      if (request.method === 'GET' && url.pathname === '/opportunities/opp-a') {
+        if (mode === 'mutation-after-recheck') h.evaluate("finishContactWrite(observeContactRequest('PATCH', 'https://services.leadconnectorhq.com/contacts/contact-a', () => '{}'))");
+        if (mode === 'user-after-recheck') h.evaluate("currentUserId = 'other-user'; invalidateContactReads()");
+        if (mode === 'route-after-recheck') { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
+        return { opportunity: mode === 'stage-mismatch' ? { ...opportunity, pipelineStageId: 'stage-new' } : opportunity };
+      }
+      writes.push(request);
+      assert.ok(JSON.parse(h.w.localStorage.getItem(checkpointKey)).pendingSave, 'journal must precede every write');
+      if (url.pathname === '/conversations/messages') {
+        sentSms = body;
+        assert.equal(body.fromNumber, '+15555550101');
+        assert.equal(body.toNumber, contact.phone);
+        assert.equal(body.message, 'Approved API message');
+        return { messageId: 'msg-created', conversationId: 'conv-created' };
+      }
+      if (request.method === 'PUT' && url.pathname === '/opportunities/opp-a') {
+        assert.deepEqual(body, { pipelineStageId: 'stage-robot', indexVersion: 8, isAttribute: false });
+        Object.assign(opportunity, { pipelineStageId: body.pipelineStageId, indexVersion: body.indexVersion });
+        if (mode === 'stage-owner-automation') contact.assignedTo = 'owner-b';
+        return { opportunity };
+      }
+      if (url.pathname === '/notes/') {
+        assert.equal(url.searchParams.get('locationId'), LOCATION);
+        assert.deepEqual(body.relations, [{ objectKey: 'contact', recordId: 'contact-a' }]);
+        assert.match(body.body, /&lt;b&gt;literal&lt;\/b&gt;/);
+        return { note: { id: 'note-created', locationId: LOCATION, contactId: 'contact-a', body: body.body } };
+      }
+      if (url.pathname === '/objects/task/records') {
+        assert.deepEqual(plain(h.w.__completedOnSave), [{ id: 'contact-a', options: { fromSaveAndNext: true } }], 'complete the old task before creating a new one');
+        assert.deepEqual(body.owners, ['owner-a'], 'assign contact owner, not current user');
+        assert.equal(body.properties.contactId, 'contact-a');
+        assert.equal(body.properties.dueDate, `${h.evaluate('futureDate(3)')}T03:00:00.000Z`);
+        if (mode === 'task-route-change') h.route(CONTACT_PATH.replace('contact-a', 'contact-other'));
+        return { record: { id: 'task-created', locationId: LOCATION, objectKey: 'task', owners: body.owners,
+          properties: { title: body.properties.title, dueDate: body.properties.dueDate.replace('.000Z', 'Z'), completed: 0 } }, errors: [] };
+      }
+      if (url.pathname === '/associations/relations/bulk') {
+        assert.equal(url.searchParams.get('updateFutureTasks'), 'false');
+        assert.deepEqual(body.add, [{ associationId: 'TASK_CONTACT_ASSOCIATION', firstRecordId: 'task-created', secondRecordId: 'contact-a' }]);
+        assert.match(h.w.localStorage.getItem(checkpointKey), /task-created/);
+        if (mode === 'link-failure') throw new Error('Association response lost');
+        return { results: { added: [{ success: true, relationId: 'relation-created', data: body.add[0] }], removed: [], errored: [] } };
+      }
+      throw new Error('Unexpected request');
+    } });
+    h.pin(); fastPolling(h);
+    const native = installRouter(h);
+    let navigationAttempts = 0;
+    const nativePush = native.router.push;
+    native.router.push = async path => {
+      navigationAttempts++;
+      if (mode === 'navigation-failure') throw new Error('Native navigation cancelled');
+      return nativePush(path);
+    };
+    h.w.__completedOnSave = [];
+    h.evaluate(`settings.priority = 'stage'; settings.rules['Attempted Contact'].next = 'Robot';
+      completeCallTask = async (id, options) => { globalThis.__completedOnSave.push({ id, options }); invalidateContactReads(); };
+      globalThis.openSidebar = async () => { throw new Error('CRM form access forbidden'); }; openSidebar = globalThis.openSidebar;`);
+    if (mode === 'route-after-recheck') h.evaluate("settings.priority = 'leads'");
+    let modalClicks = 0;
+    if (mode === 'retained-modal') {
+      h.w.document.body.insertAdjacentHTML('beforeend', '<div id="modal"><div id="OpportunityStage">Other opportunity</div><button id="CreateUpdateOpportunity">Save</button></div>');
+      h.w.document.getElementById('CreateUpdateOpportunity').addEventListener('click', () => modalClicks++);
+    }
+    const pending = h.evaluate('run()'); await flush();
+    const dialog = h.w.document.getElementById('pertama-confirm-actions');
+    assert.ok(dialog, h.alerts.join('\n'));
+    assert.match(dialog.querySelector('[data-task]').textContent, /Contact owner.*owner-a/);
+    const form = dialog.querySelector('form');
+    form.elements.namedItem('stage').checked = true;
+    form.elements.namedItem('targetStage').value = 'Robot';
+    form.elements.namedItem('note').checked = allActions;
+    form.elements.namedItem('task').checked = allActions;
+    form.elements.namedItem('taskDays').value = '3';
+    form.elements.namedItem('noteText').value = 'No answer <b>literal</b>\nFollow up';
+    assert.equal(form.elements.namedItem('sms').checked, false);
+    assert.equal(h.requests.some(r => /phone-system|conversations/.test(r.url)), false, 'non-SMS confirmation must not fetch SMS data');
+    if (smsEnabled) {
+      form.elements.namedItem('sms').checked = true;
+      form.elements.namedItem('sms').dispatchEvent(new h.w.Event('change', { bubbles: true })); await flush();
+      assert.equal(form.elements.namedItem('smsFrom'), null);
+      assert.match(dialog.querySelector('[data-sms-status]').textContent, /From: \+15555550101/);
+      form.elements.namedItem('smsText').value = 'Approved API message';
+    }
+    form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+    if (mode === 'stale-confirmation') { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
+    form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+    await pending;
+    assert.equal(modalClicks, 0, 'existing opportunity editors must never be used');
+    const timings = plain(h.w.pertamaWorkflowTimings);
+    for (const phase of ['Reading contact and opportunity…', 'Awaiting confirmation…']) {
+      assert.ok(timings.some(row => row.phase === phase), `missing phase: ${phase}`);
+    }
+    assert.doesNotMatch(JSON.stringify(timings), /Ada|contact-a|opp-a|owner-a|stage-robot/);
+    const beforeWriteFailure = ['stale-confirmation', 'stage-mismatch', 'mutation-after-recheck', 'user-after-recheck', 'route-after-recheck'].includes(mode);
+    if (beforeWriteFailure) {
+      assert.equal(writes.length, 0, h.alerts.join('\n'));
+      assert.equal(navigationAttempts, 0);
+      assert.ok(h.alerts.length);
+      assert.equal(h.w.localStorage.getItem(checkpointKey), null, 'no attempted write to reconcile');
+    } else if (['navigation-failure', 'stage-owner-automation', 'link-failure', 'task-route-change', 'sms-readback-mismatch'].includes(mode)) {
+      assert.equal(writes.length, smsEnabled ? 5 : mode === 'link-failure' ? 4 : mode === 'task-route-change' ? 3 : 1, h.alerts.join('\n'));
+      if (smsEnabled) assert.match(h.w.localStorage.getItem(checkpointKey), /msg-created/);
+      assert.equal(navigationAttempts, mode === 'navigation-failure' ? 1 : 0);
+      assert.match(h.w.localStorage.getItem(checkpointKey), /Stage: Robot/);
+      if (mode === 'link-failure' || mode === 'task-route-change') {
+        assert.match(h.w.localStorage.getItem(checkpointKey), /Task created.*task-created/);
+      }
+      if (mode === 'task-route-change') h.route(CONTACT_PATH);
+      const count = h.requests.length;
+      await h.evaluate('run()');
+      assert.equal(h.requests.length, count, 'checkpoint blocks duplicate requests, including re-creating a partially linked task');
+      assert.match(h.alerts.join('\n'), /Repeat run blocked/);
+    } else {
+      assert.deepEqual(h.alerts, []);
+      assert.equal(writes.length, smsEnabled ? 5 : allActions ? 4 : 1);
+      assert.deepEqual(writes.map(r => r.method), smsEnabled ? ['PUT', 'POST', 'POST', 'POST', 'POST'] : allActions ? ['PUT', 'POST', 'POST', 'POST'] : ['PUT']);
+      const lookup = h.requests.find(r => r.body?.aggregations);
+      assert.deepEqual(lookup.body.aggregations[0].options.include, ['stage-atc']);
+      if (mode === 'empty-queue') {
+        assert.equal(navigationAttempts, 0);
+        assert.match(h.w.document.getElementById('pertama-task-notice').textContent, /refresh/i);
+      } else {
+        assert.deepEqual(native.pushes, [NEXT_PATH]);
+        assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), { ...queue, contactId: 'contact-b', opportunityId: 'opp-b' });
+      }
+      assert.equal(h.w.localStorage.getItem(checkpointKey), null);
+    }
+    if (!beforeWriteFailure && mode !== 'stage-owner-automation') {
+      assert.deepEqual(plain(h.w.__completedOnSave), [{ id: 'contact-a', options: { fromSaveAndNext: true } }]);
+    }
+    assert.equal(h.evaluate('busy'), false);
+    assert.equal(h.navigationErrors.length, 0);
   });
-  const pending = h.evaluate('run()');
-  await flush();
-  const dialog = h.w.document.querySelector('#pertama-confirm-actions');
-  assert.ok(dialog, h.alerts.join('\n'));
-  const form = dialog.querySelector('form');
-  form.elements.namedItem('stage').checked = true;
-  form.elements.namedItem('targetStage').value = 'Robot';
-  for (const name of ['note', 'task', 'sms']) form.elements.namedItem(name).checked = false;
-  form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
-  if (changeRoute) { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
-  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
-  await pending;
-  const timings = plain(h.w.pertamaWorkflowTimings);
-  for (const phase of ['Reading contact…', 'Reading owner and preparing SMS…', 'Reading opportunity…', 'Awaiting confirmation…']) {
-    assert.ok(timings.some(row => row.action === 'Save and next' && row.phase === phase), `missing timing: ${phase}`);
-  }
-  assert.equal(timings.at(-1).phase, 'Total');
-  assert.equal(timings.at(-1).result, changeRoute ? 'stopped' : 'navigating');
-  assert.doesNotMatch(JSON.stringify(timings), /Ada|contact-a|opp-a|stage-robot/);
-  if (changeRoute) {
-    assert.equal(h.requests.length, 0, 'a stale confirmation must not save anything');
-    assert.match(h.alerts.join('\n'), /queue.*changed|changed.*queue/i);
-    return;
-  }
-  assert.deepEqual(h.alerts, []);
-  assert.equal(h.requests.length, 2, 'one simulated CRM save and one read-only next lookup');
-  assert.equal(h.requests[0].method, 'PUT');
-  assert.equal(h.requests[1].method, 'POST');
-  assert.deepEqual(h.requests[1].body.aggregations[0].options.include, ['stage-atc'], 'lookup stays on original stage after save');
-  assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), { ...queue, contactId: 'contact-b', opportunityId: 'opp-b' }, 'current contact was excluded');
-  assert.equal(h.w.localStorage.getItem(`pertama:no-answer:unfinished:${LOCATION}:contact-a`), null);
-});
-
 }
 
 test('mutation start and settlement do not drift the pinned original stage', t => {
@@ -554,72 +1052,24 @@ test('mutation start and settlement do not drift the pinned original stage', t =
   assert.deepEqual(plain(h.evaluate('stageQueueContext().queue')), queue);
 });
 
-test('contact name uses already-visible inputs without opening All fields', async t => {
-  const h = harness(t); fastPolling(h);
-  h.w.document.body.insertAdjacentHTML('beforeend', '<input id="contact.first_name" value="Ada"><input id="contact.last_name" value="Test">');
-  const name = plain(await h.evaluate('readContactName()'));
-  assert.deepEqual(name, { firstName: 'Ada', name: 'Ada Test' });
-  assert.equal(h.w.__elapsed, 0);
-});
-
-test('contact name opens All fields once when inputs are hidden', async t => {
-  const h = harness(t); fastPolling(h);
-  h.w.document.body.insertAdjacentHTML('beforeend', `<div id="record-details-tabs"><div class="hr-tabs-rail"><div></div><div><span>All fields</span></div></div></div>
-    <input id="contact.first_name" value="" hidden><input id="contact.last_name" value="Test" hidden>`);
-  let clicks = 0;
-  h.w.document.querySelector('#record-details-tabs span').addEventListener('click', () => {
-    clicks++;
-    for (const input of h.w.document.querySelectorAll('input')) input.hidden = false;
+for (const ownerId of ['', 'unsafe/owner']) {
+  test(`missing or invalid API owner disables only task selection: ${ownerId || 'unassigned'}`, async t => {
+    const h = harness(t); apiContactFixture(h); h.pin(); fastPolling(h);
+    h.w.__apiContact.assignedTo = ownerId;
+    const pending = h.evaluate('run()'); await flush();
+    const dialog = h.w.document.getElementById('pertama-confirm-actions');
+    assert.ok(dialog, h.alerts.join('\n'));
+    const form = dialog.querySelector('form');
+    assert.equal(form.elements.namedItem('task').disabled, true);
+    assert.equal(form.elements.namedItem('task').checked, false);
+    assert.match(dialog.querySelector('[data-task]').textContent, /owner.*unavailable|no.*owner/i);
+    assert.equal(form.elements.namedItem('note').disabled, false);
+    assert.equal(form.elements.namedItem('stage').disabled, false);
+    dialog.querySelector('[data-cancel]').click(); await pending;
+    assert.equal(h.requests.length, 0);
+    assert.deepEqual(h.alerts, []);
   });
-  assert.deepEqual(plain(await h.evaluate('readContactName()')), { firstName: '', name: 'Test' });
-  assert.equal(clicks, 1);
-});
-
-test('visible name inputs still enforce contact guards and reject an empty name', async t => {
-  const h = harness(t); fastPolling(h);
-  h.w.document.body.insertAdjacentHTML('beforeend', '<input id="contact.first_name"><input id="contact.last_name">');
-  await assert.rejects(h.evaluate('readContactName()'), /name is empty/i);
-  h.evaluate("guardedContact = 'different-contact'");
-  await assert.rejects(h.evaluate('readContactName()'), /contact changed/i);
-});
-
-test('SMS preparation begins while passive owner lookup is still waiting', async t => {
-  const h = harness(t);
-  h.w.document.body.insertAdjacentHTML('beforeend', '<div id="owner-dropdown-trigger"></div>');
-  h.evaluate("globalThis.__smsStarted = false; prepareSms = async () => { __smsStarted = true; return { error: 'No composer in fixture' }; }");
-  const pending = h.evaluate('readOwnerAndPrepareSms()');
-  await flush();
-  assert.equal(h.w.__smsStarted, true, 'SMS should not wait for owner text to load');
-  h.w.document.getElementById('owner-dropdown-trigger').innerHTML = '<span>Ada Owner</span>';
-  assert.deepEqual(plain(await pending), { owner: 'Ada Owner', sms: { error: 'No composer in fixture' } });
-});
-
-test('owner failure waits for SMS activation to settle before releasing the workflow', async t => {
-  const h = harness(t);
-  let release;
-  h.w.__smsGate = new Promise(resolve => { release = resolve; });
-  h.evaluate("guardedContact = 'different-contact'; prepareSms = () => __smsGate");
-  let settled = false;
-  const pending = h.evaluate('readOwnerAndPrepareSms()');
-  const outcome = pending.then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
-  await flush();
-  assert.equal(settled, false);
-  release({ error: 'Composer unavailable' });
-  assert.match((await outcome).error.message, /contact changed/i);
-});
-
-test('unexpected SMS failure also drains the passive owner lookup', async t => {
-  const h = harness(t);
-  h.w.document.body.insertAdjacentHTML('beforeend', '<div id="owner-dropdown-trigger"></div>');
-  h.evaluate("prepareSms = async () => { throw new Error('SMS preparation failed'); }");
-  let settled = false;
-  const pending = h.evaluate('readOwnerAndPrepareSms()');
-  const outcome = pending.then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
-  await flush();
-  assert.equal(settled, false);
-  h.w.document.getElementById('owner-dropdown-trigger').innerHTML = '<span>Ada Owner</span>';
-  assert.match((await outcome).error.message, /SMS preparation failed/);
-});
+}
 
 // Advance only the polling clock/sleep boundary; exercise the real readiness loop.
 function fastPolling(h) {
@@ -633,140 +1083,78 @@ function fastPolling(h) {
     return 0;
   };
 }
-function smsControls({ channel = 'SMS', internal = false, draft = 'Existing unsent draft' } = {}) {
-  return `<button id="conv-channel-bar-provider-trigger">${channel}</button>
-    <button id="conv-channel-bar-internal-comment-toggle" aria-pressed="${internal}">Internal comment</button>
-    <button id="contact-select-trigger">+628111111111</button>
-    <div data-to><span>To:</span> +628222222222</div>
-    <textarea id="conv-composer-textarea-input">${draft}</textarea>
-    <button id="conv-send-button-simple">Send</button>`;
+function deferredSmsFixture(t) {
+  const h = harness(t); apiContactFixture(h); h.pin();
+  h.w.__smsCalls = 0;
+  h.w.__smsResult = { contact: plain(h.w.__apiContact), to: h.w.__apiContact.phone,
+    from: '+15555550101', fromNumbers: [{ number: '+15555550101', label: 'Your number' }], savedDraftCount: 1 };
+  h.evaluate(`globalThis.prepareSmsApi = async () => { __smsCalls++; return globalThis.__smsGate ? await __smsGate : __smsResult; };
+    prepareSmsApi = globalThis.prepareSmsApi;
+    globalThis.prepareSms = async () => { __smsCalls++; return { error: 'Legacy UI preparation' }; }; prepareSms = globalThis.prepareSms;
+    globalThis.sendSmsApi = async () => { globalThis.__sentSms = JSON.parse(JSON.stringify(approvedActionContext.sms)); };
+    sendSmsApi = globalThis.sendSmsApi; findNextActionable = async () => null; completeCallTask = async () => {};`);
+  return h;
 }
-function mountComposer(h, contents = smsControls()) {
-  const root = h.w.document.createElement('div');
-  root.id = 'composer-textarea'; root.innerHTML = contents;
-  h.w.document.body.append(root);
-  return root;
-}
-
-for (const eventName of ['focus', 'click']) {
-  test(`visible composer wrapper still activates its lazy editor on ${eventName}`, async t => {
-    const h = harness(t); fastPolling(h);
-    const root = mountComposer(h, '<textarea id="composer-input-contact-a" placeholder="Type a message"></textarea>');
-    const placeholder = root.querySelector('textarea');
-    let activations = 0;
-    placeholder.addEventListener(eventName, () => { activations++; root.innerHTML = smsControls(); });
-    const context = await h.evaluate('prepareSms()');
-    assert.equal(context.error, undefined, context.error);
-    assert.equal(activations, 1);
-    assert.equal(context.to, '+628222222222');
-    assert.equal(context.draft, 'Existing unsent draft');
-    assert.equal(h.requests.length, 0);
-  });
-}
-
-test('collapsed composer can expand then activate a second lazy textarea', async t => {
-  const h = harness(t); fastPolling(h);
-  const trigger = h.w.document.createElement('button');
-  trigger.id = 'conv-composer-inline-expand-trigger'; h.w.document.body.append(trigger);
-  let expansions = 0, activations = 0;
-  trigger.addEventListener('click', () => {
-    expansions++;
-    const root = mountComposer(h, '<textarea placeholder="Type a message"></textarea>');
-    root.querySelector('textarea').addEventListener('focus', () => {
-      activations++; root.innerHTML = smsControls();
-    });
-  });
-  const context = await h.evaluate('prepareSms()');
-  assert.equal(context.error, undefined, context.error);
-  assert.equal(expansions, 1, 'the still-visible expansion button must not be clicked again');
-  assert.equal(activations, 1);
-});
-
-test('ready composer is read without focusing, clicking or changing its draft', async t => {
-  const h = harness(t); fastPolling(h);
-  const root = mountComposer(h);
-  let interactions = 0;
-  root.addEventListener('focus', () => interactions++, true);
-  root.addEventListener('click', () => interactions++);
-  const context = await h.evaluate('prepareSms()');
-  assert.equal(context.error, undefined);
-  assert.equal(context.draft, 'Existing unsent draft');
-  assert.equal(interactions, 0);
-  assert.equal(h.w.__elapsed, 0);
-});
-
-test('failed activation has one short total budget and never toggles repeatedly', async t => {
-  const h = harness(t); fastPolling(h);
-  const root = mountComposer(h, '<button id="conv-composer-inline-expand-trigger">Expand</button>');
-  let clicks = 0;
-  root.querySelector('button').addEventListener('click', () => clicks++);
-  const context = await h.evaluate('prepareSms()');
-  assert.match(context.error, /timed out/i);
-  assert.equal(clicks, 1);
-  assert.ok(h.w.__elapsed <= 5250, `SMS preparation took ${h.w.__elapsed}ms`);
-  assert.equal(h.requests.length, 0);
-});
-
-test('absent composer uses the same short preparation budget', async t => {
-  const h = harness(t); fastPolling(h);
-  const context = await h.evaluate('prepareSms()');
-  assert.match(context.error, /timed out/i);
-  assert.ok(h.w.__elapsed <= 5250, `Missing composer took ${h.w.__elapsed}ms`);
-});
-
-test('disabled expansion control is never activated', async t => {
-  const h = harness(t); fastPolling(h);
-  const root = mountComposer(h, '<button id="conv-composer-inline-expand-trigger" aria-disabled="true">Expand</button>');
-  let interactions = 0;
-  root.addEventListener('focus', () => interactions++, true);
-  root.addEventListener('click', () => interactions++);
-  const context = await h.evaluate('prepareSms()');
-  assert.ok(context.error);
-  assert.equal(interactions, 0);
-});
-
-for (const options of [{ channel: 'Email' }, { internal: true }]) {
-  test(`composer preparation does not switch unsafe channel state: ${JSON.stringify(options)}`, async t => {
-    const h = harness(t); fastPolling(h);
-    const root = mountComposer(h, smsControls(options));
-    let clicks = 0;
-    root.addEventListener('click', () => clicks++);
-    const context = await h.evaluate('prepareSms()');
-    assert.match(context.error, /select SMS|Internal Comment/i);
-    assert.equal(clicks, 0);
-    assert.equal(h.w.__elapsed, 0);
-  });
-}
-
-for (const changed of ['recipient', 'draft']) {
-  test(`SMS send still refuses a changed ${changed} after approval`, async t => {
-    const h = harness(t); fastPolling(h);
-    const root = mountComposer(h);
-    h.w.__approvedSms = await h.evaluate('prepareSms()');
-    h.evaluate('startingContact = contactId()');
-    if (changed === 'recipient') root.querySelector('[data-to]').innerHTML = '<span>To:</span> +628333333333';
-    else root.querySelector('textarea').value = 'Changed draft';
-    let sends = 0;
-    root.querySelector('#conv-send-button-simple').addEventListener('click', () => sends++);
-    await assert.rejects(h.evaluate("sendSmsOnce(__approvedSms, 'Approved message')"), /changed.*confirmation/i);
-    assert.equal(sends, 0);
-  });
-}
-
-for (const clears of [true, false]) {
-  test(`SMS sends only once when composer ${clears ? 'clears' : 'does not clear'}`, async t => {
-    const h = harness(t); fastPolling(h);
-    const root = mountComposer(h);
-    h.w.__approvedSms = await h.evaluate('prepareSms()');
-    h.evaluate('startingContact = contactId()');
-    let sends = 0;
-    root.querySelector('#conv-send-button-simple').addEventListener('click', () => {
-      sends++;
-      if (clears) root.querySelector('textarea').value = '';
-    });
-    const sent = h.evaluate("sendSmsOnce(__approvedSms, 'Approved message')");
-    if (clears) await sent;
-    else await assert.rejects(sent, /may already have been sent/i);
-    assert.equal(sends, 1);
+for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inventory', 'cancel-loading', 'route-change', 'stale-result']) {
+  test(`deferred API SMS confirmation: ${mode}`, async t => {
+    const h = deferredSmsFixture(t);
+    let release;
+    if (['toggle-off', 'cancel-loading', 'stale-result'].includes(mode)) h.w.__smsGate = new Promise(resolve => { release = resolve; });
+    if (mode === 'prep-failure') h.evaluate('prepareSmsApi = async () => { __smsCalls++; throw new Error("SMS inventory unavailable"); }');
+    if (mode === 'empty-inventory') h.w.__smsResult.from = null;
+    const pending = h.evaluate('run()'); await flush();
+    const dialog = h.w.document.getElementById('pertama-confirm-actions');
+    assert.ok(dialog, h.alerts.join('\n'));
+    const form = dialog.querySelector('form'), sms = form.elements.namedItem('sms');
+    assert.equal(h.w.__smsCalls, 0, 'no SMS preparation before explicit opt-in');
+    assert.equal(sms.checked, false);
+    assert.equal(sms.disabled, false);
+    for (const field of ['stage', 'note', 'task']) form.elements.namedItem(field).checked = false;
+    if (mode === 'cancel') { dialog.querySelector('[data-cancel]').click(); await pending; return; }
+    sms.checked = true; sms.dispatchEvent(new h.w.Event('change', { bubbles: true })); await flush();
+    assert.equal(h.w.__smsCalls, 1);
+    if (mode === 'cancel-loading') {
+      dialog.querySelector('[data-cancel]').click(); await pending;
+      release(h.w.__smsResult); await flush();
+      assert.equal(h.w.document.getElementById('pertama-confirm-actions'), null);
+      assert.equal(h.w.__sentSms, undefined);
+      assert.equal(h.evaluate('busy'), false);
+      return;
+    }
+    if (mode === 'stale-result') {
+      sms.checked = false; sms.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+      const oldRelease = release;
+      h.w.__smsGate = new Promise(resolve => { release = resolve; });
+      sms.checked = true; sms.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+      release({ ...h.w.__smsResult, from: '+15555550103' }); await flush();
+      oldRelease(h.w.__smsResult); await flush();
+      assert.match(dialog.querySelector('[data-sms-status]').textContent, /From: \+15555550103/);
+      dialog.querySelector('[data-cancel]').click(); await pending; return;
+    }
+    if (mode === 'toggle-off' || mode === 'prep-failure' || mode === 'empty-inventory') {
+      assert.equal(form.querySelector('[type="submit"]').disabled, true);
+      if (mode === 'empty-inventory') assert.match(dialog.querySelector('[data-sms-status]').textContent, /choose.*sender/i);
+      sms.checked = false; sms.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+      assert.equal(form.querySelector('[type="submit"]').disabled, false, 'SMS error/loading must not block non-SMS actions');
+      if (release) { release(h.w.__smsResult); await flush(); }
+      form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true })); await pending;
+      assert.equal(h.w.__sentSms, undefined);
+      assert.deepEqual(h.alerts, []);
+      return;
+    }
+    assert.equal(form.elements.namedItem('smsFrom'), null);
+    assert.match(dialog.querySelector('[data-sms-status]').textContent, /From: \+15555550101/);
+    form.elements.namedItem('smsText').value = 'Approved independent message';
+    assert.match(dialog.querySelector('[data-sms-status]').textContent, /draft.*(kept|untouched|unchanged)|preserv/i);
+    if (mode === 'route-change') { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
+    form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true })); await pending;
+    if (mode === 'route-change') {
+      assert.equal(h.w.__sentSms, undefined);
+      assert.match(h.alerts.join('\n'), /changed/i);
+    } else {
+      assert.deepEqual(plain(h.w.__sentSms), { from: '+15555550101', to: '+628123456789', message: 'Approved independent message' });
+      assert.deepEqual(h.alerts, []);
+    }
+    assert.equal(h.requests.length, 0, 'fixture uses only API stubs, never native composer');
   });
 }

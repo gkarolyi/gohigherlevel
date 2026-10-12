@@ -1,5 +1,5 @@
 {
-  "name": "pertama-userscript",
+  "name": "gohigherlevel",
   "private": true,
   "scripts": {
     "test": "node --test tests/*.test.cjs"

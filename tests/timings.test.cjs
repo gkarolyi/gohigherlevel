@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'pertama.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '..', 'gohigherlevel.user.js'), 'utf8');
 const LOCATION = '3QixdLNutDXye95tTBK0';
 const ROUTE = `/v2/location/${LOCATION}/contacts/detail/contact-a`;
 const TIMINGS = `pertama:workflow-timings:${LOCATION}`;
@@ -115,9 +115,37 @@ test('denied storage never prevents in-memory workflow timings', t => {
   assert.deepEqual(h.rows(), [row('Next lead', 'Prepare', 7, 'stopped'), row('Next lead', 'Total', 7, 'stopped')]);
 });
 
-test('openLead stores wall-clock navigation marker with source document origin', t => {
+test('native timing measures route commitment, not a retained toolbar or document load', async t => {
   const h = harness(t);
-  h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })");
+  const target = `/v2/location/${LOCATION}/contacts/detail/contact-b`;
+  const router = {
+    currentRoute: { value: { name: 'contact_detail-v2', path: ROUTE } },
+    resolve(path) { return { name: 'contact_detail-v2', href: path }; },
+    async push(path) {
+      h.tick(25);
+      h.w.history.pushState({}, '', path);
+      h.evaluate('recordNavigationReady()');
+      assert.deepEqual(h.rows(), [], 'old visible toolbar must not finish native timing');
+      h.tick(75); h.wall(999999);
+      router.currentRoute.value = { name: 'contact_detail-v2', path };
+    },
+  };
+  const root = h.w.document.createElement('div'); root.setAttribute('data-v-app', '');
+  root.__vue_app__ = { config: { globalProperties: { $router: router } } };
+  h.w.document.body.append(root);
+  h.tick(10);
+  await h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })");
+  assert.equal(h.w.location.pathname, target);
+  assert.deepEqual(h.rows(), [row('Navigation', 'Native route committed', 65),
+    row('Navigation', 'Previous contact controls released', 65)]);
+  h.evaluate('recordNavigationReady()');
+  assert.equal(h.rows().length, 2);
+  assert.equal(h.w.sessionStorage.getItem(NAVIGATION), null);
+});
+
+test('openLead stores wall-clock navigation marker with source document origin', async t => {
+  const h = harness(t);
+  await h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })");
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(NAVIGATION)), { contactId: 'contact-b', startedAt: 10000, sourceTimeOrigin: 5000 });
 });
 
@@ -176,13 +204,13 @@ test('navigation measurement tolerates denied storage', t => {
   assert.deepEqual(h.rows(), []);
 });
 
-test('optional navigation marker failure does not block otherwise valid navigation', t => {
+test('optional navigation marker failure does not block otherwise valid navigation', async t => {
   const h = harness(t);
   const originalSet = h.w.Storage.prototype.setItem;
   h.w.Storage.prototype.setItem = function (key, value) {
     if (key === NAVIGATION) throw new h.w.DOMException('Storage full', 'QuotaExceededError');
     return originalSet.call(this, key, value);
   };
-  assert.doesNotThrow(() => h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })"));
+  await assert.doesNotReject(() => h.evaluate("openLead({ contactId: 'contact-b', opportunityId: 'opp-b', pipeline: 'Sales', pipelineId: 'pipe-a', stageId: 'stage-atc' })"));
   assert.equal(JSON.parse(h.w.sessionStorage.getItem(`pertama:stage-queue:${LOCATION}`)).contactId, 'contact-b');
 });
