@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.4
+// @version      1.0.5
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.4';
+  const VERSION = '1.0.5';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -1221,6 +1221,17 @@
       if (pipeline) choices.set(opportunity.id, pipeline);
     }
     if (!choices.size) throw new Error('Pipeline metadata is unavailable. Open the Opportunities board first.');
+    const origin = readOrigin(id);
+    const inferred = origin ? opportunities.find(item => item.id === origin.opportunityId)
+      : opportunities.length === 1 ? opportunities[0] : null;
+    if (origin && (!inferred || (origin.pipelineId ? origin.pipelineId !== inferred.pipelineId
+      : origin.pipeline !== choices.get(inferred.id)?.name))) {
+      throw new Error('Original opportunity/pipeline could not be verified. Reopen the contact from its pipeline board.');
+    }
+    if (inferred) {
+      pinStageQueue({ contactId: id, opportunityId: inferred.id, pipelineId: inferred.pipelineId, stageId: inferred.pipelineStageId });
+      return stageQueueContext();
+    }
     markWorkflowTiming('Awaiting queue selection…');
     const selected = await new Promise(resolve => {
       const previousFocus = document.activeElement;
@@ -1243,8 +1254,7 @@
       const stage = form.elements.namedItem('stage');
       opportunity.add(new Option('Select an opportunity…', ''));
       for (const [opportunityId, pipeline] of choices) opportunity.add(new Option(`${pipeline.name} · ${opportunityId}`, opportunityId));
-      const origin = readOrigin(id);
-      opportunity.value = choices.has(origin?.opportunityId) ? origin.opportunityId : choices.size === 1 ? choices.keys().next().value : '';
+      opportunity.value = choices.size === 1 ? choices.keys().next().value : '';
       function updateStages() {
         stage.replaceChildren(new Option('Select the original stage…', ''));
         const pipeline = choices.get(opportunity.value);
@@ -1709,7 +1719,6 @@
       if (!rule.next) dialog.querySelector('[data-stage]').textContent += ' · No rule for this stage. Stage update is off by default; choose a destination to turn it on.';
       else if (!stageOptions.includes(rule.next)) dialog.querySelector('[data-stage]').textContent += ` · Suggested stage ${rule.next} is unavailable; choose a destination to update.`;
       field('taskDays').value = due ? String(rule.days) : '';
-      dialog.querySelector('[data-task-days]').hidden = !due;
       function taskDate() {
         const raw = field('taskDays').value.trim();
         const days = Number(raw);
@@ -1721,10 +1730,8 @@
       }
       function updateTaskDate() {
         field('taskDays').setCustomValidity('');
-        const date = due ? taskDate() : null;
-        dialog.querySelector('[data-task]').textContent = !due
-          ? 'No follow-up task at the Robot stage.'
-          : !ownerId ? 'No valid contact owner assigned. Task creation is unavailable.'
+        const date = taskDate();
+        dialog.querySelector('[data-task]').textContent = !ownerId ? 'No valid contact owner assigned. Task creation is unavailable.'
           : date ? `${taskTitle}\n${date} at 11am WITA · ${owner}` : 'Enter a whole number of days, 0 or greater.';
       }
       field('taskDays').addEventListener('input', updateTaskDate);
@@ -1760,11 +1767,11 @@
         : 'After saving: open the next lead using your selected pipelines and lead priority.';
       field('noteText').value = renderTemplate(settings.note, { firstName, name });
       field('task').checked = Boolean(due && ownerId);
-      field('task').disabled = !due || !ownerId;
+      field('task').disabled = !ownerId;
       function updateFields() {
         field('targetStage').disabled = !field('stage').checked;
-        field('taskDays').disabled = !field('task').checked || !due;
-        field('taskDays').required = field('task').checked && Boolean(due);
+        field('taskDays').disabled = !field('task').checked || field('task').disabled;
+        field('taskDays').required = !field('taskDays').disabled;
         updateTaskDate();
         field('noteText').disabled = !field('note').checked;
         field('noteText').required = field('note').checked;
@@ -1795,8 +1802,9 @@
       form.addEventListener('submit', event => {
         event.preventDefault();
         if (field('sms').checked && (smsLoading || !sms)) return;
-        const selectedDue = field('task').checked && due ? taskDate() : null;
-        field('taskDays').setCustomValidity(field('task').checked && due && !selectedDue
+        const taskSelected = field('task').checked && !field('task').disabled;
+        const selectedDue = taskSelected ? taskDate() : null;
+        field('taskDays').setCustomValidity(taskSelected && !selectedDue
           ? 'Enter a whole number of days, 0 or greater, within the supported date range.' : '');
         const targetStage = field('targetStage').value;
         field('targetStage').setCustomValidity(field('stage').checked && !stageOptions.includes(targetStage) ? 'Choose an available stage.' : '');
@@ -1806,7 +1814,7 @@
         field('noteText').setCustomValidity(field('note').checked && !noteText ? 'Enter a note or turn Add note off.' : '');
         if (!form.reportValidity()) return;
         finish({ stage: field('stage').checked, targetStage, note: field('note').checked,
-          task: field('task').checked && !field('task').disabled && Boolean(due), due: selectedDue, noteText,
+          task: taskSelected, due: selectedDue, noteText,
           sms: field('sms').checked, smsText, smsFrom: sms?.from, smsTo: sms?.to });
       });
       field('targetStage').addEventListener('change', () => field('targetStage').setCustomValidity(''));
@@ -2006,10 +2014,10 @@
       <p data-sms-settings-status>SMS is available only with a number linked to your CRM user.</p>
       <p>Save and next completes a matching existing Call task before creating a new follow-up. Tasks created with an older title template need manual completion.</p>
       <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option><option value="stage">Same stage only</option></select></label>
-      <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; if it was not captured, you will be asked to choose it. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
+      <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; otherwise its current pipeline and stage are inferred automatically. You will only be asked to choose a queue if multiple opportunities make it ambiguous. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
       <label>New lead stage name<input name="newLeadStage" required></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups use your saved task-list filters. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
-      <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Leave follow-up days blank for no task. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
+      <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Leave follow-up days blank to keep Add task off by default; you can still enable it when saving. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
       <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
     const form = dialog.querySelector('form');
     const settingsContact = contactId();

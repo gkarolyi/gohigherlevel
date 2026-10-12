@@ -561,7 +561,7 @@ test('settings dialog offers and saves same-stage priority', t => {
 
 test('explicit picker requires stage choice and pins chosen opportunity before resolving', { timeout: 3000 }, async t => {
   const h = harness(t); apiContactFixture(h);
-  h.w.document.body.insertAdjacentHTML('beforeend', `<div class="opportunities-pane-list"><a href="/v2/location/${LOCATION}/opportunities/opp-a?pipelineId=pipe-a">Sales opportunity</a></div>`);
+  h.w.__apiOpportunities.push({ ...h.w.__apiOpportunities[0], id: 'opp-other' });
   const pending = h.evaluate('ensureStageQueue()');
   await new Promise(resolve => setImmediate(resolve));
   const dialog = h.w.document.querySelector('#pertama-stage-queue');
@@ -685,17 +685,89 @@ test('API context failure drains the other read before releasing the workflow', 
   assert.match(h.alerts.join('\n'), /Contact read failed/);
 });
 
-test('unknown stage queue uses API opportunity choices without opening the CRM sidebar', async t => {
+test('unknown stage queue infers the sole current opportunity without opening the CRM sidebar', async t => {
   const h = harness(t); apiContactFixture(h);
   h.evaluate("globalThis.openSidebar = async () => { throw new Error('Sidebar discovery forbidden'); }; openSidebar = globalThis.openSidebar;");
   const pending = h.evaluate('ensureStageQueue()').catch(error => ({ error }));
   await flush();
   const dialog = h.w.document.getElementById('pertama-stage-queue');
-  assert.ok(dialog, 'API data must suffice to present the queue picker');
-  assert.equal(dialog.querySelector('[name="stage"]').value, '');
+  assert.equal(dialog, null, 'a unique opportunity needs no queue confirmation');
+  const context = await pending;
+  assert.deepEqual(plain(context.queue), queue);
+  assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
+  assert.deepEqual(plain(h.w.__apiReads), [{ kind: 'opportunities', fresh: false }]);
+});
+
+test('same-stage inference uses the opened opportunity origin to disambiguate current stage', async t => {
+  const h = harness(t); apiContactFixture(h);
+  h.w.__apiOpportunities.unshift({ ...h.w.__apiOpportunities[0], id: 'opp-other' });
+  h.w.__apiOpportunities[1].pipelineStageId = 'stage-robot';
+  h.w.sessionStorage.setItem('pertama:origin:contact-a', JSON.stringify({ opportunityId: 'opp-a', pipelineId: 'pipe-a', pipeline: 'Sales' }));
+  const pending = h.evaluate('ensureStageQueue()'); await flush();
+  const dialog = h.w.document.getElementById('pertama-stage-queue');
+  if (dialog) dialog.querySelector('[data-cancel]').click();
+  assert.equal(dialog, null);
+  assert.deepEqual(plain((await pending).queue), { ...queue, stageId: 'stage-robot' });
+});
+
+for (const invalid of ['stage', 'origin']) {
+  test(`same-stage inference rejects an unavailable ${invalid} without pinning a queue`, async t => {
+    const h = harness(t); apiContactFixture(h);
+    if (invalid === 'stage') h.w.__apiOpportunities[0].pipelineStageId = 'missing';
+    else h.w.sessionStorage.setItem('pertama:origin:contact-a', JSON.stringify({ opportunityId: 'missing', pipelineId: 'pipe-a' }));
+    const pending = h.evaluate('ensureStageQueue()');
+    const settled = pending.then(value => ({ value }), error => ({ error }));
+    await flush();
+    h.w.document.querySelector('#pertama-stage-queue [data-cancel]')?.click();
+    assert.match(String((await settled).error), /stage|opportunity/i);
+    assert.equal(h.w.sessionStorage.getItem(QUEUE_KEY), null);
+  });
+}
+
+test('Robot rule permits opt-in tasks and validates a user-entered deadline', async t => {
+  const h = harness(t);
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada Test', firstName: 'Ada',
+    phone: '', stage: 'ATC 3', rule: { next: 'Robot', days: null, updateStage: true }, due: null,
+    owner: 'Owner', ownerId: 'owner-a', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const dialog = h.w.document.getElementById('pertama-confirm-actions');
+  t.after(() => dialog.querySelector('[data-cancel]')?.click());
+  const form = dialog.querySelector('form');
+  const task = form.elements.namedItem('task'), days = form.elements.namedItem('taskDays');
+  assert.equal(task.checked, false);
+  assert.equal(task.disabled, false);
+  assert.equal(days.disabled, true);
+  assert.equal(days.value, '');
+  task.checked = true;
+  form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
+  assert.equal(days.disabled, false);
+  assert.equal(days.required, true);
+  assert.equal(dialog.querySelector('[data-task-days]').hidden, false);
+  form.elements.namedItem('note').checked = false;
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+  assert.equal(dialog.isConnected, true, 'missing deadline must not close confirmation');
+  assert.equal(days.checkValidity(), false);
+  days.value = '-1';
+  days.dispatchEvent(new h.w.Event('input', { bubbles: true }));
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+  assert.equal(dialog.isConnected, true, 'negative deadline must not close confirmation');
+  days.value = '3';
+  days.dispatchEvent(new h.w.Event('input', { bubbles: true }));
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+  const choices = await pending;
+  assert.equal(choices.task, true);
+  assert.equal(choices.due, h.evaluate('futureDate(3)'));
+});
+
+test('Robot rule still disables task creation without a valid owner', async t => {
+  const h = harness(t);
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada', firstName: 'Ada',
+    phone: '', stage: 'ATC 3', rule: { next: 'Robot', days: null }, due: null,
+    owner: '', ownerId: '', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const dialog = h.w.document.getElementById('pertama-confirm-actions');
+  assert.equal(dialog.querySelector('[name="task"]').disabled, true);
+  assert.match(dialog.querySelector('[data-task]').textContent, /owner/i);
   dialog.querySelector('[data-cancel]').click();
   assert.equal(await pending, null);
-  assert.deepEqual(plain(h.w.__apiReads), [{ kind: 'opportunities', fresh: false }]);
 });
 
 for (const outcome of ['cancel', 'skip-writes', 'changed-contact', 'changed-stage', 'changed-owner']) {
@@ -736,6 +808,7 @@ for (const outcome of ['cancel', 'skip-writes', 'changed-contact', 'changed-stag
 for (const action of ['cancel', 'contact change', 'navigate away and back']) {
   test(`picker ${action} never pins a queue or searches`, { timeout: 3000 }, async t => {
     const h = harness(t); opportunityFixture(h);
+    h.w.__apiOpportunities.push({ ...h.w.__apiOpportunities[0], id: 'opp-other' });
     const pending = h.evaluate('ensureStageQueue()');
     // Attach rejection handler immediately: contact-change cancellation may reject.
     const settled = pending.then(value => ({ value }), error => ({ error }));
@@ -814,8 +887,22 @@ test('Next lead uses pinned queue and shows stage-specific empty notice without 
   assert.equal(timing.result, 'ok');
 });
 
-test('Next lead resolves missing context through actual picker before lookup', { timeout: 3000 }, async t => {
+test('Next lead infers the current stage and navigates without a queue picker', async t => {
+  const h = harness(t); apiContactFixture(h);
+  h.evaluate("settings.priority = 'stage'");
+  const { pushes } = installRouter(h);
+  h.respond(result([hit()]));
+  await h.evaluate('nextLead()');
+  assert.equal(h.w.document.querySelector('#pertama-stage-queue'), null);
+  assert.deepEqual(pushes, [NEXT_PATH]);
+  assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), { ...queue, contactId: 'contact-b', opportunityId: 'opp-b' });
+  assert.deepEqual(h.requests[0].body.aggregations[0].options.include, ['stage-atc']);
+  assert.deepEqual(h.alerts, []);
+});
+
+test('Next lead resolves ambiguous context through actual picker before lookup', { timeout: 3000 }, async t => {
   const h = harness(t); opportunityFixture(h);
+  h.w.__apiOpportunities.push({ ...h.w.__apiOpportunities[0], id: 'opp-other' });
   h.evaluate("settings.priority = 'stage'");
   h.respond(result([hit()]));
   const pending = h.evaluate('nextLead()');
