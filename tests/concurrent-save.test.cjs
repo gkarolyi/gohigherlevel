@@ -282,6 +282,21 @@ test('no matching old task permits follow-up creation but never completion', asy
   await pending; assert.deepEqual(h.alerts, []);
 });
 
+for (const version of [undefined, null]) test(`concurrent saves accept ${String(version)} opportunity version at preflight`, async t => {
+  const h = harness(t);
+  h.hook(r => r.pathname === '/opportunities/o1' && r.method === 'GET'
+    ? { opportunity: { ...opportunity, indexVersion: version } } : undefined);
+  const pending = h.run(); await flush();
+  assert.deepEqual(h.writes.map(r => r.operation).sort(), ['complete', 'note', 'stage']);
+  assert.equal(h.writes.find(r => r.operation === 'stage').body.indexVersion, 1);
+  for (const key of ['stage', 'note', 'complete', 'task', 'link']) h.gates[key].resolve();
+  await pending;
+  assert.equal(h.e('__nextCalls'), 1);
+  assert.equal(h.checkpoint(), null);
+  assert.deepEqual(h.alerts, []);
+  assert.equal(h.w.document.querySelector('#pertama-save-progress'), null);
+});
+
 test('preflight failure drains reads and sends no writes', async t => {
   const h = harness(t); const read = deferred();
   h.hook(r => r.pathname === '/opportunities/o1' ? new Response('{}', { status: 500 })

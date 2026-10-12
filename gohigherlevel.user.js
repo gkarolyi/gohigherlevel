@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.7
+// @version      1.0.8
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.7';
+  const VERSION = '1.0.8';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -995,9 +995,11 @@
     const fresh = data.opportunity, approved = context.opportunity;
     requireSaved(fresh && ['id', 'contactId', 'locationId', 'pipelineId', 'pipelineStageId'].every(key => fresh[key] === approved[key])
       && (fresh.assignedTo ?? '') === (approved.assignedTo ?? ''), 'fresh opportunity changed after approval.');
-    requireSaved(Number.isSafeInteger(fresh.indexVersion) && fresh.indexVersion >= 0 && Number.isSafeInteger(fresh.indexVersion + 1), 'invalid opportunity version.');
+    // The native CRM starts missing/null versions at 1; other malformed values still fail closed.
+    const version = fresh.indexVersion ?? 0;
+    requireSaved(Number.isSafeInteger(version) && version >= 0 && Number.isSafeInteger(version + 1), 'invalid opportunity version.');
     // Captured increment, not a claim of atomic optimistic locking or safe replay.
-    actionStageVersions.set(context, fresh.indexVersion + 1);
+    actionStageVersions.set(context, version + 1);
   }
   async function saveStageApi() {
     const context = requireActionApproval('stage');

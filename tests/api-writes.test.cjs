@@ -47,6 +47,39 @@ test('exact API requests, confirmed checkpoints, stage lifecycle and no CRM DOM'
 for (const fn of ['saveStageApi','saveNoteApi','createTaskApi']) for (const change of ['approvedActionContext = null', 'approvedActionContext.actions = {}', 'approvedActionContext.user = "other"', 'approvedActionContext.contactRecord.locationId = "other"', 'identityExpires = 0', 'liveReadHeaders = null']) test(`${fn} refuses ${change}`, async t => {
   const h = harness(t); h.e(change); await assert.rejects(h.run(fn)); assert.equal(h.calls.length, 0);
 });
+for (const [label, version, expected] of [['missing', undefined, 1], ['null', null, 1], ['zero', 0, 1],
+  ['positive', 7, 8], ['largest incrementable', Number.MAX_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER]]) {
+  test(`stage version accepts ${label} and verifies the incremented receipt`, async t => {
+    const h = harness(t);
+    h.hook(c => c.init.method === 'GET' ? { opportunity: { ...opportunity, indexVersion: version } } : undefined);
+    await h.run('saveStageApi');
+    assert.deepEqual(h.calls.map(c => c.init.method), ['GET', 'PUT']);
+    assert.deepEqual(h.calls[1].body, { pipelineStageId: 's2', indexVersion: expected, isAttribute: false });
+    assert.equal(JSON.parse(h.checkpoint()).pendingSave, '');
+    assert.match(JSON.parse(h.checkpoint()).completed.join('\n'), /Stage:.*server confirmed/);
+  });
+}
+for (const version of ['7', '', false, true, -1, 1.5, {}, [], Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1]) {
+  test(`stage version rejects malformed ${JSON.stringify(version)} before dispatch`, async t => {
+    const h = harness(t);
+    h.hook(() => ({ opportunity: { ...opportunity, indexVersion: version } }));
+    await assert.rejects(h.run('saveStageApi'), /invalid opportunity version/);
+    assert.deepEqual(h.calls.map(c => c.init.method), ['GET']);
+    assert.equal(h.checkpoint(), null);
+  });
+}
+for (const version of [undefined, null]) for (const receipt of [undefined, null, '1', 0, 2]) {
+  test(`stage version ${String(version)} still rejects receipt ${JSON.stringify(receipt)}`, async t => {
+    const h = harness(t);
+    h.hook(c => ({ opportunity: { ...opportunity, ...c.body,
+      indexVersion: c.init.method === 'GET' ? version : receipt } }));
+    await assert.rejects(h.run('saveStageApi'), /saved opportunity account\/version\/owner did not match/);
+    assert.deepEqual(h.calls.map(c => c.init.method), ['GET', 'PUT']);
+    assert.equal(h.calls[1].body.indexVersion, 1);
+    assert.ok(JSON.parse(h.checkpoint()).pendingSave);
+    assert.deepEqual(JSON.parse(h.checkpoint()).completed, []);
+  });
+}
 for (const field of ['id','locationId','contactId','pipelineId','pipelineStageId','assignedTo','indexVersion']) test(`fresh stage rejects wrong ${field}`, async t => {
   const h = harness(t); h.hook(() => ({ opportunity:{ ...opportunity,indexVersion:7,[field]:field === 'indexVersion' ? Number.MAX_SAFE_INTEGER : 'wrong' } }));
   await assert.rejects(h.run('saveStageApi')); assert.equal(h.calls.length, 1);
