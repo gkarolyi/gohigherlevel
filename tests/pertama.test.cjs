@@ -971,14 +971,13 @@ test('overlapping writes reject snapshots before and during writes, even after s
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
 });
 
-for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mismatch', 'stale-confirmation', 'navigation-failure', 'stage-mismatch', 'retained-modal',
+for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unavailable', 'sms-navigation-failure', 'stale-confirmation', 'navigation-failure', 'stage-mismatch', 'retained-modal',
   'mutation-after-recheck', 'user-after-recheck', 'route-after-recheck', 'stage-owner-automation', 'link-failure', 'task-route-change', 'empty-queue']) {
   test(`API Save and next without CRM forms: ${mode}`, { timeout: 3000 }, async t => {
     const contact = { id: 'contact-a', locationId: LOCATION, firstName: 'Ada', lastName: 'Test', phone: '+628123456789', assignedTo: 'owner-a' };
     const opportunity = { id: 'opp-a', contactId: 'contact-a', locationId: LOCATION, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', assignedTo: 'owner-a', indexVersion: 7, isAttribute: true };
-    const smsEnabled = ['all-actions-sms', 'sms-readback-mismatch'].includes(mode);
+    const smsEnabled = ['all-actions-sms', 'sms-history-unavailable', 'sms-navigation-failure'].includes(mode);
     const allActions = smsEnabled || ['all-actions', 'stage-owner-automation', 'link-failure', 'task-route-change'].includes(mode);
-    let sentSms;
     const writes = [];
     const checkpointKey = `pertama:no-answer:unfinished:${LOCATION}:contact-a`;
     const h = harness(t, { fetchResponse: request => {
@@ -989,10 +988,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
           { phoneNumber: '+15555550102', sid: 'pn-b', linkedUser: 'owner-a', isDefaultNumber: false, capabilities: { sms: true } }], rcsSenderIds: [] };
       if (url.pathname.startsWith('/conversations/messages/drafts/')) { assert.equal(request.method, 'GET'); return { drafts: [] }; }
       if (url.pathname === '/conversations/messages/spam/v2') { assert.equal(body.text, 'Approved API message'); return { isSpam: false }; }
-      if (url.pathname === '/f1/conversations/conv-created/messages') return { messages: { lastMessageId: 'msg-created', messages: [{
-        id: mode === 'sms-readback-mismatch' ? 'other-message' : 'msg-created', conversationId: 'conv-created', contactId: 'contact-a', locationId: LOCATION,
-        type: 2, direction: 'outbound', status: 'sent', body: sentSms.message, meta: { from: sentSms.fromNumber, to: sentSms.toNumber },
-      }] } };
+      if (url.pathname.startsWith('/f1/conversations/')) throw new Error('Conversation history is unavailable');
       if (url.pathname.replace(/\/$/, '') === '/opportunities/search') {
         return body.aggregations ? result(mode === 'empty-queue' ? [] : [hit('contact-a', 'opp-a'), hit()])
           : { opportunities: [opportunity], total: 1 };
@@ -1007,7 +1003,6 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
       writes.push(request);
       assert.ok(JSON.parse(h.w.localStorage.getItem(checkpointKey)).pendingSave, 'journal must precede every write');
       if (url.pathname === '/conversations/messages') {
-        sentSms = body;
         assert.equal(body.fromNumber, '+15555550101');
         assert.equal(body.toNumber, contact.phone);
         assert.equal(body.message, 'Approved API message');
@@ -1048,7 +1043,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
     const nativePush = native.router.push;
     native.router.push = async path => {
       navigationAttempts++;
-      if (mode === 'navigation-failure') throw new Error('Native navigation cancelled');
+      if (['navigation-failure', 'sms-navigation-failure'].includes(mode)) throw new Error('Native navigation cancelled');
       return nativePush(path);
     };
     h.evaluate(`settings.priority = 'stage'; settings.rules['Attempted Contact'].next = 'Robot';
@@ -1095,10 +1090,10 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
       assert.equal(navigationAttempts, 0);
       assert.ok(h.alerts.length);
       assert.equal(h.w.localStorage.getItem(checkpointKey), null, 'no attempted write to reconcile');
-    } else if (['navigation-failure', 'link-failure', 'task-route-change', 'sms-readback-mismatch'].includes(mode)) {
+    } else if (['navigation-failure', 'sms-navigation-failure', 'link-failure', 'task-route-change'].includes(mode)) {
       assert.equal(writes.length, smsEnabled ? 5 : mode === 'link-failure' ? 4 : mode === 'task-route-change' ? 3 : 1, h.alerts.join('\n'));
       if (smsEnabled) assert.match(h.w.localStorage.getItem(checkpointKey), /msg-created/);
-      assert.equal(navigationAttempts, mode === 'navigation-failure' ? 1 : 0);
+      assert.equal(navigationAttempts, ['navigation-failure', 'sms-navigation-failure'].includes(mode) ? 1 : 0);
       assert.match(h.w.localStorage.getItem(checkpointKey), /Stage: Robot/);
       if (mode === 'link-failure' || mode === 'task-route-change') {
         assert.match(h.w.localStorage.getItem(checkpointKey), /Task created.*task-created/);
@@ -1122,6 +1117,10 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
         assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), { ...queue, contactId: 'contact-b', opportunityId: 'opp-b' });
       }
       assert.equal(h.w.localStorage.getItem(checkpointKey), null);
+      if (smsEnabled) {
+        assert.equal(h.requests.some(r => new URL(r.url).pathname.startsWith('/f1/conversations/')), false, 'SMS acknowledgment must not require history before navigation');
+        assert.match(h.w.document.getElementById('pertama-task-notice').textContent, /accepted.*delivery not confirmed/i);
+      }
     }
     if (!beforeWriteFailure) {
       assert.equal(h.requests.filter(r => new URL(r.url).pathname === '/objects/task/records/search').length, 1, 'preflight checks for an existing task before writes');

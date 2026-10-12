@@ -1562,7 +1562,7 @@
       || !liveReadHeaders || userFromHeaders(liveReadHeaders).id !== context.user) throw new Error('SMS contact/account/session changed.');
   }
   // Closed endpoint inventory: no arbitrary URL or native draft writes.
-  async function smsApiRequest(operation, context, sms, acknowledgment) {
+  async function smsApiRequest(operation, context, sms) {
     const reading = operation === 'inventory' || operation === 'drafts';
     const guard = () => reading ? guardSmsRead(context) : requireActionApproval('sms', context);
     guard();
@@ -1580,9 +1580,6 @@
       body = operation === 'spam' ? { text: sms.message, locationId: LOCATION_ID, contactId: context.contact }
         : { contactId: context.contact, locationId: LOCATION_ID, message: sms.message, fromNumber: sms.from,
           toNumber: sms.to, type: 'SMS', channel: 'sms', fromOneToOneConversation: true, attachments: [] };
-    } else if (operation === 'history' && safeActionId(acknowledgment?.conversationId) && safeActionId(acknowledgment?.messageId)) {
-      path = `/f1/conversations/${acknowledgment.conversationId}/messages?limit=20`;
-      diagnosticPath = '/f1/conversations/{id}/messages';
     } else throw new Error('SMS operation is not permitted.');
     const method = body ? 'POST' : 'GET';
     const diagnostic = { method, url: `https://services.leadconnectorhq.com${diagnosticPath}`, status: null, result: 'pending' };
@@ -1601,7 +1598,7 @@
       const data = await response.json();
       if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.errors?.length) throw new Error('Invalid response');
       diagnostic.result = 'response received';
-      // Send/history outcomes must be journaled by the caller before its post-await guard.
+      // Send acknowledgment must be journaled by the caller before its post-await guard.
       if (reading || operation === 'spam') guard();
       return data;
     } catch (error) {
@@ -1659,31 +1656,20 @@
     requireActionApproval('sms', context);
     if (spam.isSpam !== false) throw new Error('SMS spam preflight did not approve the message.');
     if (pendingSave) throw new Error('An unresolved save exists. No retry.');
-    pendingSave = `SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance/delivery not yet verified`;
+    pendingSave = `SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance not yet confirmed`;
     saveCheckpoint();
     const acknowledgment = await smsApiRequest('send', context, sms);
     if (!safeActionId(acknowledgment.conversationId) || !safeActionId(acknowledgment.messageId)) throw new Error('SMS acknowledgment is unverified. No retry.');
     const identity = `SMS message ${acknowledgment.messageId}; conversation ${acknowledgment.conversationId}`;
-    completed.push(`${identity}: acknowledged, delivery not verified.`);
-    pendingSave = `${identity}: history not yet verified`;
+    completed.push(`${identity}: accepted by CRM; delivery not confirmed.`);
+    pendingSave = `${identity}: accepted; workflow continuation not yet approved`;
     saveCheckpoint();
     requireActionApproval('sms', context);
-    const history = await smsApiRequest('history', context, sms, acknowledgment);
-    const matches = Array.isArray(history.messages?.messages) ? history.messages.messages.filter(item => item?.id === acknowledgment.messageId) : [];
-    const message = matches[0];
-    if (matches.length !== 1 || message.conversationId !== acknowledgment.conversationId || message.contactId !== context.contact
-      || message.locationId !== LOCATION_ID || message.type !== 2 || message.direction !== 'outbound' || message.body !== sms.message
-      || message.meta?.from !== sms.from || message.meta?.to !== sms.to
-      || !['pending', 'queued', 'sent', 'delivered', 'read', 'failed', 'undelivered', 'accepted', 'scheduled'].includes(message.status)) {
-      throw new Error('SMS history identity or status is unverified. Inspect the conversation; no retry.');
-    }
-    completed.push(`${identity}: verified outbound SMS; status ${message.status}.`);
     const unresolved = pendingSave;
     pendingSave = '';
     try { saveCheckpoint(); } catch (error) { pendingSave = unresolved; throw error; }
     requireActionApproval('sms', context);
-    if (['failed', 'undelivered'].includes(message.status)) throw new Error(`SMS ${message.status}. Inspect the conversation before clearing the unfinished action. No automatic retry.`);
-    const notice = `SMS to ${sms.to}: ${message.status}.`;
+    const notice = `SMS to ${sms.to}: accepted by CRM; delivery not confirmed.`;
     try {
       taskNotice(notice);
       const savedNotice = JSON.stringify({ message: notice, time: Date.now() });

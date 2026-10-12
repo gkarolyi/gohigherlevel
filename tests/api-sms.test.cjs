@@ -21,7 +21,7 @@ function harness(t) {
       else if (c.path.includes('/drafts/')) data = {drafts:[{unknown:'native saved draft'}]};
       else if (c.path.includes('/spam/')) data = {isSpam:false};
       else if (init.method === 'POST') data = {conversationId:'v1',messageId:'m1'};
-      else data = {messages:{messages:[{id:'m1',conversationId:'v1',contactId:'c1',locationId:L,type:2,direction:'outbound',status:'pending',body:'Hello',meta:{from:number.phoneNumber,to:contact.phone}}]}};
+      else throw new Error('Unexpected SMS read');
     }
     return new Response(JSON.stringify(data));
   };
@@ -89,24 +89,15 @@ for (const change of ['approvedActionContext=null','approvedActionContext.action
 for (const isSpam of [true,null,undefined]) test(`spam ${isSpam} blocks send`,async t=>{
   const h=harness(t); h.hook(c=>c.path.includes('/spam/')?{isSpam}:undefined); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
 });
-test('exact send, durable ack then verified pending status; no resend',async t=>{
+test('exact send succeeds on durable acknowledgment without history readback or resend',async t=>{
   const h=harness(t); await h.send(); const send=h.calls.find(c=>c.path==='/conversations/messages');
   assert.deepEqual(send.body,{contactId:'c1',locationId:L,message:'Hello',fromNumber:number.phoneNumber,toNumber:contact.phone,type:'SMS',channel:'sms',fromOneToOneConversation:true,attachments:[]});
-  assert.equal(h.checkpoint().pendingSave,''); assert.match(h.checkpoint().completed.join(' '),/pending/); assert.doesNotMatch(h.checkpoint().completed.join(' '),/delivered/);
+  assert.equal(h.checkpoint().pendingSave,'');
+  assert.match(h.checkpoint().completed.join(' '),/SMS message m1; conversation v1: accepted by CRM; delivery not confirmed/);
+  assert.equal(h.calls.some(c=>c.path.startsWith('/f1/')),false);
+  assert.match(h.w.document.getElementById('pertama-task-notice').textContent,/accepted.*delivery not confirmed/i);
+  assert.equal(h.w.document.querySelector('textarea').value,'untouched');
   await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
-});
-for (const status of ['failed', 'undelivered']) test(`terminal SMS ${status} stops workflow and retains known outcome`, async t => {
-  const h = harness(t);
-  h.hook(c => c.path.startsWith('/f1/') ? { messages: { messages: [{ id: 'm1', conversationId: 'v1', contactId: 'c1', locationId: L,
-    type: 2, direction: 'outbound', status, body: 'Hello', meta: { from: number.phoneNumber, to: contact.phone } }] } } : undefined);
-  await assert.rejects(h.send(), new RegExp(status));
-  assert.match(h.checkpoint().completed.join(' '), new RegExp(`status ${status}`));
-  await assert.rejects(h.send());
-  assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, 1);
-});
-for (const patch of [{id:'wrong'},{conversationId:'wrong'},{contactId:'wrong'},{locationId:'wrong'},{type:1},{direction:'inbound'},{body:'wrong'},{meta:{from:'+11111111111',to:contact.phone}},{meta:{from:number.phoneNumber,to:'+11111111111'}}]) test(`mismatched history retains ack ${JSON.stringify(patch)}`,async t=>{
-  const h=harness(t); h.hook(c=>c.path.startsWith('/f1/')?{messages:{messages:[{id:'m1',conversationId:'v1',contactId:'c1',locationId:L,type:2,direction:'outbound',status:'sent',body:'Hello',meta:{from:number.phoneNumber,to:contact.phone},...patch}]}}:undefined);
-  await assert.rejects(h.send()); assert.match(h.checkpoint().pendingSave,/m1/); await assert.rejects(h.send());
 });
 for (const patch of [{phone:'+12222222222'},{assignedTo:'other'}]) test('fresh contact change blocks send '+JSON.stringify(patch),async t=>{
   const h=harness(t); h.hook(c=>c.path==='/contacts/c1'?{contact:{...contact,...patch}}:undefined); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);
@@ -128,11 +119,18 @@ test('a concurrent-save approval never permits a changed SMS phone number', asyn
 });
 
 test('sender removed blocks send',async t=>{const h=harness(t); h.hook(c=>c.path.startsWith('/phone-system/')?{numbers:[],total:0}:undefined); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);});
-for (const response of [{}, {conversationId:'v1',messageId:'bad/id'}]) test('malformed ack leaves unknown journal',async t=>{
+for (const response of [{}, {conversationId:'v1'}, {messageId:'m1'}, {conversationId:'bad/id',messageId:'m1'}, {conversationId:'v1',messageId:'bad/id'}]) test('malformed ack leaves unknown journal',async t=>{
   const h=harness(t); h.hook(c=>c.path==='/conversations/messages'?response:undefined); await assert.rejects(h.send()); assert.match(h.checkpoint().pendingSave,/Hello/); await assert.rejects(h.send());
 });
-test('route changed during send preserves acknowledgment',async t=>{
-  const h=harness(t); h.hook(c=>{if(c.path==='/conversations/messages')h.w.history.pushState({},'', '/away');}); await assert.rejects(h.send()); assert.match(h.checkpoint().pendingSave,/m1/); assert.equal(h.calls.filter(c=>c.path.startsWith('/f1/')).length,0);
+for (const change of ['route', 'auth']) test(`${change} changed during send preserves acknowledgment and blocks continuation`,async t=>{
+  const h=harness(t); h.hook(c=>{if(c.path==='/conversations/messages') {
+    if(change === 'route') h.w.history.pushState({},'', '/away'); else h.e('rejectCrmAuthorization()');
+  }});
+  await assert.rejects(h.send());
+  assert.match(h.checkpoint().completed.join(' '),/m1.*accepted by CRM/);
+  assert.match(h.checkpoint().pendingSave,/m1/);
+  assert.equal(h.calls.filter(c=>c.path.startsWith('/f1/')).length,0);
+  await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
 });
 test('storage failure prevents send and retry',async t=>{
   const h=harness(t); h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}'); await assert.rejects(h.send()); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
@@ -141,19 +139,28 @@ for (const status of [401,403,500]) test(`inventory HTTP ${status} sanitized`,as
   const h=harness(t); h.hook(c=>c.path.startsWith('/phone-system/')?new Response('secret',{status}):undefined); await assert.rejects(h.prep(),e=>!e.message.includes('secret')); if(status!==500)assert.equal(h.e('currentUserId'),null);
   assert.ok(!JSON.stringify(h.w.pertamaRequestDiagnostics).includes(number.phoneNumber));
 });
-for (const operation of ['/conversations/messages','/f1/conversations/v1/messages']) test(`unknown outcome at ${operation} remains blocked and redacted`,async t=>{
-  const h=harness(t); h.hook(c=>{if(c.path===operation)throw new Error('secret-token-and-body');});
+test('unknown SMS send outcome remains blocked and redacted',async t=>{
+  const h=harness(t); h.hook(c=>{if(c.path==='/conversations/messages')throw new Error('secret-token-and-body');});
   await assert.rejects(h.send(),e=>!e.message.includes('secret')); assert.ok(h.checkpoint().pendingSave); await assert.rejects(h.send());
   assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
 });
+for (const status of [401,403,500]) test(`send HTTP ${status} retains the intent and cannot resend`,async t=>{
+  const h=harness(t);
+  h.hook(c=>c.path==='/conversations/messages'?new Response('private-payload',{status}):undefined);
+  await assert.rejects(h.send(),error=>!error.message.includes('private-payload'));
+  assert.match(h.checkpoint().pendingSave,/acceptance not yet confirmed/);
+  assert.equal(h.checkpoint().completed.length,0);
+  await assert.rejects(h.send());
+  assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
+});
 for (const path of ['/contacts/c1', '/phone-system/numbers/v2/location/' + L, '/conversations/messages/drafts/' + L + '/contacts/c1',
-  '/conversations/messages/spam/v2', '/conversations/messages', '/f1/conversations/v1/messages']) {
+  '/conversations/messages/spam/v2', '/conversations/messages']) {
   test(`malformed SMS JSON fails closed without replay: ${path}`, async t => {
     const h = harness(t);
     h.hook(c => c.path === path ? new Response('{private-payload') : undefined);
     await assert.rejects(h.send(), error => !error.message.includes('private-payload'));
     const sends = h.calls.filter(c => c.path === '/conversations/messages').length;
-    assert.equal(sends, ['/conversations/messages', '/f1/conversations/v1/messages'].includes(path) ? 1 : 0);
+    assert.equal(sends, path === '/conversations/messages' ? 1 : 0);
     await assert.rejects(h.send());
     assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, sends);
     assert.doesNotMatch(JSON.stringify(h.w.pertamaRequestDiagnostics), /private-payload/);
@@ -173,10 +180,9 @@ test('timeout aborts send once without losing intent',async t=>{
   h.hook(c=>c.path==='/conversations/messages'?new Promise((resolve,reject)=>c.init.signal.addEventListener('abort',()=>reject(new DOMException('secret','AbortError')))):undefined);
   const pending=h.send(); await h.flush(); abort(); await assert.rejects(pending,/Timed out/); assert.ok(h.checkpoint().pendingSave); await assert.rejects(h.send());
 });
-for(const where of ['/conversations/messages/spam/v2','/f1/conversations/v1/messages']) test(`changed route while ${where} pending`,async t=>{
-  const h=harness(t); h.hook(c=>{if(c.path===where)h.w.history.pushState({},'', '/away');}); await assert.rejects(h.send());
-  if(where.includes('/spam/'))assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
-  else {assert.equal(h.checkpoint().pendingSave,'');assert.match(h.checkpoint().completed.join(' '),/status pending/);}
+test('changed route during spam check prevents sending',async t=>{
+  const h=harness(t); h.hook(c=>{if(c.path==='/conversations/messages/spam/v2')h.w.history.pushState({},'', '/away');}); await assert.rejects(h.send());
+  assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
 });
 for(const data of [{drafts:null},{drafts:{}}]) test('malformed draft array fails closed',async t=>{
   const h=harness(t);h.hook(c=>c.path.includes('/drafts/')?data:undefined);await assert.rejects(h.prep());
