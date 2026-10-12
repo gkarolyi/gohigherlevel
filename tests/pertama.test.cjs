@@ -593,7 +593,8 @@ function apiContactFixture(h) {
   globalThis.readContactOpportunities = async (options = {}) => {
     __apiReads.push({ kind: 'opportunities', fresh: Boolean(options.fresh) });
     return JSON.parse(JSON.stringify(__apiOpportunities));
-  }; readContactOpportunities = globalThis.readContactOpportunities;`);
+  }; readContactOpportunities = globalThis.readContactOpportunities;
+  readCallTasks = async () => ({ rows: [], total: 0 });`);
 }
 function opportunityFixture(h) {
   apiContactFixture(h);
@@ -625,7 +626,8 @@ test('unconfigured stage allows manual stage update and defaults follow-up to tw
   const h = harness(t); apiContactFixture(h); h.pin();
   h.w.__apiOpportunities[0].pipelineStageId = 'stage-robot';
   h.w.__selectedActions = [];
-  h.evaluate(`saveStageApi = async () => { __selectedActions.push({ action: 'stage', target: approvedActionContext.targetStageId }); };
+  h.evaluate(`prepareStageApi = async () => {};
+    saveStageApi = async () => { __selectedActions.push({ action: 'stage', target: approvedActionContext.targetStageId }); };
     createTaskApi = async () => { __selectedActions.push({ action: 'task', due: approvedActionContext.due }); };
     completeCallTask = async () => {}; findNextActionable = async () => null;`);
   const pending = h.evaluate('run()'); await flush();
@@ -796,7 +798,7 @@ for (const outcome of ['cancel', 'skip-writes', 'changed-contact', 'changed-stag
       form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
       form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
       await pending;
-      assert.equal(h.w.__apiReads.filter(read => read.fresh).length, 2);
+      assert.equal(h.w.__apiReads.filter(read => read.fresh).length, outcome === 'skip-writes' ? 3 : 2);
       if (outcome.startsWith('changed')) assert.match(h.alerts.join('\n'), /changed.*confirmation|confirmation.*changed/i);
     }
     if (!outcome.startsWith('changed')) assert.deepEqual(h.alerts, []);
@@ -1001,6 +1003,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
         if (mode === 'route-after-recheck') { h.route(BOARD_PATH); h.route(CONTACT_PATH); }
         return { opportunity: mode === 'stage-mismatch' ? { ...opportunity, pipelineStageId: 'stage-new' } : opportunity };
       }
+      if (url.pathname === '/objects/task/records/search') return { customObjectRecords: [], total: 0 };
       writes.push(request);
       assert.ok(JSON.parse(h.w.localStorage.getItem(checkpointKey)).pendingSave, 'journal must precede every write');
       if (url.pathname === '/conversations/messages') {
@@ -1023,7 +1026,6 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
         return { note: { id: 'note-created', locationId: LOCATION, contactId: 'contact-a', body: body.body } };
       }
       if (url.pathname === '/objects/task/records') {
-        assert.deepEqual(plain(h.w.__completedOnSave), [{ id: 'contact-a', options: { fromSaveAndNext: true } }], 'complete the old task before creating a new one');
         assert.deepEqual(body.owners, ['owner-a'], 'assign contact owner, not current user');
         assert.equal(body.properties.contactId, 'contact-a');
         assert.equal(body.properties.dueDate, `${h.evaluate('futureDate(3)')}T03:00:00.000Z`);
@@ -1049,9 +1051,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
       if (mode === 'navigation-failure') throw new Error('Native navigation cancelled');
       return nativePush(path);
     };
-    h.w.__completedOnSave = [];
     h.evaluate(`settings.priority = 'stage'; settings.rules['Attempted Contact'].next = 'Robot';
-      completeCallTask = async (id, options) => { globalThis.__completedOnSave.push({ id, options }); invalidateContactReads(); };
       globalThis.openSidebar = async () => { throw new Error('CRM form access forbidden'); }; openSidebar = globalThis.openSidebar;`);
     if (mode === 'route-after-recheck') h.evaluate("settings.priority = 'leads'");
     let modalClicks = 0;
@@ -1095,7 +1095,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
       assert.equal(navigationAttempts, 0);
       assert.ok(h.alerts.length);
       assert.equal(h.w.localStorage.getItem(checkpointKey), null, 'no attempted write to reconcile');
-    } else if (['navigation-failure', 'stage-owner-automation', 'link-failure', 'task-route-change', 'sms-readback-mismatch'].includes(mode)) {
+    } else if (['navigation-failure', 'link-failure', 'task-route-change', 'sms-readback-mismatch'].includes(mode)) {
       assert.equal(writes.length, smsEnabled ? 5 : mode === 'link-failure' ? 4 : mode === 'task-route-change' ? 3 : 1, h.alerts.join('\n'));
       if (smsEnabled) assert.match(h.w.localStorage.getItem(checkpointKey), /msg-created/);
       assert.equal(navigationAttempts, mode === 'navigation-failure' ? 1 : 0);
@@ -1123,8 +1123,8 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-readback-mis
       }
       assert.equal(h.w.localStorage.getItem(checkpointKey), null);
     }
-    if (!beforeWriteFailure && mode !== 'stage-owner-automation') {
-      assert.deepEqual(plain(h.w.__completedOnSave), [{ id: 'contact-a', options: { fromSaveAndNext: true } }]);
+    if (!beforeWriteFailure) {
+      assert.equal(h.requests.filter(r => new URL(r.url).pathname === '/objects/task/records/search').length, 1, 'preflight checks for an existing task before writes');
     }
     assert.equal(h.evaluate('busy'), false);
     assert.equal(h.navigationErrors.length, 0);

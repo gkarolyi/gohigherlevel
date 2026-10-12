@@ -912,15 +912,15 @@
     requireActionApproval(action, context);
     let attempts = actionAttempts.get(context);
     if (!attempts) { attempts = new Set(); actionAttempts.set(context, attempts); }
-    if (attempts.has(operation) || pendingSave && operation !== 'link') throw new Error('Action already attempted or an unresolved save exists. No retry.');
+    if (attempts.has(operation) || context.stopSaves || pendingSave && !context.parallel && operation !== 'link') throw new Error('Action already attempted, stopped or an unresolved save exists. No retry.');
     const wire = wireRequest(method, path, body);
     if (action !== 'task') delete wire.headers.developer_version;
     if (method !== 'GET') {
-      pendingSave = operation === 'link' ? `Contact association for task ${context.taskId}`
+      const description = operation === 'link' ? `Contact association for task ${context.taskId}`
         : action === 'stage' ? `Stage: ${context.targetStageName} (${context.targetStageId}); opportunity ${context.opportunity.id}`
         : action === 'note' ? `Note: ${context.noteText}`
         : `Task: ${context.taskTitle}; ${context.due}, 11am WITA; owner ${context.ownerId}`;
-      saveCheckpoint(); // No request is allowed before this durable journal entry.
+      setPendingAction(operation, description); // No request before this operation's durable journal entry.
       attempts.add(operation);
     }
     const diagnostic = { method, url: `https://services.leadconnectorhq.com${action === 'stage' ? '/opportunities/{id}' : path.split('?')[0]}`,
@@ -934,6 +934,11 @@
       requireActionApproval(action, context);
       if (operation === 'stage') {
         contactObservation = observeContactRequest(method, wire.url, () => body);
+        // Account for our own stage write without making contact caches reusable during it.
+        if (context.parallel && contactObservation?.write) {
+          context.ownedEpoch++;
+          context.ownedWritesPending++;
+        }
         stageObservation = observeStageRequest(method, wire.url);
       }
       const response = await originalFetch.call(window, wire.url, { method, headers: { ...wire.headers, ...liveReadHeaders },
@@ -950,11 +955,15 @@
       // Do not propagate server text, URLs, bodies or native exception messages.
       throw new Error(`API ${action}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : diagnostic.status ? `HTTP ${diagnostic.status}; response not verified` : 'No verified HTTP response'}. No automatic retry.`);
     } finally {
+      if (context.parallel && contactObservation?.write && !contactObservation.finished) {
+        context.ownedEpoch++;
+        context.ownedWritesPending--;
+      }
       finishContactWrite(contactObservation); finishStageWrite(stageObservation);
       clearTimeout(timeout); diagnostic.elapsedMs = Date.now() - started;
     }
   }
-  async function saveStageApi() {
+  async function prepareStageApi() {
     const context = requireActionApproval('stage');
     const { data } = await actionRequest('stageRead', context);
     requireActionApproval('stage', context);
@@ -964,41 +973,47 @@
     requireSaved(Number.isSafeInteger(fresh.indexVersion) && fresh.indexVersion >= 0 && Number.isSafeInteger(fresh.indexVersion + 1), 'invalid opportunity version.');
     // Captured increment, not a claim of atomic optimistic locking or safe replay.
     actionStageVersions.set(context, fresh.indexVersion + 1);
+  }
+  async function saveStageApi() {
+    const context = requireActionApproval('stage');
+    if (!actionStageVersions.has(context)) await prepareStageApi();
+    const approved = context.opportunity;
     const saved = await actionRequest('stage', context);
     verifyStage(saved.data, saved.body, approved.id, context.contact, approved.pipelineId);
-    requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === fresh.indexVersion + 1
-      && (saved.data.opportunity.assignedTo ?? '') === (approved.assignedTo ?? ''), 'saved opportunity account/version/owner did not match.');
+    requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === actionStageVersions.get(context)
+      && (context.parallel || (saved.data.opportunity.assignedTo ?? '') === (approved.assignedTo ?? '')), 'saved opportunity account/version/owner did not match.');
     completed.push(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
-    pendingSave = ''; saveCheckpoint();
+    setPendingAction('stage', null);
     requireActionApproval('stage', context, 1);
-    context.epoch = contactReadEpoch;
+    if (!context.parallel) context.epoch = contactReadEpoch;
   }
   async function saveNoteApi() {
     const context = requireActionApproval('note');
-    await recheckActionContact('note', context);
+    if (!context.parallel) await recheckActionContact('note', context);
     const { data, body } = await actionRequest('note', context);
     requireSaved(safeActionId(data.note?.id), 'unsafe note ID.');
     verifyNote(data, body, context.contact, context.noteText);
     completed.push(`Note saved (server confirmed; note ${data.note.id})`);
-    pendingSave = ''; saveCheckpoint();
+    setPendingAction('note', null);
     requireActionApproval('note', context);
   }
   async function createTaskApi() {
     const context = requireActionApproval('task');
     actionRequestShape('task', context);
-    if (pendingSave || actionAttempts.get(context)?.has('task')) throw new Error('Task already attempted or unresolved save exists. No retry.');
-    await recheckActionContact('task', context);
+    if (pendingSave && !context.parallel || actionAttempts.get(context)?.has('task')) throw new Error('Task already attempted or unresolved save exists. No retry.');
+    if (!context.parallel) await recheckActionContact('task', context);
     const { data, body } = await actionRequest('task', context);
     requireSaved(safeActionId(data.record?.id), 'unsafe task ID.');
     verifyTask(data, body, context.contact, context.taskTitle, context.due);
     context.taskId = data.record.id;
     completed.push(`Task created: ${context.taskId}; ${context.due}, 11am WITA (server confirmed)`);
-    pendingSave = `Contact association for task ${context.taskId}`; saveCheckpoint();
+    setPendingAction('task', `Contact association for task ${context.taskId}`);
     requireActionApproval('task', context);
     const linked = await actionRequest('link', context);
     verifyTaskLink(linked.data, context.taskId, context.contact);
     completed.push('Task contact association: server confirmed');
-    pendingSave = ''; saveCheckpoint();
+    setPendingAction('link', null);
+    setPendingAction('task', null);
     requireActionApproval('task', context);
   }
 
@@ -1015,6 +1030,7 @@
   let step = '';
   let completed = [];
   let pendingSave = '';
+  let pendingActions = {};
   let startingContact = '';
 
   // Fixed phase labels and durations only: no names, IDs, credentials or message text.
@@ -1132,15 +1148,34 @@
 
   function saveCheckpoint() {
     localStorage.setItem(checkpointKey(startingContact), JSON.stringify({
-      completed, pendingSave, time: new Date().toISOString(),
+      completed, pendingSave, pendingActions: { ...pendingActions }, time: new Date().toISOString(),
     }));
   }
 
+  function setPendingAction(operation, description) {
+    const previous = { ...pendingActions }, previousSummary = pendingSave;
+    if (description === null) delete pendingActions[operation];
+    else pendingActions[operation] = description;
+    pendingSave = Object.values(pendingActions).join('\n');
+    try { saveCheckpoint(); }
+    catch (error) {
+      pendingActions = previous; pendingSave = previousSummary;
+      if (approvedActionContext?.parallel) approvedActionContext.stopSaves = true;
+      throw error;
+    }
+  }
+  async function drainAll(promises) {
+    const results = await Promise.allSettled(promises);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
+    return results.map(result => result.value);
+  }
   function assertApprovedActionContext(expectedWrites = 0) {
     const context = approvedActionContext;
+    // Only explicitly owned invalidations may overlap; any external mutation still fails closed.
     if (context && (contactId() !== context.contact || stageRouteRevision !== context.route
       || currentUserId !== context.user || identityExpires <= Date.now() / 1000
-      || contactWritesPending || contactReadEpoch !== context.epoch + expectedWrites * 2)) {
+      || contactWritesPending !== (context.parallel ? context.ownedWritesPending : 0)
+      || contactReadEpoch !== context.epoch + (context.parallel ? context.ownedEpoch : expectedWrites * 2))) {
       throw new Error('Contact, opportunity or session changed after confirmation. Further saves stopped; review the record before trying again.');
     }
   }
@@ -1315,7 +1350,11 @@
   }
 
   function requireCallTaskContext(context) {
-    if (!validContactRead(context) || stageRouteRevision !== context.route
+    if (context.approval) {
+      if (context.approval !== approvedActionContext) throw new Error('Call task approval changed.');
+      assertApprovedActionContext();
+    }
+    if ((!context.approval && !validContactRead(context)) || stageRouteRevision !== context.route
       || settings.task !== context.template || !liveReadHeaders
       || userFromHeaders(liveReadHeaders).id !== context.user) {
       throw new Error('Call task context changed.');
@@ -1410,7 +1449,31 @@
     }, 7000);
   }
 
-  async function completeCallTask(id, { fromSaveAndNext = false } = {}) {
+  async function prepareCallTask(id) {
+    requireContactControlsReady();
+    const context = { ...contactReadContext(), route: stageRouteRevision, template: settings.task };
+    if (context.id !== id) throw new Error('Contact changed before task lookup.');
+    requireCallTaskContext(context);
+    const [contact, lookup] = await drainAll([readContactDetails({ fresh: true }), readCallTasks(context)]);
+    requireCallTaskContext(context);
+    const title = callTaskTitle(contact, context.template);
+    const matchesTitle = row => row.properties.title.replace(/\s+/g, ' ').trim() === title;
+    const task = lookup.rows.find(row => matchesTitle(row) && [0, false].includes(row.properties.completed));
+    if (!task) {
+      if (lookup.total > lookup.rows.length) throw new Error('More tasks exist beyond the lookup.');
+      return { context, contact, title, task: null };
+    }
+    const [fresh, latest] = await drainAll([readContactDetails({ fresh: true }), readCallTasks(context)]);
+    requireCallTaskContext(context);
+    if (['id', 'locationId', 'firstName', 'lastName', 'assignedTo'].some(key => contact[key] !== fresh[key])
+      || callTaskTitle(fresh, context.template) !== title) throw new Error('Contact changed before completion.');
+    const target = latest.rows.find(row => row.id === task.id);
+    if (!target || !matchesTitle(target) || ![0, false].includes(target.properties.completed)
+      || target.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId
+        !== task.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId) throw new Error('Task changed before completion.');
+    return { context, contact: fresh, title, task };
+  }
+  async function completeCallTask(id, { fromSaveAndNext = false, prepared = null } = {}) {
     if (busy && !fromSaveAndNext) {
       console.info('Call-task completion skipped: another script action is running.');
       return;
@@ -1423,46 +1486,24 @@
     let phase = 'checking contact/session and unfinished actions';
     try {
       requireContactControlsReady();
-      const context = { ...contactReadContext(), route: stageRouteRevision, template: settings.task };
-      if (context.id !== id) throw new Error('Contact changed before task lookup.');
-      requireCallTaskContext(context);
       if (!fromSaveAndNext && localStorage.getItem(checkpointKey(id))) {
         taskNotice('Call task stopped: an unfinished action already exists. Inspect the CRM record, then use Settings to clear its checkpoint. No automatic retry.', true);
         return;
       }
       if (!fromSaveAndNext) {
         completed = [];
-        pendingSave = '';
+        pendingSave = ''; pendingActions = {};
         startingContact = id;
       }
-      phase = 'reading the current contact and exact pending task';
-      const contact = await readContactDetails({ fresh: true });
+      phase = 'reading and rechecking the current contact and exact pending task';
+      const { context, title, task } = prepared || await prepareCallTask(id);
       requireCallTaskContext(context);
-      const title = callTaskTitle(contact, context.template);
-      const lookup = await readCallTasks(context);
-      requireCallTaskContext(context);
+      if (!task) return;
       const matchesTitle = row => row.properties.title.replace(/\s+/g, ' ').trim() === title;
-      const task = lookup.rows.find(row => matchesTitle(row) && [0, false].includes(row.properties.completed));
-      if (!task) {
-        if (lookup.total > lookup.rows.length) throw new Error('More tasks exist beyond the lookup.');
-        return;
-      }
-      phase = 'rechecking contact name, owner and exact task';
-      const fresh = await readContactDetails({ fresh: true });
-      requireCallTaskContext(context);
-      if (['id', 'locationId', 'firstName', 'lastName', 'assignedTo'].some(key => contact[key] !== fresh[key])
-        || callTaskTitle(fresh, context.template) !== title) throw new Error('Contact changed before completion.');
-      const latest = await readCallTasks(context);
-      requireCallTaskContext(context);
-      const target = latest.rows.find(row => row.id === task.id);
-      if (!target || !matchesTitle(target) || ![0, false].includes(target.properties.completed)
-        || target.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId
-          !== task.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId) throw new Error('Task changed before completion.');
       phase = 'saving the completion checkpoint';
       if (!fromSaveAndNext && localStorage.getItem(checkpointKey(id))) throw new Error('An unfinished action appeared.');
-      if (pendingSave) throw new Error('An unresolved save exists.');
-      pendingSave = `Complete Call task ${task.id}: ${task.properties.title}`;
-      saveCheckpoint(); // A storage failure must block the PUT.
+      if (approvedActionContext?.stopSaves || pendingSave && !context.approval) throw new Error('An unresolved save exists or saving was stopped.');
+      setPendingAction('complete', `Complete Call task ${task.id}: ${task.properties.title}`); // Persist before PUT.
       requireCallTaskContext(context);
       phase = 'sending task completion or verifying its acknowledgment';
       attempted = true;
@@ -1484,8 +1525,7 @@
       }
       if (!verified) throw new Error('Task completion readback unavailable.');
       completed.push(`Call task completed and verified: ${task.id}: ${title}`);
-      pendingSave = '';
-      saveCheckpoint();
+      setPendingAction('complete', null);
       requireCallTaskContext(context);
       if (!fromSaveAndNext) {
         localStorage.removeItem(checkpointKey(id));
@@ -1501,7 +1541,10 @@
         ? 'Completion may already be saved. Inspect the task and unfinished-action checkpoint before clearing it in Settings.'
         : 'No task completion was sent. Check the contact, session and task data before trying again.'} No automatic retry. The native call was not blocked.`, true);
     } finally {
-      if (attempted) invalidateContactReads();
+      if (attempted) {
+        if (fromSaveAndNext && approvedActionContext?.parallel) approvedActionContext.ownedEpoch++;
+        invalidateContactReads();
+      }
       if (!fromSaveAndNext) {
         guardedContact = null;
         busy = false;
@@ -1609,7 +1652,8 @@
     smsAttempts.add(context);
     const fresh = await prepareSmsApi();
     requireActionApproval('sms', context);
-    if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => fresh.contact[key] !== context.contactRecord[key])
+    if (['id', 'locationId', 'firstName', 'lastName', 'phone'].some(key => fresh.contact[key] !== context.contactRecord[key])
+      || !context.parallel && fresh.contact.assignedTo !== context.contactRecord.assignedTo
       || fresh.to !== sms.to || fresh.from !== sms.from) throw new Error('SMS contact or sender changed after confirmation.');
     const spam = await smsApiRequest('spam', context, sms);
     requireActionApproval('sms', context);
@@ -1851,7 +1895,7 @@
     busy = true;
     runButton.disabled = true;
     completed = [];
-    pendingSave = '';
+    pendingSave = ''; pendingActions = {};
     step = 'Checking contact page';
     guardedContact = contactId();
     startingContact = guardedContact || '(none)';
@@ -1868,6 +1912,7 @@
         const saved = JSON.parse(previous);
         completed = saved.completed || [];
         pendingSave = saved.pendingSave || '';
+        pendingActions = saved.pendingActions || {};
         throw new Error(`Repeat run blocked: an unfinished no-answer action exists from ${saved.time}. Stage/note/task changes may already be saved. Reconcile that action before starting another; refreshing does not clear this block.`);
       }
       if (settings.pipelineIds?.length || settings.priority === 'stage') {
@@ -1917,23 +1962,32 @@
         sms: { from: choices.smsFrom, to: choices.smsTo, message: choices.smsText } };
       assertApprovedActionContext();
       if (choices.task && (!ownerId || !choices.due)) throw new Error('A valid contact owner and deadline are required for the task. Nothing saved.');
-      progress('Applying selected actions…');
-      if (choices.stage) {
-        if (!stageOptions.includes(choices.targetStage)) throw new Error('Selected stage is not available in this pipeline. Nothing saved.');
-        progress('Saving stage…');
-        await saveStageApi();
+      progress('Preflighting stage and existing Call task…');
+      const [, preparedTask] = await drainAll([
+        choices.stage ? prepareStageApi() : Promise.resolve(),
+        prepareCallTask(startingContact),
+      ]);
+      assertApprovedActionContext();
+      if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => contact[key] !== preparedTask.contact[key])) {
+        throw new Error('Contact changed during save preflight. Nothing saved.');
       }
-      if (choices.note) {
-        progress('Saving note…');
-        await saveNoteApi();
-      }
-      progress('Completing existing Call task…');
-      await completeCallTask(startingContact, { fromSaveAndNext: true });
-      approvedActionContext.epoch = contactReadEpoch;
-      if (choices.task) {
-        progress('Creating follow-up…');
-        await createTaskApi();
-      }
+      // Every lane uses this preflight snapshot; in-flight requests cannot be recalled on failure.
+      Object.assign(approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0, stopSaves: false });
+      preparedTask.context.approval = approvedActionContext;
+      progress('Saving selected actions concurrently…');
+      const saveLane = async action => {
+        try { await action(); }
+        catch (error) { approvedActionContext.stopSaves = true; throw error; }
+      };
+      await drainAll([
+        ...(choices.stage ? [saveLane(saveStageApi)] : []),
+        ...(choices.note ? [saveLane(saveNoteApi)] : []),
+        saveLane(async () => {
+          await completeCallTask(startingContact, { fromSaveAndNext: true, prepared: preparedTask });
+          if (choices.task) await createTaskApi();
+        }),
+      ]);
+      assertApprovedActionContext();
 
       if (choices.sms) {
         progress('Sending SMS…');

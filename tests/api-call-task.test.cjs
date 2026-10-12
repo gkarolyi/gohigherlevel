@@ -130,6 +130,34 @@ test('readback HTTP failure retains acceptance and checkpoint', async t => {
 test('native PUT failure redacts exception and retains the intent', async t => {
   const h = harness(t); h.hook(c => {if(c.init.method === 'PUT') throw new Error('secret credentials');}); await h.run(); assert.ok(h.checkpoint()); assert.doesNotMatch(h.notice(),/secret credentials/); assert.equal(h.puts().length,1);
 });
+test('the second Call-task preflight pair also overlaps before completion', async t => {
+  const h = harness(t); let contactReads = 0, taskReads = 0, releaseContact, releaseTasks;
+  const heldContact = new Promise(resolve => { releaseContact = resolve; });
+  const heldTasks = new Promise(resolve => { releaseTasks = resolve; });
+  h.hook(c => c.init.method === 'GET' && ++contactReads === 2 ? heldContact
+    : c.init.method === 'POST' && ++taskReads === 2 ? heldTasks : undefined);
+  const pending = h.run(); await h.flush();
+  assert.equal(contactReads, 2);
+  assert.equal(taskReads, 2);
+  assert.equal(h.puts().length, 0);
+  releaseContact({ contact }); releaseTasks(list([task])); await pending;
+  assert.equal(h.puts().length, 1);
+  assert.equal(h.checkpoint(), null);
+});
+
+test('Call-task preflight overlaps contact and task reads and drains both on failure', async t => {
+  const h = harness(t); let release;
+  const held = new Promise(resolve => { release = resolve; });
+  h.hook(c => c.init.method === 'GET' ? held : new Response('{}', { status: 500 }));
+  const pending = h.run(); await h.flush();
+  assert.deepEqual(h.calls.map(c => c.init.method).sort(), ['GET', 'POST']);
+  assert.equal(h.e('busy'), true);
+  assert.equal(h.puts().length, 0);
+  release({ contact }); await pending;
+  assert.equal(h.e('busy'), false);
+  assert.equal(h.puts().length, 0);
+});
+
 test('Call click does not trigger task completion', async t => {
   const h = harness(t); h.w.document.body.innerHTML = '<button id="hr-button-v-1"><span id="hr-button-v-1-label"><span class="sr-only">Call: Ada</span><p>Call</p></span></button>';
   h.w.document.querySelector('button').click();

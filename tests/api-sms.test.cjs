@@ -111,6 +111,22 @@ for (const patch of [{id:'wrong'},{conversationId:'wrong'},{contactId:'wrong'},{
 for (const patch of [{phone:'+12222222222'},{assignedTo:'other'}]) test('fresh contact change blocks send '+JSON.stringify(patch),async t=>{
   const h=harness(t); h.hook(c=>c.path==='/contacts/c1'?{contact:{...contact,...patch}}:undefined); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);
 });
+test('concurrent-save approval keeps the preflight owner but still rechecks the SMS recipient', async t => {
+  const h = harness(t);
+  h.e('Object.assign(approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
+  h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, assignedTo: 'other' } } : undefined);
+  await h.send();
+  assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, 1);
+});
+
+test('a concurrent-save approval never permits a changed SMS phone number', async t => {
+  const h = harness(t);
+  h.e('Object.assign(approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
+  h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, phone: '+12222222222' } } : undefined);
+  await assert.rejects(h.send());
+  assert.equal(h.calls.filter(c => c.init.method === 'POST').length, 0);
+});
+
 test('sender removed blocks send',async t=>{const h=harness(t); h.hook(c=>c.path.startsWith('/phone-system/')?{numbers:[],total:0}:undefined); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);});
 for (const response of [{}, {conversationId:'v1',messageId:'bad/id'}]) test('malformed ack leaves unknown journal',async t=>{
   const h=harness(t); h.hook(c=>c.path==='/conversations/messages'?response:undefined); await assert.rejects(h.send()); assert.match(h.checkpoint().pendingSave,/Hello/); await assert.rejects(h.send());
