@@ -1009,7 +1009,7 @@
     verifyStage(saved.data, saved.body, approved.id, context.contact, approved.pipelineId);
     requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === actionStageVersions.get(context)
       && (context.parallel || (saved.data.opportunity.assignedTo ?? '') === (approved.assignedTo ?? '')), 'saved opportunity account/version/owner did not match.');
-    workflow.completed.push(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
+    appendJournalEvidence(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
     workflow.activeSaveProgress?.confirm('stage');
     setPendingAction('stage', null);
     requireActionApproval('stage', context, 1);
@@ -1021,7 +1021,7 @@
     const { data, body } = await actionRequest('note', context);
     requireSaved(safeActionId(data.note?.id), 'unsafe note ID.');
     verifyNote(data, body, context.contact, context.noteText);
-    workflow.completed.push(`Note saved (server confirmed; note ${data.note.id})`);
+    appendJournalEvidence(`Note saved (server confirmed; note ${data.note.id})`);
     workflow.activeSaveProgress?.confirm('note');
     setPendingAction('note', null);
     requireActionApproval('note', context);
@@ -1036,12 +1036,12 @@
     verifyTask(data, body, context.contact, context.taskTitle, context.due);
     context.taskId = data.record.id;
     workflow.activeSaveProgress?.created();
-    workflow.completed.push(`Task created: ${context.taskId}; ${context.due}, 11am WITA (server confirmed)`);
+    appendJournalEvidence(`Task created: ${context.taskId}; ${context.due}, 11am WITA (server confirmed)`);
     setPendingAction('task', `Contact association for task ${context.taskId}`);
     requireActionApproval('task', context);
     const linked = await actionRequest('link', context);
     verifyTaskLink(linked.data, context.taskId, context.contact);
-    workflow.completed.push('Task contact association: server confirmed');
+    appendJournalEvidence('Task contact association: server confirmed');
     workflow.activeSaveProgress?.confirm('task');
     setPendingAction('link', null);
     setPendingAction('task', null);
@@ -1171,6 +1171,37 @@
     }
     localStorage.removeItem(key);
     return true;
+  }
+
+  function resetJournalEvidence() {
+    workflow.completed = [];
+    workflow.pendingSave = '';
+    workflow.pendingActions = {};
+  }
+
+  function restoreJournalEvidence(saved) {
+    workflow.completed = [...(saved.completed || [])];
+    workflow.pendingSave = saved.pendingSave || '';
+    workflow.pendingActions = { ...(saved.pendingActions || {}) };
+  }
+
+  function appendJournalEvidence(description) {
+    workflow.completed.push(description);
+  }
+
+  function setSmsSummary(description) {
+    workflow.pendingSave = description;
+    saveCheckpoint();
+  }
+
+  function clearSmsSummary() {
+    const unresolved = workflow.pendingSave;
+    workflow.pendingSave = '';
+    try { saveCheckpoint(); } catch (error) { workflow.pendingSave = unresolved; throw error; }
+  }
+
+  function removeCompletedCheckpoint(id) {
+    localStorage.removeItem(checkpointKey(id));
   }
 
   function saveCheckpoint() {
@@ -1450,7 +1481,7 @@
       if (data?.succeded !== true || data.error || data.errors?.length) throw new Error('Completion acknowledgment missing.');
       diagnostic.result = 'completion accepted';
       // Preserve known acceptance even if navigation/session changed while the request was in flight.
-      workflow.completed.push(`Call task completion accepted: ${taskId}; readback not yet verified.`);
+      appendJournalEvidence(`Call task completion accepted: ${taskId}; readback not yet verified.`);
       saveCheckpoint();
       requireCallTaskContext(context);
     } catch (error) {
@@ -1520,8 +1551,7 @@
         return;
       }
       if (!fromSaveAndNext) {
-        workflow.completed = [];
-        workflow.pendingSave = ''; workflow.pendingActions = {};
+        resetJournalEvidence();
         workflow.startingContact = id;
       }
       phase = 'reading and rechecking the current contact and exact pending task';
@@ -1554,12 +1584,12 @@
         }
       }
       if (!verified) throw new Error('Task completion readback unavailable.');
-      workflow.completed.push(`Call task completed and verified: ${task.id}: ${title}`);
+      appendJournalEvidence(`Call task completed and verified: ${task.id}: ${title}`);
       workflow.activeSaveProgress?.confirm('complete');
       setPendingAction('complete', null);
       requireCallTaskContext(context);
       if (!fromSaveAndNext) {
-        localStorage.removeItem(checkpointKey(id));
+        removeCompletedCheckpoint(id);
         taskNotice(`Completed: ${title}`);
       }
     } catch {
@@ -1688,19 +1718,15 @@
     requireActionApproval('sms', context);
     if (spam.isSpam !== false) throw new Error('SMS spam preflight did not approve the message.');
     if (workflow.pendingSave) throw new Error('An unresolved save exists. No retry.');
-    workflow.pendingSave = `SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance not yet confirmed`;
-    saveCheckpoint();
+    setSmsSummary(`SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance not yet confirmed`);
     const acknowledgment = await smsApiRequest('send', context, sms);
     if (!safeActionId(acknowledgment.conversationId) || !safeActionId(acknowledgment.messageId)) throw new Error('SMS acknowledgment is unverified. No retry.');
     const identity = `SMS message ${acknowledgment.messageId}; conversation ${acknowledgment.conversationId}`;
-    workflow.completed.push(`${identity}: accepted by CRM; delivery not confirmed.`);
+    appendJournalEvidence(`${identity}: accepted by CRM; delivery not confirmed.`);
     workflow.activeSaveProgress?.confirm('sms');
-    workflow.pendingSave = `${identity}: accepted; workflow continuation not yet approved`;
-    saveCheckpoint();
+    setSmsSummary(`${identity}: accepted; workflow continuation not yet approved`);
     requireActionApproval('sms', context);
-    const unresolved = workflow.pendingSave;
-    workflow.pendingSave = '';
-    try { saveCheckpoint(); } catch (error) { workflow.pendingSave = unresolved; throw error; }
+    clearSmsSummary();
     requireActionApproval('sms', context);
     const notice = `SMS to ${sms.to}: accepted by CRM; delivery not confirmed.`;
     try {
@@ -1996,8 +2022,7 @@
     let saveProgress = null;
     workflow.busy = true;
     runButton.disabled = true;
-    workflow.completed = [];
-    workflow.pendingSave = ''; workflow.pendingActions = {};
+    resetJournalEvidence();
     workflow.step = 'Checking contact page';
     workflow.guardedContact = contactId();
     workflow.startingContact = workflow.guardedContact || '(none)';
@@ -2012,9 +2037,7 @@
       const previous = localStorage.getItem(checkpointKey(workflow.startingContact));
       if (previous) {
         const saved = JSON.parse(previous);
-        workflow.completed = saved.completed || [];
-        workflow.pendingSave = saved.pendingSave || '';
-        workflow.pendingActions = saved.pendingActions || {};
+        restoreJournalEvidence(saved);
         throw new Error(`Repeat run blocked: an unfinished no-answer action exists from ${saved.time}. Stage/note/task changes may already be saved. Reconcile that action before starting another; refreshing does not clear this block.`);
       }
       if (settings.pipelineIds?.length || settings.priority === 'stage') {
@@ -2117,7 +2140,7 @@
       const next = await findNextActionable();
       if (next) { await openLead(next, () => saveProgress.remove()); timingResult = 'navigating'; }
       else { saveProgress.remove(); taskNotice(`Selected actions saved. ${emptyQueueMessage()} Refresh the contact to update the CRM panels.`); }
-      localStorage.removeItem(checkpointKey(workflow.startingContact));
+      removeCompletedCheckpoint(workflow.startingContact);
 
     } catch (error) {
       timingResult = 'stopped';
