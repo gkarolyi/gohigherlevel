@@ -2133,6 +2133,7 @@
         await trackAction('sms', sendSmsApi, 'Sending…');
       }
 
+      removeCompletedCheckpoint(workflow.startingContact);
       progress('Opening next lead…');
       workflow.guardedContact = null; // Navigation is allowed only after the saves succeeded.
       workflow.guardedStageQueue = null;
@@ -2140,7 +2141,6 @@
       const next = await findNextActionable();
       if (next) { await openLead(next, () => saveProgress.remove()); timingResult = 'navigating'; }
       else { saveProgress.remove(); taskNotice(`Selected actions saved. ${emptyQueueMessage()} Refresh the contact to update the CRM panels.`); }
-      removeCompletedCheckpoint(workflow.startingContact);
 
     } catch (error) {
       timingResult = 'stopped';

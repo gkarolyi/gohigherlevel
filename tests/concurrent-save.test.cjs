@@ -195,8 +195,10 @@ for (const failure of [false, true]) test(`progress navigation settles without e
   assert.equal(d.querySelector('h2').textContent, 'Opening next lead…');
   assert.equal(d.querySelector('[data-close]').hidden, true);
   for (const key of ['stage', 'note', 'complete', 'task']) assert.equal(d.querySelector(`[data-action="${key}"]`).dataset.state, 'confirmed');
+  assert.equal(h.checkpoint(), null, 'verified actions must clear their block before navigation settles');
   if (failure) navigation.reject(new Error('Navigation failed')); else navigation.resolve();
   await pending;
+  assert.equal(h.checkpoint(), null, 'navigation failure must not restore a completed contact block');
   assert.equal(d.isConnected, failure);
   if (failure) {
     assert.match(d.querySelector('[data-report]').textContent, /Opening next lead/);

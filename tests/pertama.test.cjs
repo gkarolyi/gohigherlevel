@@ -1185,10 +1185,11 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
       assert.equal(h.w.localStorage.getItem(checkpointKey), null, 'no attempted write to reconcile');
     } else if (['navigation-failure', 'sms-navigation-failure', 'link-failure', 'task-route-change'].includes(mode)) {
       assert.equal(writes.length, smsEnabled ? 5 : mode === 'link-failure' ? 4 : mode === 'task-route-change' ? 3 : 1, h.alerts.join('\n'));
-      if (smsEnabled) assert.match(h.w.localStorage.getItem(checkpointKey), /msg-created/);
-      assert.equal(navigationAttempts, ['navigation-failure', 'sms-navigation-failure'].includes(mode) ? 1 : 0);
-      assert.match(h.w.localStorage.getItem(checkpointKey), /Stage: Robot/);
-      if (mode === 'link-failure' || mode === 'task-route-change') {
+      const navigationFailed = ['navigation-failure', 'sms-navigation-failure'].includes(mode);
+      assert.equal(navigationAttempts, navigationFailed ? 1 : 0);
+      if (navigationFailed) assert.equal(h.w.localStorage.getItem(checkpointKey), null, 'completed writes must not remain blocked by navigation');
+      else {
+        assert.match(h.w.localStorage.getItem(checkpointKey), /Stage: Robot/);
         assert.match(h.w.localStorage.getItem(checkpointKey), /Task created.*task-created/);
       }
       const progress = h.w.document.querySelector('#pertama-save-progress');
@@ -1198,11 +1199,13 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
       if (mode === 'link-failure') assert.match(progress.querySelector('[data-action="task"]').textContent, /Created; contact link unverified/);
       assert.deepEqual(h.alerts, []);
       progress.querySelector('[data-close]').click();
-      if (mode === 'task-route-change') h.route(CONTACT_PATH);
-      const count = h.requests.length;
-      await h.evaluate('run()');
-      assert.equal(h.requests.length, count, 'checkpoint blocks duplicate requests, including re-creating a partially linked task');
-      assert.match(h.alerts.join('\n'), /Repeat run blocked/);
+      if (!navigationFailed) {
+        if (mode === 'task-route-change') h.route(CONTACT_PATH);
+        const count = h.requests.length;
+        await h.evaluate('run()');
+        assert.equal(h.requests.length, count, 'checkpoint blocks duplicate requests, including re-creating a partially linked task');
+        assert.match(h.alerts.join('\n'), /Repeat run blocked/);
+      }
     } else {
       assert.deepEqual(h.alerts, []);
       assert.equal(writes.length, smsEnabled ? 5 : allActions ? 4 : 1);
