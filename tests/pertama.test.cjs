@@ -613,6 +613,32 @@ test('same-stage lookup requires verified identity before sending a request', as
   assert.equal(h.requests.length, 0);
 });
 
+test('settings new-lead stage is picked from available pipeline stages', t => {
+  const h = harness(t);
+  h.evaluate('openSettings()');
+  const form = h.w.document.querySelector('#pertama-settings form');
+  const stage = form.elements.namedItem('newLeadStage');
+  assert.equal(stage.tagName, 'SELECT');
+  assert.equal(stage.value, 'New Lead');
+  assert.deepEqual([...stage.options].map(option => option.value), ['', 'New Lead', 'Attempted Contact', 'Robot']);
+  stage.value = 'Robot';
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+  assert.equal(JSON.parse(h.w.localStorage.getItem(`pertama:settings:${LOCATION}`)).newLeadStage, 'Robot');
+});
+
+test('settings preserve the saved stage when the pipeline catalog is unavailable', t => {
+  const h = harness(t);
+  h.evaluate('NAV_PIPELINES.splice(0)');
+  h.evaluate('openSettings()');
+  const form = h.w.document.querySelector('#pertama-settings form');
+  const stage = form.elements.namedItem('newLeadStage');
+  assert.equal(stage.tagName, 'SELECT');
+  assert.deepEqual([...stage.options].map(option => option.value), ['', 'New Lead']);
+  assert.equal(stage.value, 'New Lead');
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+  assert.equal(JSON.parse(h.w.localStorage.getItem(`pertama:settings:${LOCATION}`)).newLeadStage, 'New Lead');
+});
+
 test('settings dialog offers and saves same-stage priority', t => {
   const h = harness(t);
   h.evaluate('openSettings()');

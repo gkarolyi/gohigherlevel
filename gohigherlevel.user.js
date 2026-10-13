@@ -2211,7 +2211,7 @@
       <p>Save and next completes a matching existing Call task before creating a new follow-up. Tasks created with an older title template need manual completion.</p>
       <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option><option value="stage">Same stage only</option></select></label>
       <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; otherwise its current pipeline and stage are inferred automatically. You will only be asked to choose a queue if multiple opportunities make it ambiguous. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
-      <label>New lead stage name<input name="newLeadStage" required></label>
+      <label>New lead stage<select name="newLeadStage" required></select></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups preserve your other task-list filters and sorting, but only include tasks already due, with a fresh cutoff on every lookup. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
       <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Leave follow-up days blank to keep Add task off by default; you can still enable it when saving. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
       <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
@@ -2232,6 +2232,10 @@
     dialog.querySelector('[data-user]').textContent = currentUserId && identityExpires > Date.now() / 1000
       ? `CRM user: ${currentUserId} · identified from current CRM authentication`
       : 'CRM user: awaiting verification. Waiting for the CRM to load authenticated data.';
+    const availableStages = [...new Set(NAV_PIPELINES.flatMap(pipeline => Object.keys(pipeline.stages)))];
+    const stageSelect = form.elements.namedItem('newLeadStage');
+    stageSelect.replaceChildren(new Option('Select a new-lead stage…', ''), ...availableStages.map(stage => new Option(stage, stage)));
+    if (!availableStages.includes(settings.newLeadStage)) stageSelect.add(new Option(`${settings.newLeadStage} (saved; not in loaded pipelines)`, settings.newLeadStage));
     for (const key of ['note', 'task', 'sms', 'priority', 'newLeadStage']) form.elements.namedItem(key).value = settings[key];
     const senderSelect = form.elements.namedItem('smsFrom');
     if (contactId() && location.pathname.includes(`/location/${LOCATION_ID}/`)) {
@@ -2293,6 +2297,7 @@
           next.rules[stage] = { next: row.querySelector('[data-next]').value.trim(), days: rawDays === '' ? null : Number(rawDays), updateStage: row.querySelector('[data-update]').checked };
         }
         validateSettings(next);
+        if (!availableStages.includes(next.newLeadStage) && next.newLeadStage !== settings.newLeadStage) throw new Error('Open the Opportunities board and reopen Settings to choose an available new-lead stage.');
         for (const id of next.priority === 'stage' ? [] : next.pipelineIds) {
           const pipeline = NAV_PIPELINES.find(p => p.id === id);
           if (!pipeline || !pipeline.stages[next.newLeadStage]) throw new Error(`${pipeline?.name || 'Unavailable pipeline'} has no ${next.newLeadStage} stage. Disable it or change the stage name.`);
