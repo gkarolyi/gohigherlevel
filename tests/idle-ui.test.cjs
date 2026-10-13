@@ -88,7 +88,7 @@ function harness(t, { mounted = true, toolbar = true, route = CONTACT, hidden = 
     assert.fail('UI did not settle within 12 frames (possible own-mutation feedback loop)');
   }
   return {
-    w, d, evaluate, counts, frames, intervals, observers, resizeObservers, flush,
+    w, d, evaluate, counts, frames, timers, intervals, observers, resizeObservers, flush,
     button: id => d.getElementById(id),
     reset() { for (const key of Object.keys(counts)) counts[key] = 0; },
     refresh() { assert.equal(evaluate('typeof refreshButtons'), 'function', 'closure must expose refreshButtons'); evaluate('refreshButtons()'); },
@@ -322,6 +322,40 @@ test('discovery can recover on user interaction after its bounded window expires
   h.d.querySelector('main').dispatchEvent(new h.w.MouseEvent('click', { bubbles: true }));
   await h.flush(); assertPlacement(h);
   assert.equal(broadObservers(h).length, 0);
+});
+
+test('hiding during discovery cancels queued work and retries until visibility resumes', async t => {
+  const h = harness(t, { mounted: false }); await h.flush();
+  assert.ok(broadObservers(h).length);
+  assert.ok(h.timers.size);
+  h.refresh(); assert.equal(h.frames.size, 1);
+  h.setHidden(true);
+  assert.equal(h.frames.size, 0);
+  assert.equal(h.timers.size, 0);
+  assert.equal(broadObservers(h).length, 0);
+  h.reset(); await h.advance(60000);
+  assert.deepEqual(h.counts, { scans: 0, visibility: 0, geometry: 0, observerRecords: 0 });
+  h.setHidden(false); await h.flush();
+  assert.ok(broadObservers(h).length);
+  assert.ok(h.timers.size);
+});
+
+test('route changes restart expired toolbar discovery and leaving the account tears down observers', async t => {
+  const h = harness(t, { toolbar: false }); await h.flush();
+  await h.advance(30001); assert.equal(h.timers.size, 0);
+  h.reset(); await h.advance(60000);
+  assert.equal(h.counts.scans + h.counts.visibility + h.counts.geometry, 0);
+  h.w.history.pushState({}, '', CONTACT.replace('contact-a', 'contact-b')); await h.flush();
+  assert.ok(h.timers.size, 'a new route gets a fresh discovery budget');
+  h.reset(); await h.advance(1000);
+  assert.equal(h.counts.scans, 0, 'toolbar-only retries must not scan all controls');
+  h.w.history.pushState({}, '', '/v2/location/other/contacts/detail/contact-b'); await h.flush();
+  assert.equal(h.timers.size, 0);
+  assert.ok(h.observers.every(observer => observer.targets.size === 0));
+  assert.ok(h.resizeObservers.every(observer => observer.targets.size === 0));
+  h.reset(); await h.advance(60000);
+  assert.equal(h.counts.scans + h.counts.visibility + h.counts.geometry, 0);
+  for (const id of [NEXT, SETTINGS]) assert.equal(h.button(id).hidden, true);
 });
 
 test('hidden tabs defer refresh and host repair until visibility resumes', async t => {

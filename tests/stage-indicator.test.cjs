@@ -148,6 +148,26 @@ test('a late-mounted name is discovered with bounded retries, never broad observ
   const count = h.requests.length; await h.advance(60000); assert.equal(h.requests.length, count);
 });
 
+test('name-only retries do not scan global controls or request contact data', async t => {
+  const h = harness(t, { mounted: false }); await h.flush();
+  const scans = [];
+  for (const root of [h.d, h.d.body]) {
+    const query = root.querySelectorAll.bind(root);
+    root.querySelectorAll = selector => {
+      if (/^a\s*,\s*button$/.test(selector)) scans.push(selector);
+      return query(selector);
+    };
+  }
+  for (let i = 0; i < 3; i++) await h.advance(1000);
+  assert.deepEqual(scans, []);
+  assert.equal(h.requests.length, 0);
+  h.d.querySelector('main').innerHTML = header('Ada Test');
+  await h.advance(1000); assertStage(h, 'New Lead');
+  assert.deepEqual(scans, []);
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.timers.size, 0);
+});
+
 test('header discovery stops after its budget and can wake on user interaction', async t => {
   const h = harness(t, { mounted: false }); await h.flush(); await h.advance(30000);
   assert.equal(h.timers.size, 0);
