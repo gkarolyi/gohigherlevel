@@ -92,3 +92,25 @@ Files: `tests/idle-ui.test.cjs`, `tests/stage-indicator.test.cjs`, `gohigherleve
 - [ ] Run full test suite, syntax and whitespace checks; verify clean Git status.
 - [ ] Re-measure hotspot complexity with the same ESLint rules used in the baseline analysis; report any tradeoff honestly.
 - [ ] Summarize commits and evidence; do not claim live browser/CRM verification. Keep deferred UI discussion untouched.
+
+## Execution record
+
+Implemented on `refactor/workflow-boundaries`. Checklists above record the original sequence; completed checkpoints:
+
+| Commit | Scope | Full-suite passing tests |
+| --- | --- | ---: |
+| `eb0d22e` | Tests only: shared evaluation and Web API bootstrap | 465 |
+| `7de70f7` | Tests only: workflow ownership guards and temporary state bridge | 468 |
+| `89d8552` | Production only: group workflow-owned state | 468 |
+| `d4e24ee` | Tests only: remove temporary bridge | 468 |
+| `bd496ae` | Tests only: checkpoint storage-failure guards | 470 |
+| `fcd0390` | Production only: centralize journal transitions | 470 |
+| `e150a86` | Tests only: toolbar discovery lifecycle guards | 473 |
+| `6e8a1c6` | Production only: separate discovery, placement and reconciliation | 473 |
+| `fff706d` | Production only: retain exact pre-refactor checkpoint restoration assignments | 473 |
+
+The last correction avoids introducing different behavior for malformed stored fields through array/object cloning. Reset still creates fresh evidence containers; restoration retains its original assignments. No new corruption handling is part of this refactor.
+
+ESLint 9 classic cyclomatic complexity: `placeButton` 55 → 30, `run` 50 → 47, `sendSmsApi` 19 → 18. Extracted toolbar boundaries: `discoverHosts` 13, `reconcileDiscovery` 10, `refreshToolbar` 5. Production cloc SLOC is 2,382 versus 2,360 initially: a small increase for explicit boundaries, not a code-size reduction. Shared test helpers eliminate repeated evaluator/Web API setup; endpoint fixtures and clocks remain local.
+
+No version bump, release, push, request changes, visual changes or live CRM writes. Full-suite verification, syntax checks and whitespace checks pass; live browser/CRM behavior remains unverified. Deferred modal UI work remains separate.
