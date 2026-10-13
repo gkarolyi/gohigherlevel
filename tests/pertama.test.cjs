@@ -75,6 +75,13 @@ test('progress controller preserves evidence, blocks dismissal and reattaches st
   assert.equal(d.querySelector('b'), null);
   assert.equal(row('complete'), null);
   assert.equal(d.querySelector('[data-close]').hidden, true);
+  assert.equal(d.querySelector('[data-footer]'), null, 'no redundant navigation status below the actions');
+  assert.equal(d.querySelector('[data-live]').getAttribute('class'), 'visually-hidden', 'screen-reader announcements remain off screen');
+  assert.equal(d.style.padding, '18px 20px', 'progress dialog uses tighter spacing');
+  assert.match(d.querySelector('style').textContent, /\[data-action\]\{display:flex;gap:10px;padding:8px 0/, 'action rows use tighter spacing');
+  p.phase('Opening next lead…');
+  assert.equal(d.querySelector('h2').textContent, 'Opening next lead…');
+  assert.equal(d.querySelector('[data-rows]').nextElementSibling?.hasAttribute('data-report'), true, 'only the hidden error report follows the action rows');
   const cancel = new h.w.Event('cancel', { cancelable: true }); d.dispatchEvent(cancel);
   assert.equal(cancel.defaultPrevented, true);
   p.addCompletion(); p.addCompletion();

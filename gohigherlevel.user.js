@@ -1745,22 +1745,25 @@
     const dialog = document.createElement('dialog');
     dialog.id = 'pertama-save-progress';
     dialog.setAttribute('aria-labelledby', 'pertama-save-progress-title');
-    dialog.style.cssText = 'width:min(510px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid #e4e7ec;border-radius:16px;padding:24px;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#182230;background:#fff';
+    dialog.style.cssText = 'width:min(420px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid #e4e7ec;border-radius:16px;padding:18px 20px;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#182230;background:#fff';
     dialog.innerHTML = `<style>
       #pertama-save-progress::backdrop{background:#10182866}
-      #pertama-save-progress h2{margin:0;font-size:22px}
-      #pertama-save-progress [data-action]{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #eaecf0}
-      #pertama-save-progress [data-icon]{color:#667085;display:inline-block}
+      #pertama-save-progress h2{margin:0;font-size:19px;line-height:1.3}
+      #pertama-save-progress [data-contact]{margin:4px 0 10px;color:#667085;font-size:13px;overflow-wrap:anywhere}
+      #pertama-save-progress [data-action]{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid #eaecf0}
+      #pertama-save-progress [data-action]:last-child{border-bottom:0}
+      #pertama-save-progress [data-icon]{color:#667085;display:inline-block;flex:0 0 18px}
       #pertama-save-progress [data-state=running] [data-icon]{color:#155eef;animation:pertama-save-spin 1s linear infinite}
       #pertama-save-progress [data-state=confirmed] [data-icon]{color:#067647}
       #pertama-save-progress [data-state=unverified] [data-icon]{color:#b54708}
       #pertama-save-progress [data-state=failed] [data-icon]{color:#b42318}
-      #pertama-save-progress small{display:block;color:#667085}
-      #pertama-save-progress [data-report]{white-space:pre-wrap;overflow-wrap:anywhere}
+      #pertama-save-progress small{display:block;margin-top:1px;color:#667085;font-size:12px;line-height:1.35}
+      #pertama-save-progress .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+      #pertama-save-progress [data-report]{margin-top:12px;padding-top:12px;border-top:1px solid #eaecf0;white-space:pre-wrap;overflow-wrap:anywhere}
       #pertama-save-progress button{padding:8px 16px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;font:inherit;cursor:pointer}
       @keyframes pertama-save-spin{to{transform:rotate(360deg)}}
       @media(prefers-reduced-motion:reduce){#pertama-save-progress [data-icon]{animation:none!important}}
-      </style><h2 id="pertama-save-progress-title" tabindex="-1">Preparing actions…</h2><p data-contact></p><div data-rows></div><p data-live role="status" aria-live="polite"></p><p data-footer>The next lead will open automatically.</p><section data-report hidden aria-label="Stopped save details"></section><button type="button" data-close hidden>Close</button>`;
+      </style><h2 id="pertama-save-progress-title" tabindex="-1">Preparing actions…</h2><p data-contact></p><div data-live class="visually-hidden" role="status" aria-live="polite"></div><div data-rows></div><section data-report hidden aria-label="Stopped save details"></section><button type="button" data-close hidden>Close</button>`;
     dialog.querySelector('[data-contact]').textContent = `${name} · ${pipelineName}`;
     const rows = new Map(), container = dialog.querySelector('[data-rows]');
     const labels = { stage: 'Stage', note: 'Note', complete: 'Existing Call task', task: 'Follow-up task', sms: 'SMS' };
@@ -1811,7 +1814,6 @@
         stopped = true;
         for (const row of rows.values()) if (['waiting', 'running'].includes(row.state)) { row.state = 'blocked'; row.detail = 'Not run'; render(row); }
         dialog.querySelector('h2').textContent = 'Execution stopped';
-        dialog.querySelector('[data-footer]').textContent = 'No automatic retry. Check the record before running again.';
         const details = dialog.querySelector('[data-report]'); details.textContent = report; details.hidden = false;
         dialog.querySelector('[data-close]').hidden = false;
         announce('Execution stopped. Results are ready to inspect.'); show();
