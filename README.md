@@ -28,7 +28,15 @@ Missing tasks are **not** assumed completed. Only an explicit observed completio
 
 On Run, the report reads the location's phone-number inventory and selects all voice-capable numbers linked to the signed-in user. Calls use that nonempty `selectedPool` with an empty `userId` filter, matching the working native report; returned rows are independently filtered by `row.userId` (not the contact assignee), location, contact ID and date. Missing, malformed or incomplete inventory is an explicit call-coverage warning, never a clean zero-call result; tasks and remembered follow-ups can still be checked. Numbers are not persisted. Backend calls/contact reads use version `2021-04-15`; services inventory/task reads use `2021-07-28`.
 
-**Live validation:** captures show the old empty-pool query returned zero calls despite a known call in the native selected-pool report. The general pending-task search has now been observed live returning the expected task. The corrected userscript query still needs a real Run report rerun before relying on completeness.
+**Live validation:** the corrected selected-pool inaccessible report has been verified by the user.
+
+## Outgoing calls
+
+Open **Workflow settings → Reports → Outgoing calls → Load call counts**. Today and Yesterday use WITA (UTC+8) calendar days, through the time loading started. **Refresh** loads a new snapshot; the small Updated timestamp is WITA. Counts include only the signed-in user's outbound calls, once per call ID—not contacts or nested call legs. Separate attempts to the same contact count separately. Completed is the CRM outcome, not proof a person answered; other returned statuses also contribute to Total.
+
+Loading reads your linked voice-number inventory and the necessary 50-row call pages only. It does not read contacts/tasks/history, save counts, write to the CRM, or poll. No counter requests run until clicked. Failed or incomplete loads show a short warning instead of partial totals. Closing/saving settings, Escape, or an account/user change cancels loading; reopen settings after switching users. The two reports cannot load simultaneously.
+
+**Live validation:** the new counter still needs comparison against the native call report for both WITA days.
 
 ## Development
 

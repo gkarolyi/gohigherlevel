@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.14
+// @version      1.0.15
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.14';
+  const VERSION = '1.0.15';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -144,7 +144,7 @@
       identityExpires = 0;
       identityStatus = error.message;
     }
-    if (previousUser !== currentUserId) { closeLeadAccessReport(); invalidateContactReads(); }
+    if (previousUser !== currentUserId) { cancelLeadAccessReport(); closeLeadAccessReport(); invalidateOutgoingCallCounter(); invalidateContactReads(); }
   }
   function scopeLeadFilters(filters, id) {
     function removeUserFilters(items) {
@@ -543,7 +543,7 @@
   function syncStageQueue() {
     if (stageQueuePath === location.pathname) return;
     stageQueuePath = location.pathname;
-    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) closeLeadAccessReport();
+    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) { cancelLeadAccessReport(); closeLeadAccessReport(); invalidateOutgoingCallCounter(); }
     stageRouteRevision++;
     invalidateContactReads();
     refreshButtons();
@@ -641,6 +641,8 @@
   function rejectCrmAuthorization() {
     liveReadHeaders = null;
     currentUserId = null; identityExpires = 0; identityStatus = 'CRM authorization rejected';
+    if (leadReportRun?.kind === 'counter') cancelLeadAccessReport();
+    invalidateOutgoingCallCounter();
     invalidateContactReads();
   }
   function contactReadContext() {
@@ -1072,7 +1074,7 @@
   // Local, bounded last-known history. Never stores credentials, phone numbers or full responses.
   const LEAD_RETENTION = 180 * 86400000;
   const leadHistories = new Map();
-  let leadHistoryTimer = null, leadStorageWarning = '', leadReportRun = null, leadReportDialog = null;
+  let leadHistoryTimer = null, leadStorageWarning = '', leadReportRun = null, leadReportDialog = null, callCounterView = null;
   const leadId = id => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id);
   const leadHistoryKey = user => `pertama:lead-access:${LOCATION_ID}:${user}`;
   function leadAccessContext() { return { user: currentUserId, observedAt: Date.now() }; }
@@ -1235,11 +1237,53 @@
       callStatus: [], dispositions: [], deviceType: [], qualifiedLead: false, firstTime: false, duration: null, selectedPool,
       direction: null, startDate: new Date(Date.now() - days * 86400000).toISOString(), endDate: new Date().toISOString(), userId: '', limit: 50, skip: 0 };
   }
-  function validateLeadCalls(data) {
+  function validateLeadCalls(data, requireContact = true) {
     if (!Array.isArray(data?.rows) || !Number.isInteger(data.totalRows) || data.totalRows < data.rows.length
       || !Number.isInteger(data.totalPages) || data.totalPages < 0) throw new Error('Incomplete call pagination.');
-    for (const row of data.rows) if (!leadId(row?.id) || !leadId(row.contactId) || !leadId(row.userId)
+    for (const row of data.rows) if (!leadId(row?.id) || requireContact && !leadId(row.contactId) || !leadId(row.userId)
       || row.locationId !== LOCATION_ID || !Number.isFinite(Date.parse(row.dateAdded))) throw new Error('Invalid call record.');
+  }
+  async function readLeadPhonePool(run) {
+    const inventory = await leadReportRequest(run, 'numbers');
+    if (!Array.isArray(inventory.numbers) || !Number.isInteger(inventory.total) || inventory.total !== inventory.numbers.length) throw new Error('Incomplete phone number inventory.');
+    const seen = new Set(), pool = [];
+    for (const number of inventory.numbers) {
+      if (!number || typeof number.phoneNumber !== 'string' || !/^\+[1-9]\d{6,14}$/.test(number.phoneNumber)
+        || seen.has(number.phoneNumber) || !(number.linkedUser == null || typeof number.linkedUser === 'string')
+        || typeof number.capabilities?.voice !== 'boolean') throw new Error('Invalid phone number inventory.');
+      seen.add(number.phoneNumber);
+      if (number.linkedUser === run.context.user && number.capabilities.voice === true) pool.push(number.phoneNumber);
+    }
+    if (!pool.length) throw new Error('No voice numbers linked to your user.');
+    return pool;
+  }
+  async function runOutgoingCallCount(owner = null) {
+    if (leadReportRun) throw new Error('Report already running.');
+    const run = { context: leadAccessContext(), kind: 'counter', cancelled: false, controller: null };
+    leadReportRun = run; if (owner) owner.run = run;
+    const now = Date.now(), today = Math.floor((now + 28800000) / 86400000) * 86400000 - 28800000, yesterday = today - 86400000;
+    const days = ['Today', 'Yesterday'].map(label => ({ label, total: 0, statuses: Object.create(null) }));
+    try {
+      const body = { ...leadCallsBody(await readLeadPhonePool(run), 2), startDate: new Date(yesterday).toISOString(), endDate: new Date(now).toISOString() };
+      const seen = new Set(); let total = null;
+      for (let skip = 0; ; skip += 50) {
+        const data = await leadReportRequest(run, 'calls', { ...body, skip }); validateLeadCalls(data, false);
+        if (total !== null && total !== data.totalRows) throw new Error('Call totals changed during pagination.');
+        total = data.totalRows;
+        if (total > 5000) throw new Error('Call coverage capped at 5,000 records.');
+        if (data.rows.length !== Math.min(50, total - skip)) throw new Error('Incomplete call pages.');
+        if (data.rows.some(row => seen.has(row.id))) throw new Error('Repeated or overlapping call pages.');
+        for (const row of data.rows) {
+          if (seen.has(row.id)) continue; seen.add(row.id);
+          const date = Date.parse(row.dateAdded);
+          if (row.userId !== run.context.user || row.direction !== 'outbound' || date < yesterday || date >= now) continue;
+          const day = days[date >= today ? 0 : 1], status = typeof row.callStatus === 'string' && row.callStatus ? row.callStatus : 'unknown';
+          day.total++; day.statuses[status] = (day.statuses[status] || 0) + 1;
+        }
+        if (skip + data.rows.length === total) break;
+      }
+      requireLeadReport(run); return { days, updatedAt: now };
+    } finally { if (leadReportRun === run) leadReportRun = null; }
   }
   async function runLeadAccessReport(days = 30, progress = () => {}) {
     if (leadReportRun) throw new Error('Report already running.');
@@ -1252,18 +1296,7 @@
       leadHistory(run.context); flushLeadHistory(); // Merge newer observations from other tabs before a report.
       progress('Reading your phone numbers…');
       try {
-        const inventory = await leadReportRequest(run, 'numbers');
-        if (!Array.isArray(inventory.numbers) || !Number.isInteger(inventory.total) || inventory.total !== inventory.numbers.length) throw new Error('Incomplete phone number inventory.');
-        const seen = new Set(), pool = [];
-        for (const number of inventory.numbers) {
-          if (!number || typeof number.phoneNumber !== 'string' || !/^\+[1-9]\d{6,14}$/.test(number.phoneNumber)
-            || seen.has(number.phoneNumber) || !(number.linkedUser == null || typeof number.linkedUser === 'string')
-            || typeof number.capabilities?.voice !== 'boolean') throw new Error('Invalid phone number inventory.');
-          seen.add(number.phoneNumber);
-          if (number.linkedUser === run.context.user && number.capabilities.voice === true) pool.push(number.phoneNumber);
-        }
-        if (!pool.length) throw new Error('No voice numbers linked to your user.');
-        body = leadCallsBody(pool, [7, 30, 90].includes(Number(days)) ? Number(days) : 30);
+        body = leadCallsBody(await readLeadPhonePool(run), [7, 30, 90].includes(Number(days)) ? Number(days) : 30);
       } catch (error) { requireLeadReport(run); result.warnings.push(`Incomplete call coverage: ${error.message}`); }
       if (body) progress('Reading your calls…');
       const calls = new Set(); let total = null;
@@ -1325,11 +1358,11 @@
     return result;
   }
   function closeLeadAccessReport() {
-    cancelLeadAccessReport();
+    if (leadReportRun?.kind !== 'counter') cancelLeadAccessReport();
     if (leadReportDialog) { const { dialog, focus } = leadReportDialog; leadReportDialog = null; dialog.close(); dialog.remove(); focus?.focus(); }
   }
   function openLeadAccessReport() {
-    if (leadReportDialog || !location.pathname.includes(`/location/${LOCATION_ID}/`)) return;
+    if (leadReportDialog || leadReportRun?.kind === 'counter' || !location.pathname.includes(`/location/${LOCATION_ID}/`)) return;
     const context = leadAccessContext(), focus = document.activeElement, dialog = document.createElement('dialog');
     dialog.id = 'pertama-lead-access'; dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); dialog.setAttribute('aria-label', 'Inaccessible leads');
     dialog.innerHTML = `<style>
@@ -2560,6 +2593,55 @@
     }
   }
 
+  function invalidateOutgoingCallCounter() {
+    const view = callCounterView;
+    if (!view || view.invalid) return;
+    view.invalid = true;
+    if (view.run && leadReportRun === view.run) cancelLeadAccessReport();
+    view.dialog.querySelector('[data-call-count-rows]').replaceChildren();
+    view.dialog.querySelector('[data-call-count-load]').disabled = true;
+    view.dialog.querySelector('[data-call-count-status]').textContent = 'Session changed. Reopen settings to load counts.';
+  }
+  function setupOutgoingCallCounter(dialog) {
+    const view = { dialog, context: leadAccessContext(), run: null, invalid: false }; callCounterView = view;
+    const button = dialog.querySelector('[data-call-count-load]'), rows = dialog.querySelector('[data-call-count-rows]');
+    const status = dialog.querySelector('[data-call-count-status]'), report = dialog.querySelector('[data-lead-access]');
+    const current = () => callCounterView === view && dialog.isConnected && !view.invalid && validLeadContext(view.context);
+    button.onclick = async () => {
+      if (button.disabled) return;
+      if (!current()) { if (callCounterView === view) invalidateOutgoingCallCounter(); return; }
+      if (leadReportRun) { status.textContent = 'Wait for the running report to finish.'; return; }
+      button.disabled = true; report.disabled = true; rows.replaceChildren(); status.textContent = 'Loading call counts…';
+      try {
+        const result = await runOutgoingCallCount(view);
+        if (!current()) return;
+        const statuses = [...new Set(['completed', 'busy', 'failed', ...result.days.flatMap(day => Object.keys(day.statuses))])];
+        const labels = { completed: 'Completed', busy: 'Busy', failed: 'Failed', 'no-answer': 'No answer' };
+        const table = document.createElement('table'), head = table.createTHead().insertRow(), body = table.createTBody();
+        for (const label of ['Day · WITA', 'Total', ...statuses.map(key => Object.hasOwn(labels, key) ? labels[key] : key)]) {
+          const th = document.createElement('th'); th.scope = 'col'; th.textContent = label; head.appendChild(th);
+        }
+        for (const day of result.days) {
+          const tr = body.insertRow(), label = document.createElement('th'); label.scope = 'row'; label.textContent = day.label; tr.appendChild(label);
+          for (const value of [day.total, ...statuses.map(key => day.statuses[key] || 0)]) tr.insertCell().textContent = String(value);
+        }
+        rows.appendChild(table); button.textContent = 'Refresh';
+        status.textContent = `Updated ${new Date(result.updatedAt + 28800000).toISOString().slice(11, 16)} · WITA`;
+      } catch {
+        if (current()) { rows.replaceChildren(); status.textContent = 'Could not load call counts. Try again.'; }
+      } finally {
+        if (callCounterView === view && dialog.isConnected) {
+          if (!validLeadContext(view.context)) invalidateOutgoingCallCounter();
+          button.disabled = view.invalid; report.disabled = false;
+        }
+        view.run = null;
+      }
+    };
+    return () => {
+      if (view.run && leadReportRun === view.run) cancelLeadAccessReport();
+      if (callCounterView === view) callCounterView = null;
+    };
+  }
   function openSettings() {
     if (workflow.busy || document.getElementById('pertama-settings')) return;
     const dialog = document.createElement('dialog');
@@ -2583,6 +2665,14 @@
       #pertama-settings button:hover{background:#f2f4f7}
       #pertama-settings button[type=submit]{background:#155eef;border-color:#155eef;color:#fff}
       #pertama-settings button[type=submit]:hover{background:#004eeb}
+      #pertama-settings [data-call-count]{margin-bottom:16px}
+      #pertama-settings [data-call-count] strong{margin-right:12px;font-weight:500}
+      #pertama-settings [data-call-count-rows]{overflow-x:auto;margin-top:10px}
+      #pertama-settings [data-call-count] table{width:100%;border-collapse:collapse;font:inherit}
+      #pertama-settings [data-call-count] th,#pertama-settings [data-call-count] td{padding:8px;text-align:left;border:0;border-bottom:1px solid #eaecf0;background:transparent;white-space:nowrap}
+      #pertama-settings [data-call-count] th{font-weight:500}
+      #pertama-settings [data-call-count-status]{display:block;margin-top:6px;color:#667085;font-size:12px}
+      #pertama-settings [data-call-count] button:disabled{opacity:.6;cursor:default}
       #pertama-settings .pipeline-row{display:flex;align-items:center;gap:6px;padding:9px 0;border-bottom:1px solid #f2f4f7}
       #pertama-settings .pipeline-row label{flex:1;margin:0;min-width:0}
       #pertama-settings .rule-row{border:1px solid #eaecf0;border-radius:9px;background:#f9fafb;padding:14px;margin:10px 0;display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
@@ -2603,7 +2693,7 @@
       <label>New lead stage<select name="newLeadStage" required></select></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups preserve your other task-list filters and sorting, but only include tasks already due, with a fresh cutoff on every lookup. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
       <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Checked actions start selected in Save and next; you can override them before confirming. Stages come from the pipelines checked above. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
-      <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><section><h3>Reports</h3><button type="button" data-lead-access>Inaccessible leads →</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
+      <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><section><h3>Reports</h3><div data-call-count><strong>Outgoing calls</strong><button type="button" data-call-count-load>Load call counts</button><div data-call-count-rows></div><small data-call-count-status role="status"></small></div><button type="button" data-lead-access>Inaccessible leads →</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
     const form = dialog.querySelector('form');
     dialog.querySelector('[data-lead-access]').addEventListener('click', event => { event.currentTarget.focus(); openLeadAccessReport(); });
     const settingsContact = contactId();
@@ -2708,7 +2798,8 @@
     for (const [stage, rule] of Object.entries(settings.rules)) addRule(stage, rule);
     pipelineRoot.addEventListener('change', refreshRuleStages);
     dialog.querySelector('[data-add-rule]').addEventListener('click', () => addRule());
-    const close = () => { dialog.close(); dialog.remove(); };
+    const closeCounter = setupOutgoingCallCounter(dialog);
+    const close = () => { closeCounter(); dialog.close(); dialog.remove(); };
     dialog.querySelector('[data-cancel]').addEventListener('click', close);
     dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
     dialog.addEventListener('keydown', event => event.stopPropagation());
@@ -2976,6 +3067,7 @@
       rootsToDiscover.add(document);
     }
     if (leadReportDialog && !validLeadContext(leadReportDialog.context)) closeLeadAccessReport();
+    if (callCounterView && !validLeadContext(callCounterView.context)) invalidateOutgoingCallCounter();
     if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
       cancelLeadAccessReport();
       setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
