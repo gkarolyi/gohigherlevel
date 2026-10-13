@@ -1821,7 +1821,7 @@
     };
   }
 
-  function confirmActions({ contact, name, firstName, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions }, onConfirm = null) {
+  function confirmActions({ contact, name, firstName, phone, stage, rule, due, ownerId, taskTitle, pipelineName, stageOptions }, onConfirm = null) {
     return new Promise(resolve => {
       let closed = false, sms = null, smsLoading = false, smsError = '', smsLoadVersion = 0;
       const confirmationUser = currentUserId, confirmationRoute = stageRouteRevision;
@@ -1903,7 +1903,8 @@
         field('taskDays').setCustomValidity('');
         const date = taskDate();
         dialog.querySelector('[data-task]').textContent = !ownerId ? 'No valid contact owner assigned. Task creation is unavailable.'
-          : date ? `${taskTitle}\n${date} at 11am WITA · ${owner}` : 'Enter a whole number of days, 0 or greater.';
+          : date ? `${taskTitle}\n${date} ${new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'UTC' }).format(new Date(`${date}T00:00:00Z`))} at 11am WITA`
+            : 'Enter a whole number of days, 0 or greater.';
       }
       field('taskDays').addEventListener('input', updateTaskDate);
       dialog.querySelector('[data-recipient]').textContent = `To: ${name}${phone ? ` · ${phone}` : ''}`;
@@ -2066,11 +2067,10 @@
       const rule = Object.hasOwn(settings.rules, stage) ? settings.rules[stage]
         : { next: '', days: 2, updateStage: false };
       const ownerId = typeof contact.assignedTo === 'string' && /^[a-zA-Z0-9_-]+$/.test(contact.assignedTo) ? contact.assignedTo : '';
-      const owner = ownerId ? `Contact owner · ${ownerId}` : '';
       const due = rule.days === null ? null : futureDate(rule.days);
       const taskTitle = renderTemplate(settings.task, { name, firstName });
       progress('Awaiting confirmation…');
-      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, due, owner, ownerId, taskTitle, pipelineName, stageOptions }, choices => {
+      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, due, ownerId, taskTitle, pipelineName, stageOptions }, choices => {
         saveProgress = createSaveProgress({ name, pipelineName, choices });
         workflow.activeSaveProgress = saveProgress;
       });

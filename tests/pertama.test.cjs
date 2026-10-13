@@ -846,6 +846,23 @@ for (const invalid of ['stage', 'origin']) {
   });
 }
 
+test('task preview shows weekday and time without exposing owner ID', t => {
+  const h = harness(t);
+  h.evaluate("futureDate = days => days === 0 ? '2026-10-14' : '2026-10-15'");
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada Test', firstName: 'Ada',
+    phone: '', stage: 'New Lead', rule: { next: 'Attempted Contact', days: 0, updateStage: true }, due: '2026-10-14',
+    ownerId: 'owner-a', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Attempted Contact'] })`);
+  const dialog = h.w.document.getElementById('pertama-confirm-actions');
+  const preview = dialog.querySelector('[data-task]');
+  assert.equal(preview.textContent, 'Call Ada\n2026-10-14 Wed at 11am WITA');
+  const days = dialog.querySelector('[name="taskDays"]');
+  days.value = '1';
+  days.dispatchEvent(new h.w.Event('input', { bubbles: true }));
+  assert.equal(preview.textContent, 'Call Ada\n2026-10-15 Thu at 11am WITA');
+  dialog.querySelector('[data-cancel]').click();
+  return pending;
+});
+
 test('Robot rule permits opt-in tasks and validates a user-entered deadline', async t => {
   const h = harness(t);
   const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada Test', firstName: 'Ada',
@@ -1180,7 +1197,8 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
     const pending = h.evaluate('run()'); await flush();
     const dialog = h.w.document.getElementById('pertama-confirm-actions');
     assert.ok(dialog, h.alerts.join('\n'));
-    assert.match(dialog.querySelector('[data-task]').textContent, /Contact owner.*owner-a/);
+    assert.match(dialog.querySelector('[data-task]').textContent, /\d{4}-\d{2}-\d{2} (Mon|Tue|Wed|Thu|Fri|Sat|Sun) at 11am WITA/);
+    assert.doesNotMatch(dialog.querySelector('[data-task]').textContent, /owner-a|Contact owner/);
     const form = dialog.querySelector('form');
     form.elements.namedItem('stage').checked = true;
     form.elements.namedItem('targetStage').value = 'Robot';
