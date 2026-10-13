@@ -144,7 +144,9 @@ test('a late-mounted name is discovered with bounded retries, never broad observ
   const h = harness(t, { mounted: false }); await h.flush(); assert.equal(h.requests.length, 0);
   h.d.querySelector('main').innerHTML = header('Ada Test');
   await h.advance(1000); assertStage(h, 'New Lead');
-  assert.equal(h.timers.size, 0, 'mounted name ends discovery timers');
+  assert.deepEqual([...h.timers.keys()], [h.e('leadHistoryTimer')], 'only the bounded history write remains, not discovery');
+  await h.advance(1000);
+  assert.equal(h.timers.size, 0, 'history write drains without polling');
   const count = h.requests.length; await h.advance(60000); assert.equal(h.requests.length, count);
 });
 
@@ -165,7 +167,9 @@ test('name-only retries do not scan global controls or request contact data', as
   await h.advance(1000); assertStage(h, 'New Lead');
   assert.deepEqual(scans, []);
   assert.equal(h.requests.length, 2);
-  assert.equal(h.timers.size, 0);
+  assert.deepEqual([...h.timers.keys()], [h.e('leadHistoryTimer')], 'only one history write remains');
+  await h.advance(1000);
+  assert.equal(h.timers.size, 0, 'no discovery or history polling remains');
 });
 
 test('header discovery stops after its budget and can wake on user interaction', async t => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.10
+// @version      1.0.14
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.10';
+  const VERSION = '1.0.14';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -144,7 +144,7 @@
       identityExpires = 0;
       identityStatus = error.message;
     }
-    if (previousUser !== currentUserId) invalidateContactReads();
+    if (previousUser !== currentUserId) { closeLeadAccessReport(); invalidateContactReads(); }
   }
   function scopeLeadFilters(filters, id) {
     function removeUserFilters(items) {
@@ -278,6 +278,7 @@
     if ((!contactRead && !listRead) || saveDescription) throw new Error('Direct requests are restricted to read-only contact/lead/task lookups.');
     await wait(() => liveReadHeaders, 'live CRM session',
       () => 'No session headers observed. Reload the CRM once after installing this script.', 30000);
+    const historyContext = leadAccessContext();
     const wire = wireRequest(method, path, body);
     const diagnostic = { method, url: contactRead ? 'https://services.leadconnectorhq.com/contacts/{id}' : wire.url, started: new Date().toISOString(), status: null,
       result: 'pending', requestFields: Object.keys(body || {}) };
@@ -302,6 +303,7 @@
       diagnostic.responseFields = Object.keys(data);
       if (data.error || data.errors?.length) throw new Error('Server returned an error in its response.');
       diagnostic.result = 'response received';
+      if (path === '/objects/task/records/search') rememberLeadTasks(data, historyContext);
       return data;
     } catch (error) {
       diagnostic.result = error.name === 'AbortError' ? 'timeout' : diagnostic.status === null ? 'no HTTP response available' : 'response rejected';
@@ -541,6 +543,7 @@
   function syncStageQueue() {
     if (stageQueuePath === location.pathname) return;
     stageQueuePath = location.pathname;
+    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) closeLeadAccessReport();
     stageRouteRevision++;
     invalidateContactReads();
     refreshButtons();
@@ -699,6 +702,7 @@
       await requireVerifiedUser();
       if (!validContactRead(context)) throw new Error('Contact read became stale.');
       slot.value = normalizeContactRead(kind, data, context.id);
+      if (kind === 'details') rememberLeadContact(slot.value, leadAccessContext());
       refreshButtons();
       return slot.value;
     })();
@@ -745,6 +749,7 @@
   async function rememberContactRead(observation, data) {
     if (!observation?.kind || observation.query && !await observation.query || !reusableContactRead(observation.context)) return;
     const value = normalizeContactRead(observation.kind, data, observation.context.id);
+    if (observation.kind === 'details') rememberLeadContact(value, leadAccessContext());
     const existing = contactReads[observation.kind];
     if (!existing || !existing.pending && existing.context.started <= observation.context.started) {
       contactReads[observation.kind] = { context: observation.context, value, pending: null };
@@ -759,12 +764,14 @@
   }
   const originalFetch = window.fetch;
   window.fetch = function(input, init) {
-    let stageObservation = null, contactObservation = null;
+    let stageObservation = null, contactObservation = null, taskObservation = null;
     try {
       const request = input instanceof Request ? input : null;
       stageObservation = observeStageRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input));
       captureReadHeaders(request?.url || String(input), init?.headers || request?.headers);
       contactObservation = observeContactRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
+        () => init?.body ?? (request ? request.clone().text() : null));
+      taskObservation = observeLeadTaskRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
         () => init?.body ?? (request ? request.clone().text() : null));
       captureQuery((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
         () => init?.body ?? (request ? request.clone().text() : null));
@@ -772,6 +779,11 @@
     let result;
     try { result = originalFetch.apply(this, arguments); }
     catch (error) { finishContactWrite(contactObservation); finishStageWrite(stageObservation); throw error; }
+    if (taskObservation) result.then(async response => {
+      if (!response.ok || !validLeadContext(taskObservation.context)) return;
+      const copy = response.clone();
+      if (await taskObservation.query) rememberLeadTasks(await copy.json(), taskObservation.context);
+    }).catch(() => {});
     if (contactObservation?.write) result.then(() => finishContactWrite(contactObservation), () => finishContactWrite(contactObservation));
     else if (contactObservation) result.then(async response => {
       if (contactObservation.query && !await contactObservation.query || !validContactRead(contactObservation.context)) return;
@@ -808,6 +820,11 @@
     try {
       const info = xhrInfo.get(this);
       if (info) { captureReadHeaders(info.url, info.headers); captureQuery(info.method, info.url, () => body); }
+      const taskObservation = info ? observeLeadTaskRequest(info.method, info.url, () => body) : null;
+      if (taskObservation) this.addEventListener('loadend', async () => {
+        try { if (this.status >= 200 && this.status < 300 && await taskObservation.query && validLeadContext(taskObservation.context))
+          rememberLeadTasks(this.responseType === 'json' ? this.response : JSON.parse(this.responseText), taskObservation.context); } catch { /* Passive only. */ }
+      }, { once: true });
       contactObservation = info ? observeContactRequest(info.method, info.url, () => body) : null;
       if (contactObservation) this.addEventListener('loadend', async () => {
         if (contactObservation.write) finishContactWrite(contactObservation);
@@ -1043,11 +1060,375 @@
     requireActionApproval('task', context);
     const linked = await actionRequest('link', context);
     verifyTaskLink(linked.data, context.taskId, context.contact);
+    rememberLeadContact(context.contactRecord, { user: context.user });
+    rememberLeadTask(context.contact, { id: context.taskId, title: context.taskTitle, due: context.due, completed: false, observedAt: Date.now() }, { user: context.user });
     appendJournalEvidence('Task contact association: server confirmed');
     workflow.activeSaveProgress?.confirm('task');
     setPendingAction('link', null);
     setPendingAction('task', null);
     requireActionApproval('task', context);
+  }
+
+  // Local, bounded last-known history. Never stores credentials, phone numbers or full responses.
+  const LEAD_RETENTION = 180 * 86400000;
+  const leadHistories = new Map();
+  let leadHistoryTimer = null, leadStorageWarning = '', leadReportRun = null, leadReportDialog = null;
+  const leadId = id => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id);
+  const leadHistoryKey = user => `pertama:lead-access:${LOCATION_ID}:${user}`;
+  function leadAccessContext() { return { user: currentUserId, observedAt: Date.now() }; }
+  function validLeadContext(context) {
+    return context?.user && context.user === currentUserId && identityExpires > Date.now() / 1000
+      && location.pathname.includes(`/location/${LOCATION_ID}/`);
+  }
+  function boundedLeadHistory(rows) {
+    return (Array.isArray(rows) ? rows : []).filter(r => leadId(r?.id) && Number.isFinite(r.observedAt)
+      && r.observedAt > Date.now() - LEAD_RETENTION).sort((a, b) => b.observedAt - a.observedAt).slice(0, 2000).map(r => ({
+      id: r.id, name: typeof r.name === 'string' ? r.name.slice(0, 300) : '', observedAt: r.observedAt,
+      lastAccessible: Number.isFinite(r.lastAccessible) ? r.lastAccessible : null,
+      lastCall: Number.isFinite(r.lastCall) ? r.lastCall : null,
+      tasks: (Array.isArray(r.tasks) ? r.tasks : []).filter(t => leadId(t?.id) && typeof t.title === 'string'
+        && typeof t.completed === 'boolean' && Number.isFinite(t.observedAt) && t.observedAt > Date.now() - LEAD_RETENTION)
+        .sort((a, b) => b.observedAt - a.observedAt).slice(0, 20).map(t => ({ id: t.id, title: t.title.slice(0, 500),
+          due: typeof t.due === 'string' ? t.due.slice(0, 100) : '', completed: t.completed, observedAt: t.observedAt })),
+    }));
+  }
+  function storedLeadHistory(user) {
+    try { return boundedLeadHistory(JSON.parse(localStorage.getItem(leadHistoryKey(user)) || '[]')); }
+    catch { leadStorageWarning = 'Local history storage unavailable; history may be lost on reload.'; return []; }
+  }
+  function leadHistory(context) {
+    if (!validLeadContext(context)) return [];
+    if (!leadHistories.has(context.user)) leadHistories.set(context.user, storedLeadHistory(context.user));
+    return leadHistories.get(context.user); // Normalized on load/flush; do not clone all tasks per observation.
+  }
+  function flushLeadHistory() {
+    clearTimeout(leadHistoryTimer); leadHistoryTimer = null;
+    for (const [user, rows] of leadHistories) {
+      const merged = new Map(storedLeadHistory(user).map(r => [r.id, r]));
+      for (const row of rows) {
+        const old = merged.get(row.id);
+        const tasks = new Map((old?.tasks || []).map(t => [t.id, t]));
+        for (const task of row.tasks) if (newerLeadTask(task, tasks.get(task.id))) tasks.set(task.id, task);
+        const newer = !old || row.observedAt >= old.observedAt ? row : old;
+        const named = row.name && (!old?.name || (row.lastAccessible || 0) >= (old.lastAccessible || 0)) ? row : old;
+        merged.set(row.id, { ...newer, name: named?.name || '',
+          lastAccessible: Math.max(row.lastAccessible || 0, old?.lastAccessible || 0) || null,
+          lastCall: Math.max(row.lastCall || 0, old?.lastCall || 0) || null, tasks: [...tasks.values()] });
+      }
+      const value = boundedLeadHistory([...merged.values()]); leadHistories.set(user, value);
+      try { const serialized = JSON.stringify(value); if (localStorage.getItem(leadHistoryKey(user)) !== serialized) localStorage.setItem(leadHistoryKey(user), serialized); }
+      catch { leadStorageWarning = 'Local history storage unavailable; history may be lost on reload.'; }
+    }
+    if (leadStorageWarning && leadReportDialog && validLeadContext(leadReportDialog.context)) {
+      leadReportDialog.dialog.querySelector('[data-storage]').textContent = leadStorageWarning;
+    }
+  }
+  window.addEventListener('pagehide', flushLeadHistory);
+  function updateLeadHistory(id, context, update) {
+    if (!leadId(id) || !validLeadContext(context)) return;
+    const rows = leadHistory(context), old = rows.find(r => r.id === id);
+    const row = old || { id, name: '', lastAccessible: null, lastCall: null, observedAt: Date.now(), tasks: [] };
+    const before = JSON.stringify(row); update(row);
+    if (!old) rows.push(row);
+    if (before !== JSON.stringify(row) || !old) {
+      if (rows.length > 2000) { rows.sort((a, b) => b.observedAt - a.observedAt); rows.splice(2000); }
+      if (leadHistoryTimer === null) leadHistoryTimer = setTimeout(flushLeadHistory, 1000);
+    }
+  }
+  function rememberLeadContact(contact, context, report = false) {
+    if (contact?.locationId !== LOCATION_ID) return;
+    updateLeadHistory(contact.id, context, row => {
+      row.name = [contact.firstName, contact.lastName].filter(v => typeof v === 'string').join(' ').trim().slice(0, 300) || row.name;
+      row.lastAccessible = Date.now();
+      // A synthetic report check is not new activity and must not extend retention.
+      if (!report) row.observedAt = Date.now();
+    });
+  }
+  function newerLeadTask(task, previous) {
+    return !previous || task.observedAt > previous.observedAt
+      || task.observedAt === previous.observedAt && (task.completed || !previous.completed);
+  }
+  function rememberLeadTask(id, task, context) {
+    updateLeadHistory(id, context, row => {
+      const saved = { id: task.id, title: task.title.slice(0, 500), due: typeof task.due === 'string' ? task.due.slice(0, 100) : '',
+        completed: task.completed, observedAt: task.observedAt };
+      const index = row.tasks.findIndex(t => t.id === task.id);
+      if (!newerLeadTask(saved, row.tasks[index])) return;
+      if (index < 0) row.tasks.push(saved); else row.tasks[index] = saved;
+      row.tasks = row.tasks.filter(t => t.observedAt > Date.now() - LEAD_RETENTION).sort((a, b) => b.observedAt - a.observedAt).slice(0, 20);
+      row.observedAt = Math.max(row.observedAt, task.observedAt);
+    });
+  }
+  function completeRememberedLeadTask(id, taskId, context) {
+    const task = leadHistory(context).find(r => r.id === id)?.tasks.find(t => t.id === taskId);
+    if (task) rememberLeadTask(id, { ...task, completed: true, observedAt: Date.now() }, context);
+  }
+  function normalizedLeadTasks(data) {
+    if (!Array.isArray(data?.customObjectRecords) || !Number.isInteger(data.total) || data.total < data.customObjectRecords.length) throw new Error('Invalid task coverage.');
+    const ids = new Set();
+    return data.customObjectRecords.map(row => {
+      const relations = row?.relations?.filter(r => r?.associationId === 'TASK_CONTACT_ASSOCIATION' || r?.objectKey === 'contact');
+      if (!leadId(row?.id) || ids.has(row.id) || row.locationId !== LOCATION_ID || row.objectKey !== 'task'
+        || !Array.isArray(row.owners) || !row.owners.every(leadId) || typeof row.properties?.title !== 'string'
+        || ![0, 1, false, true].includes(row.properties.completed) || typeof row.properties.dueDate !== 'string'
+        || !Array.isArray(relations) || relations.length > 1 || relations.length === 1 && (relations[0].associationId !== 'TASK_CONTACT_ASSOCIATION'
+        || relations[0].objectKey !== 'contact' || !leadId(relations[0].recordId) || !leadId(relations[0].relationId))) throw new Error('Invalid task record.');
+      ids.add(row.id); return { row, contact: relations[0]?.recordId || null };
+    });
+  }
+  function rememberLeadTasks(data, context) {
+    if (!validLeadContext(context)) return;
+    try {
+      for (const { row, contact } of normalizedLeadTasks(data)) {
+        if (!contact) continue;
+        const known = leadHistory(context).find(r => r.id === contact)?.tasks.some(t => t.id === row.id);
+        if (row.owners.includes(context.user) || known) rememberLeadTask(contact, { id: row.id, title: row.properties.title,
+          due: row.properties.dueDate, completed: Boolean(row.properties.completed), observedAt: context.observedAt ?? Date.now() }, context);
+      }
+    } catch { /* Passive observations must never interrupt the CRM. */ }
+  }
+  function observeLeadTaskRequest(method, url, body) {
+    try {
+      const parsed = new URL(url, location.href), context = leadAccessContext();
+      if (method !== 'POST' || parsed.origin !== 'https://services.leadconnectorhq.com'
+        || parsed.pathname !== '/objects/task/records/search' || parsed.search || !validLeadContext(context)) return null;
+      return { context, query: Promise.resolve(body()).then(raw => jsonValue(raw)?.locationId === LOCATION_ID, () => false) };
+    } catch { return null; }
+  }
+  function cancelLeadAccessReport() { if (leadReportRun) { leadReportRun.cancelled = true; leadReportRun.controller?.abort(); } }
+  function requireLeadReport(run, controller) {
+    if (run !== leadReportRun || controller?.signal.aborted || run.cancelled || !validLeadContext(run.context)) throw new Error('Report cancelled or account/session changed.');
+  }
+  async function leadReportRequest(run, kind, body) {
+    requireLeadReport(run);
+    const contact = kind === 'contact', reading = contact || kind === 'numbers', backend = contact || kind === 'calls';
+    if (!['calls', 'tasks', 'contact', 'numbers'].includes(kind) || contact && !leadId(body)) throw new Error('Report endpoint rejected.');
+    if (!liveReadHeaders?.['token-id']) throw new Error('Verified CRM token-id required.');
+    const url = backend ? `https://backend.leadconnectorhq.com${contact ? `/contacts/${body}` : '/reporting/calls/get-all-phone-calls-new'}`
+      : `https://services.leadconnectorhq.com${kind === 'numbers' ? `/phone-system/numbers/v2/location/${LOCATION_ID}?includeRcsSenderIds=true` : '/objects/task/records/search'}`;
+    const controller = new AbortController(); run.controller = controller;
+    let timeout;
+    const aborted = new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new Error(run.cancelled ? 'Report cancelled.' : 'Report request timed out.')), { once: true }));
+    timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const result = await Promise.race([aborted, (async () => {
+        const response = await originalFetch.call(window, url, { method: reading ? 'GET' : 'POST',
+          headers: { ...CRM_HEADERS, version: backend ? '2021-04-15' : '2021-07-28', 'token-id': liveReadHeaders['token-id'],
+            ...(reading ? {} : { 'content-type': 'application/json' }) }, redirect: 'error', cache: 'no-store', signal: controller.signal,
+          ...(reading ? {} : { body: JSON.stringify(body) }) });
+        requireLeadReport(run, controller);
+        let data;
+        try { data = await response.json(); }
+        catch { requireLeadReport(run, controller); if ([401, 403].includes(response.status)) rejectCrmAuthorization(); throw new Error('Unreadable report response.'); }
+        requireLeadReport(run, controller);
+        if (contact && [401, 403].includes(response.status) && data?.message === 'Permission denied.'
+          && data.error === 'Unauthorized' && data.statusCode === response.status) return { denied: true };
+        if ([401, 403].includes(response.status)) { rejectCrmAuthorization(); throw new Error('CRM session rejected.'); }
+        if (!response.ok || !data || typeof data !== 'object' || data.error || data.errors?.length) throw new Error(`Report lookup failed (HTTP ${response.status}).`);
+        return data;
+      })()]);
+      requireLeadReport(run, controller); return result;
+    } finally { clearTimeout(timeout); if (run.controller === controller) run.controller = null; }
+  }
+  function leadCallsBody(selectedPool, days) {
+    return { locationId: LOCATION_ID, source: [], sourceType: [], keyword: [], landingPage: [], referrer: [], campaign: [],
+      callStatus: [], dispositions: [], deviceType: [], qualifiedLead: false, firstTime: false, duration: null, selectedPool,
+      direction: null, startDate: new Date(Date.now() - days * 86400000).toISOString(), endDate: new Date().toISOString(), userId: '', limit: 50, skip: 0 };
+  }
+  function validateLeadCalls(data) {
+    if (!Array.isArray(data?.rows) || !Number.isInteger(data.totalRows) || data.totalRows < data.rows.length
+      || !Number.isInteger(data.totalPages) || data.totalPages < 0) throw new Error('Incomplete call pagination.');
+    for (const row of data.rows) if (!leadId(row?.id) || !leadId(row.contactId) || !leadId(row.userId)
+      || row.locationId !== LOCATION_ID || !Number.isFinite(Date.parse(row.dateAdded))) throw new Error('Invalid call record.');
+  }
+  async function runLeadAccessReport(days = 30, progress = () => {}) {
+    if (leadReportRun) throw new Error('Report already running.');
+    const run = { context: leadAccessContext(), cancelled: false, controller: null }; leadReportRun = run;
+    const result = { rows: [], warnings: [], complete: false, cancelled: false, checked: 0 };
+    const candidates = new Set();
+    let body;
+    try {
+      requireLeadReport(run);
+      leadHistory(run.context); flushLeadHistory(); // Merge newer observations from other tabs before a report.
+      progress('Reading your phone numbers…');
+      try {
+        const inventory = await leadReportRequest(run, 'numbers');
+        if (!Array.isArray(inventory.numbers) || !Number.isInteger(inventory.total) || inventory.total !== inventory.numbers.length) throw new Error('Incomplete phone number inventory.');
+        const seen = new Set(), pool = [];
+        for (const number of inventory.numbers) {
+          if (!number || typeof number.phoneNumber !== 'string' || !/^\+[1-9]\d{6,14}$/.test(number.phoneNumber)
+            || seen.has(number.phoneNumber) || !(number.linkedUser == null || typeof number.linkedUser === 'string')
+            || typeof number.capabilities?.voice !== 'boolean') throw new Error('Invalid phone number inventory.');
+          seen.add(number.phoneNumber);
+          if (number.linkedUser === run.context.user && number.capabilities.voice === true) pool.push(number.phoneNumber);
+        }
+        if (!pool.length) throw new Error('No voice numbers linked to your user.');
+        body = leadCallsBody(pool, [7, 30, 90].includes(Number(days)) ? Number(days) : 30);
+      } catch (error) { requireLeadReport(run); result.warnings.push(`Incomplete call coverage: ${error.message}`); }
+      if (body) progress('Reading your calls…');
+      const calls = new Set(); let total = null;
+      for (let page = 0; body; page++) {
+        if (page === 100) throw new Error('Call coverage capped at 5,000 records.');
+        const data = await leadReportRequest(run, 'calls', { ...body, skip: page * 50 }); validateLeadCalls(data);
+        if (total !== null && total !== data.totalRows) throw new Error('Call totals changed during pagination.'); total = data.totalRows;
+        let added = 0;
+        for (const row of data.rows) {
+          if (calls.has(row.id)) continue; calls.add(row.id); added++;
+          const date = Date.parse(row.dateAdded);
+          if (row.userId !== run.context.user || date < Date.parse(body.startDate) || date > Date.parse(body.endDate)) continue;
+          candidates.add(row.contactId);
+          updateLeadHistory(row.contactId, run.context, saved => { saved.lastCall = Math.max(saved.lastCall || 0, date); saved.observedAt = Math.max(saved.observedAt, date); });
+        }
+        if (calls.size === total) break;
+        if (!added || data.rows.length !== 50 || (page + 1) * 50 >= total) throw new Error('Repeated or incomplete call pages.');
+      }
+      progress('Reading pending tasks…');
+      try {
+        const seen = new Set(); let taskTotal = null;
+        for (let page = 1; ; page++) {
+          if (page > 100) throw new Error('Task coverage capped at 10,000 records.');
+          const taskContext = { ...run.context, observedAt: Date.now() };
+          const data = await leadReportRequest(run, 'tasks', { locationId: LOCATION_ID, page, pageLimit: 100,
+            filters: [{ field: 'properties.completed', operator: 'eq', value: 0 }],
+            sort: [{ field: 'properties.dueDate', direction: 'asc' }], includeTopRelations: true, includeRecurringTaskConfigs: true });
+          const rows = normalizedLeadTasks(data);
+          if (taskTotal !== null && taskTotal !== data.total) throw new Error('Task totals changed.'); taskTotal = data.total;
+          for (const { row, contact } of rows) {
+            if (seen.has(row.id)) throw new Error('Repeated task page.'); seen.add(row.id);
+            if (contact && row.owners.includes(run.context.user) && !row.properties.completed) candidates.add(contact);
+          }
+          rememberLeadTasks(data, taskContext);
+          if (seen.size === taskTotal) break;
+          if (rows.length !== 100 || page * 100 >= taskTotal) throw new Error('Incomplete task pages.');
+        }
+      } catch (error) { requireLeadReport(run); result.warnings.push(`Incomplete task coverage: ${error.message}`); }
+      flushLeadHistory(); // Include cross-tab follow-ups written while list requests were in flight; prune expired history.
+      for (const row of leadHistory(run.context)) if (row.tasks.some(t => !t.completed)) candidates.add(row.id);
+      for (const id of candidates) {
+        requireLeadReport(run); progress(`Checking contacts ${result.checked + 1}/${candidates.size}…`);
+        try {
+          const data = await leadReportRequest(run, 'contact', id);
+          if (data.denied) {
+            const saved = leadHistory(run.context).find(r => r.id === id);
+            result.rows.push({ id, name: saved?.name || id, lastCall: saved?.lastCall, lastAccessible: saved?.lastAccessible,
+              tasks: (saved?.tasks || []).filter(t => !t.completed) });
+          } else rememberLeadContact(normalizeContactRead('details', data, id), run.context, true);
+        } catch (error) { requireLeadReport(run); result.warnings.push(`Unresolved contact ${id}: ${error.message}`); }
+        result.checked++;
+      }
+      if (result.rows.length && body) { progress('Revalidating CRM session…'); validateLeadCalls(await leadReportRequest(run, 'calls', body)); }
+      requireLeadReport(run); result.complete = result.warnings.length === 0;
+    } catch (error) { result.rows = []; result.cancelled = run.cancelled; result.warnings.push(error.message); }
+    finally { if (leadReportRun === run) leadReportRun = null; }
+    flushLeadHistory(); // A quota failure must be visible before returning a completed report.
+    if (leadStorageWarning) { result.warnings.push(leadStorageWarning); result.complete = false; }
+    return result;
+  }
+  function closeLeadAccessReport() {
+    cancelLeadAccessReport();
+    if (leadReportDialog) { const { dialog, focus } = leadReportDialog; leadReportDialog = null; dialog.close(); dialog.remove(); focus?.focus(); }
+  }
+  function openLeadAccessReport() {
+    if (leadReportDialog || !location.pathname.includes(`/location/${LOCATION_ID}/`)) return;
+    const context = leadAccessContext(), focus = document.activeElement, dialog = document.createElement('dialog');
+    dialog.id = 'pertama-lead-access'; dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); dialog.setAttribute('aria-label', 'Inaccessible leads');
+    dialog.innerHTML = `<style>
+      #pertama-lead-access{box-sizing:border-box;width:800px;max-width:calc(100vw - 32px);max-height:85vh;overflow:auto;border:1px solid #e4e7ec;border-radius:14px;padding:24px;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#182230;background:#fff;box-shadow:0 24px 60px #10182830}
+      #pertama-lead-access::backdrop{background:#10182866}
+      #pertama-lead-access *{box-sizing:border-box}
+      #pertama-lead-access [hidden]{display:none!important}
+      #pertama-lead-access h2{margin:0;padding-right:40px;font-size:22px;font-weight:600;line-height:1.3;color:#182230}
+      #pertama-lead-access p{margin:16px 0;color:#667085;font-size:13px;line-height:1.5}
+      #pertama-lead-access .report-toolbar{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;margin-top:24px}
+      #pertama-lead-access label{display:block;margin:0;color:#344054;font-size:13px;font-weight:500}
+      #pertama-lead-access select,#pertama-lead-access button{padding:9px 11px;border:1px solid #d0d5dd;border-radius:7px;background:#fff;color:#344054;font:inherit;line-height:1.5;margin:0;box-shadow:0 1px 2px #10182805}
+      #pertama-lead-access select{display:block;margin-top:5px;min-width:170px;color:#182230}
+      #pertama-lead-access button{cursor:pointer;font-weight:500}
+      #pertama-lead-access button:hover{background:#f2f4f7}
+      #pertama-lead-access select:focus-visible,#pertama-lead-access button:focus-visible,#pertama-lead-access a:focus-visible{outline:2px solid #84adff;outline-offset:2px}
+      #pertama-lead-access [data-run]{margin-left:auto;background:#155eef;border-color:#155eef;color:#fff}
+      #pertama-lead-access [data-run]:hover{background:#004eeb}
+      #pertama-lead-access :disabled{opacity:.6;cursor:default}
+      #pertama-lead-access [data-close]{position:absolute;top:16px;right:16px;padding:4px 10px;border:0;background:transparent;font-size:24px;box-shadow:none}
+      #pertama-lead-access [data-warning],#pertama-lead-access [data-storage]{margin:8px 0;color:#93370d;font-size:12px}
+      #pertama-lead-access [data-warning]:empty,#pertama-lead-access [data-storage]:empty{display:none}
+      #pertama-lead-access [data-rows]{max-width:100%;overflow-x:auto}
+      #pertama-lead-access table{width:100%;min-width:620px;border-collapse:collapse;table-layout:fixed;font:inherit;color:#182230;background:#fff;border:0}
+      #pertama-lead-access th,#pertama-lead-access td{padding:12px;text-align:left;vertical-align:top;border:0;border-bottom:1px solid #eaecf0;background:transparent;line-height:1.5}
+      #pertama-lead-access th{background:#f9fafb;color:#667085;font-size:12px;font-weight:500}
+      #pertama-lead-access th:nth-child(1){width:28%}#pertama-lead-access th:nth-child(2){width:16%}#pertama-lead-access th:nth-child(3){width:36%}#pertama-lead-access th:nth-child(4){width:20%}
+      #pertama-lead-access a{color:#155eef;text-decoration:none;overflow-wrap:anywhere}
+      #pertama-lead-access small{display:block;color:#667085;font-size:12px;overflow-wrap:anywhere}
+      #pertama-lead-access .report-task{height:48px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #pertama-lead-access .report-time{display:block;color:#667085;font-size:12px}
+      </style><h2>Inaccessible leads</h2><button type="button" data-close aria-label="Close" title="Close">×</button>
+      <div class="report-toolbar"><label>Calls from<select><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option></select></label><button type="button" data-run>Run report</button><button type="button" data-cancel hidden disabled>Cancel</button></div>
+      <p role="status"></p><p data-warning role="alert"></p><p data-storage role="alert"></p><div data-rows></div>`;
+    leadReportDialog = { dialog, focus, context }; document.body.appendChild(dialog); dialog.showModal();
+    const run = dialog.querySelector('[data-run]'), cancel = dialog.querySelector('[data-cancel]'), status = dialog.querySelector('[role="status"]'), rows = dialog.querySelector('[data-rows]');
+    const period = dialog.querySelector('select'), warning = dialog.querySelector('[data-warning]');
+    status.textContent = 'Choose a period and run the report.';
+    dialog.querySelector('[data-storage]').textContent = leadStorageWarning;
+    const date = (value, due = false) => {
+      if (value === null || value === undefined || value === '') return ['—', ''];
+      const dateOnly = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+      const parsed = new Date(dateOnly ? `${value}T11:00:00+08:00` : value);
+      if (!Number.isFinite(parsed.getTime()) || dateOnly && parsed.toISOString().slice(0, 10) !== value) return ['—', ''];
+      const options = { timeZone: 'Asia/Makassar' };
+      const year = new Intl.DateTimeFormat('en-GB', { ...options, year: 'numeric' });
+      const day = new Intl.DateTimeFormat('en-GB', { ...options, day: 'numeric', month: 'short', ...(year.format(parsed) !== year.format(new Date()) ? { year: 'numeric' } : {}) }).format(parsed);
+      const hour = new Intl.DateTimeFormat('en-GB', { ...options, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(parsed);
+      const fullDay = new Intl.DateTimeFormat('en-GB', { ...options, day: 'numeric', month: 'short', year: 'numeric' }).format(parsed);
+      return [day, due ? hour : '', `${fullDay}, ${hour} WITA`];
+    };
+    const showWarnings = messages => {
+      warning.title = messages.join('\n');
+      const labels = messages.filter(message => message !== leadStorageWarning).map(message =>
+        /task coverage/i.test(message) ? 'Task lookup failed.' : /Unresolved contact/i.test(message) ? 'Some contacts could not be checked.'
+        : /timed out/i.test(message) ? 'Request timed out.' : /call/i.test(message) ? 'Call lookup failed.' : 'Report could not be completed.');
+      warning.textContent = labels.length ? `${[...new Set(labels)].join(' ')} Results may be incomplete.` : '';
+    };
+    dialog.querySelector('[data-close]').onclick = closeLeadAccessReport; cancel.onclick = cancelLeadAccessReport;
+    dialog.addEventListener('cancel', event => { event.preventDefault(); closeLeadAccessReport(); });
+    run.onclick = async () => {
+      if (run.disabled) return;
+      run.disabled = true; period.disabled = true; cancel.disabled = false; cancel.hidden = false; rows.replaceChildren(); showWarnings([]);
+      try {
+        const result = await runLeadAccessReport(Number(dialog.querySelector('select').value), message => { status.textContent = message; });
+        if (leadReportDialog?.dialog !== dialog) return;
+        if (!validLeadContext(context)) { closeLeadAccessReport(); return; }
+        status.textContent = result.cancelled ? 'Report cancelled.' : `${result.rows.length} inaccessible · ${result.checked} checked`;
+        if (!result.cancelled) showWarnings(result.warnings.length || result.complete ? result.warnings : ['Report incomplete.']);
+        if (!result.rows.length) {
+          if (result.complete && !result.cancelled) rows.textContent = 'No inaccessible contacts found.';
+          return;
+        }
+        const table = document.createElement('table');
+        table.innerHTML = '<thead><tr><th scope="col">Contact</th><th scope="col">Last call</th><th scope="col">Remembered follow-up</th><th scope="col">Due</th></tr></thead><tbody></tbody>';
+        for (const row of result.rows) {
+          const tr = document.createElement('tr'), contact = document.createElement('td'), lastCall = document.createElement('td'), tasks = document.createElement('td'), due = document.createElement('td');
+          const link = document.createElement('a'), id = document.createElement('small');
+          link.href = `/v2/location/${LOCATION_ID}/contacts/detail/${encodeURIComponent(row.id)}`;
+          link.textContent = row.name?.trim() && row.name !== row.id ? row.name : 'Name unavailable';
+          id.textContent = row.id; contact.append(link, id);
+          const [callDay, , callDetails] = date(row.lastCall); lastCall.textContent = callDay;
+          if (callDetails) lastCall.title = callDetails;
+          for (const task of row.tasks) {
+            const title = document.createElement('div'), deadline = document.createElement('div'), time = document.createElement('span');
+            title.className = deadline.className = 'report-task'; title.textContent = task.title; title.title = task.title;
+            const [day, hour, details] = date(task.due, true); deadline.textContent = day;
+            time.className = 'report-time'; time.textContent = hour; deadline.appendChild(time);
+            if (details) deadline.title = details;
+            tasks.appendChild(title); due.appendChild(deadline);
+          }
+          if (!row.tasks.length) { tasks.textContent = '—'; due.textContent = '—'; }
+          tr.append(contact, lastCall, tasks, due); table.querySelector('tbody').appendChild(tr);
+        }
+        rows.appendChild(table);
+      } catch (error) { status.textContent = 'Report incomplete.'; showWarnings([error.message]); }
+      finally { run.disabled = false; period.disabled = false; cancel.disabled = true; cancel.hidden = true; }
+    };
+    run.focus();
   }
 
   // Small DOM helpers. Selectors come from the recordings and inspected CRM UI.
@@ -1482,6 +1863,7 @@
       const data = await response.json();
       if (data?.succeded !== true || data.error || data.errors?.length) throw new Error('Completion acknowledgment missing.');
       diagnostic.result = 'completion accepted';
+      completeRememberedLeadTask(context.id, taskId, { user: context.user });
       // Preserve known acceptance even if navigation/session changed while the request was in flight.
       appendJournalEvidence(`Call task completion accepted: ${taskId}; readback not yet verified.`);
       saveCheckpoint();
@@ -2221,8 +2603,9 @@
       <label>New lead stage<select name="newLeadStage" required></select></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups preserve your other task-list filters and sorting, but only include tasks already due, with a fresh cutoff on every lookup. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
       <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Checked actions start selected in Save and next; you can override them before confirming. Stages come from the pipelines checked above. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
-      <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
+      <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><section><h3>Reports</h3><button type="button" data-lead-access>Inaccessible leads →</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
     const form = dialog.querySelector('form');
+    dialog.querySelector('[data-lead-access]').addEventListener('click', event => { event.currentTarget.focus(); openLeadAccessReport(); });
     const settingsContact = contactId();
     const checkpointSection = dialog.querySelector('[data-checkpoint]');
     if (settingsContact && location.pathname.includes(`/location/${LOCATION_ID}/`)
@@ -2592,7 +2975,9 @@
       stopDiscovery(); discoveryExpired = false;
       rootsToDiscover.add(document);
     }
+    if (leadReportDialog && !validLeadContext(leadReportDialog.context)) closeLeadAccessReport();
     if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
+      cancelLeadAccessReport();
       setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
       hostObserver.disconnect(); stopDiscovery(); widthObserver?.disconnect();
       observedWidthTarget = null; observedWidth = null;

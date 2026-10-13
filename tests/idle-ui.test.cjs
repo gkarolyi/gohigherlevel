@@ -12,6 +12,7 @@ const CONTACT = `/v2/location/${LOCATION}/contacts/detail/contact-a`;
 const RUN = 'pertama-no-answer-button';
 const NEXT = 'pertama-next-lead-button';
 const SETTINGS = 'pertama-settings-button';
+const REPORT = 'pertama-lead-access-button';
 const sidebarHosts = '<aside id="sidebar"><nav><a id="hub">Message hub</a><a id="settings-anchor">Settings</a></nav></aside>';
 const toolbarHost = '<header><button id="tb_business">Companies</button></header>';
 const hosts = `${sidebarHosts}${toolbarHost}`;
@@ -110,6 +111,7 @@ function harness(t, { mounted = true, toolbar = true, route = CONTACT, hidden = 
 }
 function assertPlacement(h) {
   for (const id of [RUN, NEXT, SETTINGS]) assert.ok(h.button(id), `${id} must be mounted`);
+  assert.equal(h.button(REPORT), null, 'report must not appear in sidebar');
   assert.equal(h.button('tb_business').nextElementSibling, h.button(RUN));
   assert.equal(h.button('hub').nextElementSibling, h.button(NEXT));
   assert.equal(h.button('settings-anchor').previousElementSibling, h.button(SETTINGS));
@@ -264,14 +266,14 @@ test('initial wrong-account route does no anchor scans or placement', async t =>
   const h = harness(t, { route: '/v2/location/other/contacts/detail/contact-a' }); await h.flush();
   assert.equal(h.counts.scans, 0);
   assert.equal(h.counts.visibility + h.counts.geometry, 0);
-  for (const id of [RUN, NEXT, SETTINGS]) assert.ok(!h.button(id) || h.button(id).hidden, `${id} must not appear in another account`);
+  for (const id of [RUN, NEXT, SETTINGS, REPORT]) assert.ok(!h.button(id) || h.button(id).hidden, `${id} must not appear in another account`);
   h.w.history.pushState({}, '', CONTACT); await h.flush(); assertPlacement(h);
 });
 
 test('history and popstate hide wrong-account controls and restore the correct account', async t => {
   const h = harness(t); await h.flush(); h.reset();
   h.w.history.replaceState({}, '', '/v2/location/other/contacts/detail/contact-a'); await h.flush();
-  for (const id of [RUN, NEXT, SETTINGS]) assert.ok(!h.button(id) || h.button(id).hidden);
+  for (const id of [RUN, NEXT, SETTINGS, REPORT]) assert.ok(!h.button(id) || h.button(id).hidden);
   assert.equal(h.counts.scans, 0);
   h.w.history.pushState({}, '', CONTACT); await h.flush(); assertPlacement(h);
   // Dispatch popstate independently of the wrapped history methods.
@@ -356,6 +358,7 @@ test('route changes restart expired toolbar discovery and leaving the account te
   h.reset(); await h.advance(60000);
   assert.equal(h.counts.scans + h.counts.visibility + h.counts.geometry, 0);
   for (const id of [NEXT, SETTINGS]) assert.equal(h.button(id).hidden, true);
+  assert.equal(h.button(REPORT), null);
 });
 
 test('hidden tabs defer refresh and host repair until visibility resumes', async t => {
