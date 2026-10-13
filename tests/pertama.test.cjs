@@ -18,7 +18,7 @@ const QUEUE_KEY = `pertama:stage-queue:${LOCATION}`;
 const queue = { contactId: 'contact-a', opportunityId: 'opp-a', pipelineId: 'pipe-a', stageId: 'stage-atc' };
 const pipelines = [{ id: 'pipe-a', name: 'Sales', stages: { 'New Lead': 'stage-new', 'Attempted Contact': 'stage-atc', Robot: 'stage-robot' } }];
 const plain = value => JSON.parse(JSON.stringify(value));
-function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = false } = {}) {
+function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = false, storedSettings } = {}) {
   const virtualConsole = new VirtualConsole();
   const navigationErrors = [];
   virtualConsole.on('jsdomError', error => { if (/navigation/i.test(error.message)) navigationErrors.push(error); });
@@ -49,6 +49,7 @@ function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = f
   w.alert = message => alerts.push(message);
   for (const [key, value] of Object.entries(session)) w.sessionStorage.setItem(key, value);
   w.localStorage.setItem(`pertama:pipelines:${LOCATION}`, JSON.stringify({ pipelines }));
+  if (storedSettings) w.localStorage.setItem(`pertama:settings:${LOCATION}`, JSON.stringify(storedSettings));
   const evaluate = evaluateUserscript(w, source);
   evaluate('initializeButtons()');
   const claims = { user_id: 'user-a', sub: 'user-a', locations: [LOCATION], exp: Math.floor(Date.now() / 1000) + 3600 };
@@ -73,7 +74,8 @@ test('progress controller preserves evidence, blocks dismissal and reattaches st
   const row = key => d.querySelector(`[data-action="${key}"]`);
   assert.equal(d.open, true);
   assert.equal(d.querySelector('b'), null);
-  assert.equal(row('complete'), null);
+  assert.equal(row('complete').dataset.state, 'waiting');
+  for (const el of d.querySelectorAll('[data-action]')) assert.equal(el.querySelector('small').textContent, 'Checking');
   assert.equal(d.querySelector('[data-close]').hidden, true);
   assert.equal(d.querySelector('[data-footer]'), null, 'no redundant navigation status below the actions');
   assert.equal(d.querySelector('[data-live]').getAttribute('class'), 'visually-hidden', 'screen-reader announcements remain off screen');
@@ -84,7 +86,6 @@ test('progress controller preserves evidence, blocks dismissal and reattaches st
   assert.equal(d.querySelector('[data-rows]').nextElementSibling?.hasAttribute('data-report'), true, 'only the hidden error report follows the action rows');
   const cancel = new h.w.Event('cancel', { cancelable: true }); d.dispatchEvent(cancel);
   assert.equal(cancel.defaultPrevented, true);
-  p.addCompletion(); p.addCompletion();
   assert.equal(d.querySelectorAll('[data-action="complete"]').length, 1);
   p.start('stage', 'Saving…'); p.dispatched('stage'); p.confirm('stage'); p.fail('stage');
   assert.equal(row('stage').dataset.state, 'confirmed');
@@ -102,6 +103,66 @@ test('progress controller preserves evidence, blocks dismissal and reattaches st
   assert.equal(d.querySelector('[data-close]').hidden, false);
   d.querySelector('[data-close]').click(); assert.equal(d.isConnected, false);
 });
+
+for (const choices of [{ note: true, sms: true }, {}]) {
+  test(`progress immediately shows fixed rows with exact initial labels: ${JSON.stringify(choices)}`, t => {
+    const h = harness(t);
+    const p = h.evaluate(`createSaveProgress({ name: 'Ada', pipelineName: 'Sales', choices: ${JSON.stringify(choices)} })`);
+    const d = h.w.document.querySelector('#pertama-save-progress');
+    const rows = [...d.querySelectorAll('[data-action]')];
+    assert.deepEqual(rows.map(row => row.dataset.action), ['stage', 'note', 'complete', 'task', 'sms']);
+    for (const row of rows) {
+      const waiting = row.dataset.action === 'complete' || choices[row.dataset.action];
+      assert.equal(row.hidden, false);
+      assert.equal(row.dataset.state, waiting ? 'waiting' : 'skipped');
+      assert.equal(row.querySelector('small').textContent, waiting ? 'Checking' : 'Skipped');
+      assert.equal(row.querySelector('[data-icon]').textContent, waiting ? '○' : '–');
+    }
+    p.skip('complete');
+    p.stop('Save failed');
+    assert.deepEqual([...d.querySelectorAll('[data-action]')], rows);
+    for (const row of rows) {
+      const selected = choices[row.dataset.action];
+      assert.equal(row.dataset.state, selected ? 'blocked' : 'skipped');
+      assert.equal(row.querySelector('small').textContent, selected ? 'Not run' : 'Skipped');
+    }
+  });
+}
+
+for (const matchingTask of [false, true]) {
+  test(`Save and next resolves completion on the original row: matching task ${matchingTask}`, async t => {
+    let completed = false;
+    const h = harness(t, { fetchResponse: request => {
+      assert.equal(request.method, 'PUT');
+      assert.deepEqual(request.body, { completed: true, ids: ['call-a'] });
+      completed = true;
+      return { succeded: true };
+    } });
+    apiContactFixture(h);
+    let release;
+    h.w.__lookupGate = new Promise(resolve => { release = resolve; });
+    h.w.__taskRows = () => matchingTask ? [{ id: 'call-a', properties: { title: 'Call Ada Test', completed },
+      relations: [{ associationId: 'TASK_CONTACT_ASSOCIATION', relationId: 'relation-a' }] }] : [];
+    h.evaluate(`settings.task = 'Call {fullName}';
+      readCallTasks = async () => { await __lookupGate; return { rows: __taskRows(), total: __taskRows().length }; };
+      findNextActionable = async () => { throw new Error('Keep results visible'); };`);
+    const pending = h.evaluate('run()'); await flush();
+    const form = h.w.document.querySelector('#pertama-confirm-actions form');
+    for (const key of ['stage', 'note', 'task', 'sms']) form.elements.namedItem(key).checked = false;
+    form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
+    const d = h.w.document.querySelector('#pertama-save-progress');
+    const rows = [...d.querySelectorAll('[data-action]')];
+    assert.deepEqual(rows.map(row => row.dataset.action), ['stage', 'note', 'complete', 'task', 'sms']);
+    await flush();
+    assert.equal(rows[2].querySelector('small').textContent, 'Checking', 'lookup remains pending');
+    release(); await pending;
+    assert.deepEqual([...d.querySelectorAll('[data-action]')], rows, 'lookup never inserts or replaces rows');
+    assert.equal(rows[2].dataset.state, matchingTask ? 'confirmed' : 'skipped');
+    assert.equal(rows[2].querySelector('small').textContent, matchingTask ? 'Confirmed' : 'Skipped');
+    assert.equal(completed, matchingTask);
+    for (const row of rows.filter(row => row.dataset.action !== 'complete')) assert.equal(row.dataset.state, 'skipped');
+  });
+}
 
 function hit(contactId = 'contact-b', opportunityId = 'opp-b', overrides = {}) {
   return { _id: opportunityId, _source: { contactId, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', locationId: LOCATION, ...overrides } };
@@ -620,6 +681,119 @@ test('same-stage lookup requires verified identity before sending a request', as
   assert.equal(h.requests.length, 0);
 });
 
+for (const key of ['addNote', 'addTask', 'sendSms']) {
+  test(`settings validate optional ${key} booleans without rejecting legacy rules`, t => {
+    const h = harness(t);
+    assert.doesNotThrow(() => h.evaluate('validateSettings(settings)'));
+    for (const value of [true, false]) assert.doesNotThrow(() => h.evaluate(`validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: 0, updateStage: false, ${key}: ${value} } } })`));
+    for (const value of [null, 'true', 1, {}]) {
+      assert.throws(() => h.evaluate(`validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: 0, updateStage: false, ${key}: ${JSON.stringify(value)} } } })`), /rule|boolean/i);
+    }
+  });
+}
+test('enabled task defaults require valid non-null days', t => {
+  const h = harness(t);
+  for (const days of [null, -1, 0.5, 36501, '2']) assert.throws(() => h.evaluate(`validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: ${JSON.stringify(days)}, updateStage: false, addTask: true } } })`), /days|task/i);
+  assert.doesNotThrow(() => h.evaluate("validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: null, updateStage: false, addTask: false } } })"));
+});
+
+function settingsForm(h) { h.evaluate('openSettings()'); return h.w.document.querySelector('#pertama-settings form'); }
+function submitSettings(h, form) { form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true })); }
+function change(h, field) { field.dispatchEvent(new h.w.Event('change', { bubbles: true })); }
+function savedSettings(h) { return JSON.parse(h.w.localStorage.getItem(`pertama:settings:${LOCATION}`)); }
+
+test('legacy rules migrate to explicit action defaults and reload without changing behavior', t => {
+  const h = harness(t);
+  const legacy = plain(h.evaluate('settings'));
+  const form = settingsForm(h);
+  for (const row of form.querySelectorAll('.rule-row')) {
+    const rule = legacy.rules[row.querySelector('[data-stage]').value];
+    assert.equal(row.querySelector('[data-note]')?.checked, true);
+    assert.equal(row.querySelector('[data-task]')?.checked, rule.days !== null);
+    assert.equal(row.querySelector('[data-sms]')?.checked, false);
+    assert.equal(row.querySelector('[data-update]').checked, rule.updateStage);
+  }
+  form.querySelector('[type="submit"]').click();
+  const saved = savedSettings(h);
+  for (const [stage, rule] of Object.entries(legacy.rules)) assert.deepEqual(saved.rules[stage], { ...rule, addNote: true, addTask: rule.days !== null, sendSms: false });
+  const loaded = harness(t, { storedSettings: saved });
+  assert.deepEqual(plain(loaded.evaluate('settings')), saved);
+});
+
+test('rule stage selects filter selected pipelines, deduplicate stages and update live without losing values', t => {
+  const h = harness(t);
+  h.evaluate(`settings.pipelineIds = ['pipe-a']; settings.priority = 'stage';
+    settings.rules = { 'New Lead': { next: 'Robot', days: 0, updateStage: false } };
+    NAV_PIPELINES.push({ id: 'pipe-b', name: 'Other', stages: { Robot: 'other-robot', Exclusive: 'exclusive' } });`);
+  const form = settingsForm(h), row = form.querySelector('.rule-row');
+  const current = row.querySelector('[data-stage]'), next = row.querySelector('[data-next]');
+  assert.equal(current.tagName, 'SELECT'); assert.equal(next.tagName, 'SELECT');
+  assert.equal(next.disabled, false, 'suggestion remains editable with stage update off');
+  const values = select => [...select.options].filter(o => o.value).map(o => o.value);
+  assert.deepEqual(values(next), ['New Lead', 'Attempted Contact', 'Robot']);
+  const a = form.querySelector('[data-pipeline-id="pipe-a"] input'), b = form.querySelector('[data-pipeline-id="pipe-b"] input');
+  b.checked = true; change(h, b);
+  assert.deepEqual(values(next), ['New Lead', 'Attempted Contact', 'Robot', 'Exclusive']);
+  next.value = 'Exclusive'; change(h, next);
+  b.checked = false; change(h, b);
+  assert.equal(next.value, 'Exclusive');
+  assert.match(next.selectedOptions[0].textContent, /unavailable/i);
+  assert.equal(next.selectedOptions[0].disabled, true);
+  submitSettings(h, form);
+  assert.match(form.querySelector('[data-error]').textContent, /unavailable/i, 'new unavailable destinations cannot be saved');
+  next.value = 'Robot'; change(h, next);
+  a.checked = false; change(h, a);
+  assert.equal(current.value, 'New Lead'); assert.match(current.selectedOptions[0].textContent, /unavailable/i);
+  assert.equal(next.value, 'Robot'); assert.match(next.selectedOptions[0].textContent, /unavailable/i);
+  form.querySelector('[data-add-rule]').click();
+  const added = form.querySelectorAll('.rule-row')[1];
+  assert.deepEqual(values(added.querySelector('[data-next]')), [], 'new rows cannot pick another rule’s unavailable saved stage');
+  added.querySelector('button').click();
+  submitSettings(h, form);
+  assert.equal(savedSettings(h).rules['New Lead'].next, 'Robot', 'unchanged saved values allowed with no pipelines');
+});
+
+for (const days of [0, 7, null]) test(`rule task toggle preserves days ${days} and persists all action choices`, t => {
+  const h = harness(t);
+  h.evaluate(`settings.rules = { 'New Lead': { next: 'Robot', days: ${days}, updateStage: false, addNote: false, addTask: false, sendSms: true } }`);
+  const form = settingsForm(h), row = form.querySelector('.rule-row');
+  const task = row.querySelector('[data-task]'), input = row.querySelector('[data-days]');
+  assert.ok(task, 'explicit follow-up toggle');
+  assert.equal(input.closest('label').hidden, true);
+  assert.match(form.closest('dialog').querySelector('style').textContent, /#pertama-settings \[hidden\]\{display:none!important\}/, 'hidden days must override the label display:block rule');
+  assert.equal(input.value, days === null ? '' : String(days));
+  task.checked = true; change(h, task);
+  assert.equal(input.closest('label').hidden, false); assert.equal(input.required, true);
+  if (days === null) {
+    submitSettings(h, form);
+    assert.equal(savedSettings(h), null);
+    assert.match(form.querySelector('[data-error]').textContent, /days|task/i);
+  }
+  task.checked = false; change(h, task);
+  assert.equal(input.required, false);
+  assert.equal(input.value, days === null ? '' : String(days));
+  submitSettings(h, form);
+  assert.deepEqual(savedSettings(h).rules['New Lead'], { next: 'Robot', days, updateStage: false, addNote: false, addTask: false, sendSms: true });
+  const reopened = settingsForm(h).querySelector('.rule-row');
+  const toggle = reopened.querySelector('[data-task]'); toggle.checked = true; change(h, toggle);
+  assert.equal(reopened.querySelector('[data-days]').value, days === null ? '' : String(days));
+});
+
+test('current stage choices disable duplicates and save validation still rejects duplicate rules', t => {
+  const h = harness(t);
+  h.evaluate(`settings.pipelineIds = ['pipe-a']; settings.rules = { 'New Lead': { next: 'Robot', days: null, updateStage: false }, Robot: { next: 'New Lead', days: null, updateStage: true } }`);
+  const form = settingsForm(h), rows = form.querySelectorAll('.rule-row');
+  const first = rows[0].querySelector('[data-stage]'), second = rows[1].querySelector('[data-stage]');
+  assert.equal(second.tagName, 'SELECT');
+  assert.equal([...second.options].find(o => o.value === 'New Lead').disabled, true);
+  first.value = 'Attempted Contact'; change(h, first);
+  assert.equal([...second.options].find(o => o.value === 'New Lead').disabled, false);
+  second.value = 'Attempted Contact'; submitSettings(h, form);
+  assert.match(form.querySelector('[data-error]').textContent, /Duplicate stage rule/);
+  rows[0].querySelector('button').click();
+  assert.equal([...second.options].find(o => o.value === 'New Lead').disabled, false);
+});
+
 test('settings new-lead stage is picked from available pipeline stages', t => {
   const h = harness(t);
   h.evaluate('openSettings()');
@@ -845,6 +1019,40 @@ for (const invalid of ['stage', 'origin']) {
     assert.equal(h.w.sessionStorage.getItem(QUEUE_KEY), null);
   });
 }
+
+for (const defaults of [
+  { addNote: false, addTask: false, updateStage: false },
+  { addNote: true, addTask: true, updateStage: true },
+  {},
+]) test(`confirmation action defaults and manual overrides: ${JSON.stringify(defaults)}`, async t => {
+  const h = harness(t);
+  const rule = { next: 'Robot', days: 0, ...defaults };
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada', firstName: 'Ada', phone: '',
+    stage: 'New Lead', rule: ${JSON.stringify(rule)}, due: futureDate(0), ownerId: 'owner-a', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const form = h.w.document.querySelector('#pertama-confirm-actions form'), field = name => form.elements.namedItem(name);
+  for (const [action, key] of [['note', 'addNote'], ['task', 'addTask'], ['stage', 'updateStage']]) {
+    assert.equal(field(action).checked, defaults[key] !== false);
+    field(action).checked = !field(action).checked; change(h, field(action));
+  }
+  assert.equal(field('sms').checked, false);
+  assert.equal(field('taskDays').value, '0', 'retain deadline even with task off');
+  field('noteText').value = 'Manual note';
+  submitSettings(h, form);
+  const choices = await pending;
+  for (const [action, key] of [['note', 'addNote'], ['task', 'addTask'], ['stage', 'updateStage']]) assert.equal(choices[action], defaults[key] === false);
+  assert.equal(choices.due, choices.task ? h.evaluate('futureDate(0)') : null);
+});
+
+test('no matching rule preserves legacy note and follow-up defaults', async t => {
+  const h = harness(t); apiContactFixture(h);
+  h.evaluate('settings.rules = {}');
+  const pending = h.evaluate('run()'); await flush();
+  const dialog = h.w.document.querySelector('#pertama-confirm-actions');
+  assert.ok(dialog, h.alerts.join('\n'));
+  const form = dialog.querySelector('form');
+  for (const [action, checked] of [['note', true], ['stage', false], ['task', true], ['sms', false]]) assert.equal(form.elements.namedItem(action).checked, checked, action);
+  dialog.querySelector('[data-cancel]').click(); await pending;
+});
 
 test('task preview shows weekday and time without exposing owner ID', t => {
   const h = harness(t);
@@ -1297,6 +1505,7 @@ for (const ownerId of ['', 'unsafe/owner']) {
   test(`missing or invalid API owner disables only task selection: ${ownerId || 'unassigned'}`, async t => {
     const h = harness(t); apiContactFixture(h); h.pin(); fastPolling(h);
     h.w.__apiContact.assignedTo = ownerId;
+    h.evaluate("settings.rules['Attempted Contact'].addTask = true");
     const pending = h.evaluate('run()'); await flush();
     const dialog = h.w.document.getElementById('pertama-confirm-actions');
     assert.ok(dialog, h.alerts.join('\n'));
@@ -1329,16 +1538,19 @@ function deferredSmsFixture(t) {
   h.w.__smsCalls = 0;
   h.w.__smsResult = { contact: plain(h.w.__apiContact), to: h.w.__apiContact.phone,
     from: '+15555550101', fromNumbers: [{ number: '+15555550101', label: 'Your number' }], savedDraftCount: 1 };
-  h.evaluate(`globalThis.prepareSmsApi = async () => { __smsCalls++; return globalThis.__smsGate ? await __smsGate : __smsResult; };
+  h.evaluate(`globalThis.prepareSmsApi = async () => {
+    if (!document.querySelector('#pertama-confirm-actions')?.open) throw new Error('SMS loaded before confirmation was shown');
+    __smsCalls++; return globalThis.__smsGate ? await __smsGate : __smsResult; };
     prepareSmsApi = globalThis.prepareSmsApi;
     globalThis.prepareSms = async () => { __smsCalls++; return { error: 'Legacy UI preparation' }; }; prepareSms = globalThis.prepareSms;
     globalThis.sendSmsApi = async () => { globalThis.__sentSms = JSON.parse(JSON.stringify(workflow.approvedActionContext.sms)); };
     sendSmsApi = globalThis.sendSmsApi; findNextActionable = async () => null; completeCallTask = async () => {};`);
   return h;
 }
-for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inventory', 'cancel-loading', 'route-change', 'stale-result']) {
-  test(`deferred API SMS confirmation: ${mode}`, async t => {
+for (const smsDefault of [false, true]) for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inventory', 'cancel-loading', 'route-change', 'stale-result']) {
+  test(`deferred API SMS confirmation (default ${smsDefault}): ${mode}`, async t => {
     const h = deferredSmsFixture(t);
+    h.evaluate(`settings.rules['Attempted Contact'].sendSms = ${smsDefault}`);
     let release;
     if (['toggle-off', 'cancel-loading', 'stale-result'].includes(mode)) h.w.__smsGate = new Promise(resolve => { release = resolve; });
     if (mode === 'prep-failure') h.evaluate('prepareSmsApi = async () => { __smsCalls++; throw new Error("SMS inventory unavailable"); }');
@@ -1347,12 +1559,13 @@ for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inven
     const dialog = h.w.document.getElementById('pertama-confirm-actions');
     assert.ok(dialog, h.alerts.join('\n'));
     const form = dialog.querySelector('form'), sms = form.elements.namedItem('sms');
-    assert.equal(h.w.__smsCalls, 0, 'no SMS preparation before explicit opt-in');
-    assert.equal(sms.checked, false);
+    assert.equal(h.w.__smsCalls, smsDefault ? 1 : 0, 'SMS preparation follows the configured default');
+    assert.equal(sms.checked, smsDefault);
+    assert.equal(h.w.__sentSms, undefined, 'defaults never send before confirmation');
     assert.equal(sms.disabled, false);
     for (const field of ['stage', 'note', 'task']) form.elements.namedItem(field).checked = false;
     if (mode === 'cancel') { dialog.querySelector('[data-cancel]').click(); await pending; return; }
-    sms.checked = true; sms.dispatchEvent(new h.w.Event('change', { bubbles: true })); await flush();
+    if (!smsDefault) { sms.checked = true; sms.dispatchEvent(new h.w.Event('change', { bubbles: true })); await flush(); }
     assert.equal(form.elements.namedItem('smsText').hidden, false);
     assert.equal(form.elements.namedItem('smsText').rows, 7, 'expanded SMS shows several lines without manual resizing');
     assert.equal(h.w.__smsCalls, 1);

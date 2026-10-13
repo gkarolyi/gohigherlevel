@@ -285,7 +285,9 @@ for (const change of ['external write', 'route', 'auth']) {
 test('no matching old task permits follow-up creation but never completion', async t => {
   const h = harness(t, { oldTask: false }); const pending = h.run(); await flush();
   assert.deepEqual(h.writes.map(r => r.operation).sort(), ['note', 'stage', 'task']);
-  assert.equal(h.w.document.querySelector('[data-action="complete"]'), null);
+  const completion = h.w.document.querySelector('[data-action="complete"]');
+  assert.equal(completion.dataset.state, 'skipped');
+  assert.equal(completion.querySelector('small').textContent, 'Skipped');
   for (const key of ['stage', 'note', 'task', 'link']) h.gates[key].resolve();
   await pending; assert.deepEqual(h.alerts, []);
 });

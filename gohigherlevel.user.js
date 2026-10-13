@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.9
+// @version      1.0.10
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.9';
+  const VERSION = '1.0.10';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -56,6 +56,8 @@
     for (const [stage, rule] of Object.entries(value.rules)) {
       if (!stage.trim() || !rule || typeof rule.next !== 'string' || !rule.next.trim()
         || typeof rule.updateStage !== 'boolean'
+        || ['addNote', 'addTask', 'sendSms'].some(key => Object.hasOwn(rule, key) && typeof rule[key] !== 'boolean')
+        || rule.addTask === true && rule.days === null
         || rule.days !== null && (!Number.isInteger(rule.days) || rule.days < 0 || rule.days > 36500)) {
         throw new Error('Each stage rule needs a destination and whole follow-up days from 0 to 36500, or no task.');
       }
@@ -1771,21 +1773,20 @@
     const announce = message => { dialog.querySelector('[data-live]').textContent = message; };
     function render(row) {
       row.el.dataset.state = row.state;
-      row.el.querySelector('[data-icon]').textContent = { waiting: '○', running: '◌', confirmed: '✓', unverified: '⚠', failed: '×', blocked: '–' }[row.state];
+      row.el.querySelector('[data-icon]').textContent = { waiting: '○', skipped: '–', running: '◌', confirmed: '✓', unverified: '⚠', failed: '×', blocked: '–' }[row.state];
       row.el.querySelector('small').textContent = row.detail;
       announce(`${labels[row.key]}: ${row.detail}`);
     }
-    function add(key) {
-      if (rows.has(key)) return;
+    for (const key of ['stage', 'note', 'complete', 'task', 'sms']) {
       const el = document.createElement('div'); el.dataset.action = key;
       el.innerHTML = '<span data-icon aria-hidden="true"></span><div><strong></strong><small></small></div>';
       el.querySelector('strong').textContent = labels[key];
-      const row = { key, el, state: 'waiting', detail: key === 'sms' ? 'Waiting for saves' : key === 'task' ? 'Waiting for existing task check' : 'Waiting', dispatched: new Set(), created: false };
+      const selected = key === 'complete' || choices[key];
+      const row = { key, el, state: selected ? 'waiting' : 'skipped', detail: selected ? 'Checking' : 'Skipped', dispatched: new Set(), created: false };
       rows.set(key, row);
-      container.insertBefore(el, key === 'complete' ? rows.get('task')?.el || rows.get('sms')?.el || null : null);
+      container.appendChild(el);
       render(row);
     }
-    for (const key of ['stage', 'note', 'task', 'sms']) if (choices[key]) add(key);
     function remove() { if (dialog.open) dialog.close(); dialog.remove(); }
     function close() { remove(); (previousFocus?.isConnected ? previousFocus : runButton)?.focus(); }
     dialog.querySelector('[data-close]').addEventListener('click', close);
@@ -1798,7 +1799,8 @@
     }
     show();
     return {
-      addCompletion: () => add('complete'), start,
+      start,
+      skip(key) { const row = rows.get(key); if (!row || row.state !== 'waiting') return; row.state = 'skipped'; row.detail = 'Skipped'; render(row); },
       dispatched(key, operation = key) { rows.get(key)?.dispatched.add(operation); },
       created() { const row = rows.get('task'); if (row) { row.created = true; start('task', 'Linking to contact…'); } },
       confirm(key) { const row = rows.get(key); if (!row) return; row.state = 'confirmed'; row.detail = key === 'sms' ? 'Accepted by CRM; delivery not confirmed' : 'Confirmed'; render(row); },
@@ -1889,7 +1891,7 @@
       field('targetStage').value = stageOptions.includes(rule.next) ? rule.next : '';
       if (!rule.next) dialog.querySelector('[data-stage]').textContent += ' · No rule for this stage. Stage update is off by default; choose a destination to turn it on.';
       else if (!stageOptions.includes(rule.next)) dialog.querySelector('[data-stage]').textContent += ` · Suggested stage ${rule.next} is unavailable; choose a destination to update.`;
-      field('taskDays').value = due ? String(rule.days) : '';
+      field('taskDays').value = rule.days == null ? '' : String(rule.days);
       function taskDate() {
         const raw = field('taskDays').value.trim();
         const days = Number(raw);
@@ -1908,7 +1910,7 @@
       }
       field('taskDays').addEventListener('input', updateTaskDate);
       dialog.querySelector('[data-recipient]').textContent = `To: ${name}${phone ? ` · ${phone}` : ''}`;
-      field('sms').checked = false;
+      field('sms').checked = rule.sendSms === true;
       async function loadSmsOptions() {
         const version = ++smsLoadVersion;
         sms = null; smsError = ''; smsLoading = true;
@@ -1937,8 +1939,9 @@
       dialog.querySelector('[data-next]').textContent = settings.priority === 'stage'
         ? `After saving — ${stageQueueLabel()}. No other queues or tasks will be used.`
         : 'After saving: open the next lead using your selected pipelines and lead priority.';
+      field('note').checked = rule.addNote !== false;
       field('noteText').value = renderTemplate(settings.note, { firstName, name });
-      field('task').checked = Boolean(due && ownerId);
+      field('task').checked = (rule.addTask ?? Boolean(due)) && Boolean(ownerId);
       field('task').disabled = !ownerId;
       function updateFields() {
         field('targetStage').disabled = !field('stage').checked;
@@ -1953,7 +1956,7 @@
         field('smsText').required = enabled;
         form.querySelector('[type="submit"]').disabled = enabled && (smsLoading || !sms);
         dialog.querySelector('[data-sms-status]').textContent = !enabled
-          ? 'Off by default. SMS details load only when enabled.'
+          ? 'SMS details load only when enabled.'
           : smsLoading ? 'Loading SMS sender options…'
           : smsError ? `${smsError} Turn SMS off to continue with other actions.`
           : sms ? `From: ${sms.from}. Native drafts are kept untouched (${sms.savedDraftCount} saved). This sends a separate message once; delivery is not guaranteed.`
@@ -1998,6 +2001,7 @@
       document.body.appendChild(dialog);
       dialog.showModal();
       dialog.querySelector('[data-cancel]').focus();
+      if (field('sms').checked) void loadSmsOptions();
     });
   }
 
@@ -2101,7 +2105,7 @@
       if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => contact[key] !== preparedTask.contact[key])) {
         throw new Error('Contact changed during save preflight. Nothing saved.');
       }
-      if (preparedTask.task) saveProgress.addCompletion();
+      if (!preparedTask.task) saveProgress.skip('complete');
       // Every lane uses this preflight snapshot; in-flight requests cannot be recalled on failure.
       Object.assign(workflow.approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0, stopSaves: false });
       preparedTask.context.approval = workflow.approvedActionContext;
@@ -2183,6 +2187,7 @@
     dialog.innerHTML = `<style>
       #pertama-settings::backdrop{background:#10182866}
       #pertama-settings *{box-sizing:border-box}
+      #pertama-settings [hidden]{display:none!important}
       #pertama-settings form{margin:0}
       #pertama-settings h2{margin:0 0 8px;font-size:22px;font-weight:600;line-height:1.3;color:#182230}
       #pertama-settings h3{margin:24px 0 8px;padding-top:18px;border-top:1px solid #eaecf0;font-size:16px;font-weight:600;line-height:1.4;color:#182230}
@@ -2215,7 +2220,7 @@
       <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; otherwise its current pipeline and stage are inferred automatically. You will only be asked to choose a queue if multiple opportunities make it ambiguous. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
       <label>New lead stage<select name="newLeadStage" required></select></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups preserve your other task-list filters and sorting, but only include tasks already due, with a fresh cutoff on every lookup. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
-      <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Leave follow-up days blank to keep Add task off by default; you can still enable it when saving. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
+      <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Checked actions start selected in Save and next; you can override them before confirming. Stages come from the pipelines checked above. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
       <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
     const form = dialog.querySelector('form');
     const settingsContact = contactId();
@@ -2273,15 +2278,52 @@
       pipelineRoot.appendChild(row);
     }
     const ruleRoot = dialog.querySelector('[data-rules]');
+    const selectedStages = () => [...new Set([...pipelineRoot.children]
+      .filter(row => row.querySelector('input').checked)
+      .flatMap(row => Object.keys(NAV_PIPELINES.find(p => p.id === row.dataset.pipelineId)?.stages || {})))];
+    function refreshRuleStages() {
+      const stages = selectedStages();
+      const currentStages = [...ruleRoot.children].map(row => row.querySelector('[data-stage]').value);
+      for (const row of ruleRoot.children) {
+        for (const key of ['stage', 'next']) {
+          const select = row.querySelector(`[data-${key}]`), value = select.value;
+          select.replaceChildren(new Option('Select a stage…', ''), ...stages.map(stage => new Option(stage, stage)));
+          if (value && !stages.includes(value)) {
+            const unavailable = new Option(`${value} (unavailable in selected pipelines)`, value);
+            unavailable.disabled = true;
+            select.add(unavailable);
+          }
+          select.value = value;
+          if (key === 'stage') for (const option of select.options) {
+            if (option.value && option.value !== value && currentStages.includes(option.value)) option.disabled = true;
+          }
+        }
+      }
+    }
     function addRule(stage = '', rule = { next: '', days: 2, updateStage: false }) {
       const row = document.createElement('div'); row.className = 'rule-row';
-      row.innerHTML = '<label>Current stage<input data-stage required></label><label>Suggested next stage<input data-next required></label><label>Follow-up days<input data-days type="number" min="0" max="36500" step="1"></label><label><input data-update type="checkbox"> Update stage by default</label><button type="button">Remove rule</button>';
-      row.querySelector('[data-stage]').value = stage; row.querySelector('[data-next]').value = rule.next;
-      row.querySelector('[data-days]').value = rule.days === null ? '' : String(rule.days);
+      row.dataset.savedStage = stage; row.dataset.savedNext = rule.next;
+      row.innerHTML = '<label>Current stage<select data-stage required></select></label><label>Suggested next stage<select data-next required></select></label><label><input data-update type="checkbox"> Update stage</label><label><input data-note type="checkbox"> Add note</label><label><input data-task type="checkbox"> Add follow-up task</label><label><input data-sms type="checkbox"> Send SMS</label><label>Follow-up days<input data-days type="number" min="0" max="36500" step="1"></label><button type="button">Remove rule</button>';
+      row.querySelector('[data-stage]').add(new Option(stage, stage));
+      row.querySelector('[data-next]').add(new Option(rule.next, rule.next));
+      const days = row.querySelector('[data-days]'), task = row.querySelector('[data-task]');
+      days.value = rule.days === null ? '' : String(rule.days);
       row.querySelector('[data-update]').checked = rule.updateStage !== false;
-      row.querySelector('button').addEventListener('click', () => row.remove()); ruleRoot.appendChild(row);
+      row.querySelector('[data-note]').checked = rule.addNote !== false;
+      task.checked = rule.addTask ?? rule.days != null;
+      row.querySelector('[data-sms]').checked = rule.sendSms === true;
+      function updateDays() {
+        days.closest('label').hidden = !task.checked;
+        days.disabled = !task.checked;
+        days.required = task.checked;
+      }
+      updateDays(); task.addEventListener('change', updateDays);
+      row.querySelector('[data-stage]').addEventListener('change', refreshRuleStages);
+      row.querySelector('button').addEventListener('click', () => { row.remove(); refreshRuleStages(); });
+      ruleRoot.appendChild(row); refreshRuleStages();
     }
     for (const [stage, rule] of Object.entries(settings.rules)) addRule(stage, rule);
+    pipelineRoot.addEventListener('change', refreshRuleStages);
     dialog.querySelector('[data-add-rule]').addEventListener('click', () => addRule());
     const close = () => { dialog.close(); dialog.remove(); };
     dialog.querySelector('[data-cancel]').addEventListener('click', close);
@@ -2296,7 +2338,15 @@
         for (const row of ruleRoot.children) {
           const stage = row.querySelector('[data-stage]').value.trim(), rawDays = row.querySelector('[data-days]').value.trim();
           if (Object.hasOwn(next.rules, stage)) throw new Error(`Duplicate stage rule: ${stage}`);
-          next.rules[stage] = { next: row.querySelector('[data-next]').value.trim(), days: rawDays === '' ? null : Number(rawDays), updateStage: row.querySelector('[data-update]').checked };
+          const destination = row.querySelector('[data-next]').value.trim();
+          const stages = selectedStages();
+          if (stage && !stages.includes(stage) && stage !== row.dataset.savedStage
+            || destination && !stages.includes(destination) && destination !== row.dataset.savedNext) {
+            throw new Error('Stage is unavailable in selected pipelines. Choose an available stage.');
+          }
+          next.rules[stage] = { next: destination, days: rawDays === '' ? null : Number(rawDays),
+            updateStage: row.querySelector('[data-update]').checked, addNote: row.querySelector('[data-note]').checked,
+            addTask: row.querySelector('[data-task]').checked, sendSms: row.querySelector('[data-sms]').checked };
         }
         validateSettings(next);
         if (!availableStages.includes(next.newLeadStage) && next.newLeadStage !== settings.newLeadStage) throw new Error('Open the Opportunities board and reopen Settings to choose an available new-lead stage.');
