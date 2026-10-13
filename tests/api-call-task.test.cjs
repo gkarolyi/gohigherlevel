@@ -30,14 +30,75 @@ function harness(t) {
 }
 test('Save-and-next task completion keeps earlier confirmed actions in its checkpoint', async t => {
   const h = harness(t);
-  h.e("busy = true; guardedContact = 'c1'; startingContact = 'c1'; completed = ['Stage: confirmed']; saveCheckpoint()");
+  h.e("workflow.busy = true; workflow.guardedContact = 'c1'; workflow.startingContact = 'c1'; workflow.completed = ['Stage: confirmed']; saveCheckpoint()");
+  const evidence = h.e('workflow.completed');
   await h.e('completeCallTask("c1", { fromSaveAndNext: true })');
+  assert.equal(h.e('workflow.completed'), evidence);
   assert.equal(h.puts().length, 1);
   assert.match(h.checkpoint(), /Stage: confirmed/);
   assert.match(h.checkpoint(), /Call task completed and verified/);
-  assert.equal(h.e('busy'), true);
-  assert.equal(h.e('guardedContact'), 'c1');
+  assert.equal(h.e('workflow.busy'), true);
+  assert.equal(h.e('workflow.guardedContact'), 'c1');
 });
+test('standalone completion acquires ownership before the checkpoint guard without resetting prior evidence', async t => {
+  const h = harness(t);
+  h.e(`workflow.completed = ['Prior confirmation']; workflow.pendingSave = 'Prior uncertainty';
+    workflow.pendingActions = { note: 'Prior note' }; workflow.startingContact = 'prior-contact'; workflow.step = 'Prior phase';`);
+  const evidence = h.e('workflow.completed'), actions = h.e('workflow.pendingActions');
+  h.w.localStorage.setItem(`pertama:no-answer:unfinished:${L}:c1`, 'original');
+  const getItem = h.w.Storage.prototype.getItem;
+  let atCheckpoint;
+  h.w.Storage.prototype.getItem = function (key) {
+    if (key === `pertama:no-answer:unfinished:${L}:c1`) {
+      atCheckpoint = h.e('[workflow.busy, workflow.guardedContact, workflow.completed, workflow.startingContact]');
+    }
+    return getItem.call(this, key);
+  };
+  await h.run();
+  h.w.Storage.prototype.getItem = getItem;
+  assert.ok(atCheckpoint);
+  assert.equal(atCheckpoint[0], true);
+  assert.equal(atCheckpoint[1], 'c1');
+  assert.equal(atCheckpoint[2], evidence);
+  assert.equal(atCheckpoint[3], 'prior-contact');
+  assert.equal(h.e('workflow.busy'), false);
+  assert.equal(h.e('workflow.guardedContact'), null);
+  assert.equal(h.e('workflow.completed'), evidence);
+  assert.equal(h.e('workflow.pendingActions'), actions);
+  assert.equal(h.e('workflow.pendingSave'), 'Prior uncertainty');
+  assert.equal(h.e('workflow.startingContact'), 'prior-contact');
+  assert.equal(h.e('workflow.step'), 'Prior phase');
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.checkpoint(), 'original');
+});
+
+test('standalone completion resets evidence after the checkpoint guard and retains its own result', async t => {
+  const h = harness(t);
+  h.e(`workflow.completed = ['Prior confirmation']; workflow.pendingSave = 'Prior uncertainty';
+    workflow.pendingActions = { note: 'Prior note' }; workflow.startingContact = 'prior-contact';`);
+  let checked = false;
+  h.hook(c => {
+    if (c.init.method !== 'GET') return;
+    checked = true;
+    assert.equal(h.e('workflow.busy'), true);
+    assert.equal(h.e('workflow.guardedContact'), 'c1');
+    assert.equal(h.e('workflow.startingContact'), 'c1');
+    assert.equal(h.e('workflow.completed.length'), 0);
+    assert.equal(h.e('workflow.pendingSave'), '');
+    assert.equal(h.e('Object.keys(workflow.pendingActions).length'), 0);
+  });
+  await h.run();
+  assert.equal(checked, true);
+  assert.equal(h.puts().length, 1);
+  assert.equal(h.e('workflow.busy'), false);
+  assert.equal(h.e('workflow.guardedContact'), null);
+  assert.equal(h.e('workflow.startingContact'), 'c1');
+  assert.match(h.e('workflow.completed.join("\\n")'), /Call task completed and verified/);
+  assert.doesNotMatch(h.e('workflow.completed.join("\\n")'), /Prior/);
+  assert.equal(h.e('workflow.pendingSave'), '');
+  assert.equal(h.checkpoint(), null);
+});
+
 test('Call-click completes exact API task without CRM panels and journals before PUT', async t => {
   const h = harness(t);
   h.hook(c => { if (c.init.method === 'PUT') { assert.match(h.checkpoint(), /t1/); assert.match(h.checkpoint(), /Call again Ada Lee/); } });
@@ -115,7 +176,7 @@ test('timeout keeps checkpoint; concurrent and subsequent calls never repeat PUT
 test('native fetch error data is never surfaced', async t => {
   const h = harness(t); h.hook(() => {throw new Error('secret credentials');}); await h.run(); assert.doesNotMatch(h.notice(),/secret credentials/); assert.match(h.notice(),/stopped/i);
 });
-for (const state of ['busy = true','identityExpires = 0','liveReadHeaders = null','retiringContactControls = [document.body]']) test(`preflight blocks ${state}`, async t => {
+for (const state of ['workflow.busy = true','identityExpires = 0','liveReadHeaders = null','retiringContactControls = [document.body]']) test(`preflight blocks ${state}`, async t => {
   const h = harness(t); h.e(state); await h.run(); assert.equal(h.calls.length,0); assert.equal(h.checkpoint(),null);
 });
 for (const patch of [{id:'c2'},{locationId:'other'}]) test(`contact response mismatch ${JSON.stringify(patch)}`, async t => {
@@ -151,10 +212,10 @@ test('Call-task preflight overlaps contact and task reads and drains both on fai
   h.hook(c => c.init.method === 'GET' ? held : new Response('{}', { status: 500 }));
   const pending = h.run(); await h.flush();
   assert.deepEqual(h.calls.map(c => c.init.method).sort(), ['GET', 'POST']);
-  assert.equal(h.e('busy'), true);
+  assert.equal(h.e('workflow.busy'), true);
   assert.equal(h.puts().length, 0);
   release({ contact }); await pending;
-  assert.equal(h.e('busy'), false);
+  assert.equal(h.e('workflow.busy'), false);
   assert.equal(h.puts().length, 0);
 });
 

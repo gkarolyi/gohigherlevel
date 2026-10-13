@@ -70,7 +70,7 @@ for (const order of [['stage', 'note', 'complete'], ['stage', 'complete', 'note'
     const h = harness(t); const pending = h.run(); await flush();
     assert.deepEqual(h.writes.map(r => r.operation).sort(), ['complete', 'note', 'stage'], h.alerts.join('\n'));
     assert.deepEqual(Object.keys(h.checkpoint().pendingActions).sort(), ['complete', 'note', 'stage']);
-    assert.equal(h.e('busy'), true);
+    assert.equal(h.e('workflow.busy'), true);
     assert.equal(h.e('__nextCalls'), 0);
     const row = key => h.w.document.querySelector(`[data-action="${key}"]`);
     assert.equal(row('task').dataset.state, 'waiting');
@@ -90,7 +90,7 @@ for (const order of [['stage', 'note', 'complete'], ['stage', 'complete', 'note'
     assert.equal(h.checkpoint(), null);
     assert.equal(h.w.document.querySelector('#pertama-save-progress'), null);
     assert.equal(h.e('__nextCalls'), 1);
-    assert.equal(h.e('busy'), false);
+    assert.equal(h.e('workflow.busy'), false);
     assert.deepEqual(h.alerts, []);
   });
 }
@@ -103,7 +103,7 @@ for (const failed of ['stage', 'note', 'complete']) for (const reason of ['HTTP'
       : reason === 'malformed receipt' ? new Response('{}')
       : reason === 'timeout' ? new DOMException('Timed out', 'AbortError') : new Error('Lost response');
     h.gates[failed].resolve(response); await flush();
-    assert.equal(h.e('busy'), true);
+    assert.equal(h.e('workflow.busy'), true);
     assert.equal(h.e('__nextCalls'), 0);
     assert.equal(h.alerts.length, 0);
     const d = h.w.document.querySelector('#pertama-save-progress');
@@ -114,7 +114,7 @@ for (const failed of ['stage', 'note', 'complete']) for (const reason of ['HTTP'
     assert.equal(h.writes.length, 3);
     assert.equal(d.querySelector('[data-close]').hidden, false);
     assert.equal(d.querySelector('[data-action="task"]').dataset.state, 'blocked');
-    assert.equal(h.e('busy'), false);
+    assert.equal(h.e('workflow.busy'), false);
     assert.equal(h.e('contactWritesPending + stageWritesPending'), 0);
     assert.deepEqual(Object.keys(h.checkpoint().pendingActions), [failed]);
     if (failed !== 'stage') assert.match(h.checkpoint().completed.join('\n'), /Stage:.*server confirmed/);
@@ -238,16 +238,22 @@ test('a failed save drains siblings and preserves their outcomes without navigat
   const h = harness(t); const pending = h.run(); await flush();
   assert.equal(h.writes.length, 3);
   h.gates.note.resolve(new Response('{}', { status: 500 })); await flush();
-  assert.equal(h.e('busy'), true);
+  assert.equal(h.e('workflow.busy'), true);
   assert.deepEqual(h.alerts, []);
   h.gates.complete.resolve(); await flush();
   assert.equal(h.writes.some(r => r.operation === 'task'), false, 'failure stops later dispatches');
   h.gates.stage.resolve(); await pending;
-  assert.equal(h.e('busy'), false);
+  assert.equal(h.e('workflow.busy'), false);
   assert.equal(h.e('__nextCalls'), 0);
   assert.match(h.checkpoint().completed.join('\n'), /Stage:.*server confirmed/);
   assert.match(h.checkpoint().completed.join('\n'), /Call task completed and verified/);
   assert.deepEqual(Object.keys(h.checkpoint().pendingActions), ['note']);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), h.checkpoint().completed);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.pendingActions)')), h.checkpoint().pendingActions);
+  assert.equal(h.e('workflow.pendingSave'), h.checkpoint().pendingSave);
+  assert.equal(h.e('workflow.startingContact'), 'c1');
+  assert.equal(h.e('workflow.step'), 'Saving selected actions concurrently…');
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify([workflow.busy, workflow.activeSaveProgress, workflow.guardedContact, workflow.guardedStageQueue, workflow.approvedActionContext])')), [false, null, null, null, null]);
   await h.run(); assert.equal(h.writes.length, 3);
 });
 
@@ -302,7 +308,7 @@ test('preflight failure drains reads and sends no writes', async t => {
   h.hook(r => r.pathname === '/opportunities/o1' ? new Response('{}', { status: 500 })
     : r.pathname === '/objects/task/records/search' ? read.promise : undefined);
   const pending = h.run(); await flush();
-  assert.equal(h.e('busy'), true);
+  assert.equal(h.e('workflow.busy'), true);
   assert.equal(h.writes.length, 0);
   read.resolve({ customObjectRecords: [], total: 0 }); await pending;
   assert.equal(h.writes.length, 0);
@@ -321,7 +327,7 @@ test('failure to persist one lane cannot erase an already dispatched lane', asyn
   const pending = h.run(); await flush();
   assert.deepEqual(h.writes.map(r => r.operation), ['stage']);
   assert.match(h.checkpoint().pendingSave, /Stage/);
-  assert.equal(h.e('busy'), true);
+  assert.equal(h.e('workflow.busy'), true);
   h.w.Storage.prototype.setItem = original;
   h.gates.stage.resolve(); await pending;
   assert.equal(h.e('__nextCalls'), 0);

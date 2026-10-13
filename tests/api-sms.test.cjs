@@ -28,7 +28,7 @@ function harness(t) {
   };
   const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({user_id:'user1',sub:'user1',locations:[L],exp:Date.now()/1000+3600})).toString('base64url')}.x`;
-  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({'token-id':token})}); startingContact='c1'; approvedActionContext={contact:'c1',route:stageRouteRevision,user:currentUserId,epoch:contactReadEpoch,contactRecord:${JSON.stringify(contact)},actions:{sms:true},sms:{from:'${number.phoneNumber}',to:'${contact.phone}',message:'Hello'}};`);
+  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({'token-id':token})}); workflow.startingContact='c1'; workflow.approvedActionContext={contact:'c1',route:stageRouteRevision,user:currentUserId,epoch:contactReadEpoch,contactRecord:${JSON.stringify(contact)},actions:{sms:true},sms:{from:'${number.phoneNumber}',to:'${contact.phone}',message:'Hello'}};`);
   return {w,e,calls,hook:fn => {hook=fn;}, prep:()=>e('prepareSmsApi()'), send:()=>e('sendSmsApi()'), checkpoint:()=>JSON.parse(w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`)), flush:()=>new Promise(r=>setImmediate(r))};
 }
 test('sole CRM-user number becomes the SMS sender without a settings choice', async t => {
@@ -83,7 +83,7 @@ test('only conservative eligible SMS numbers; no RCS inference', async t=>{
   h.hook(c=>c.path.startsWith('/phone-system/')?{numbers,total:numbers.length,rcsSenderIds:['rcs']}:undefined);
   assert.equal((await h.prep()).fromNumbers.length,1);
 });
-for (const change of ['approvedActionContext=null','approvedActionContext.actions.sms=false','approvedActionContext.sms.from=""','approvedActionContext.sms.to="+19999999999"','approvedActionContext.sms.message=" "','pendingSave="unresolved"']) test(`send refuses ${change}`,async t=>{
+for (const change of ['workflow.approvedActionContext=null','workflow.approvedActionContext.actions.sms=false','workflow.approvedActionContext.sms.from=""','workflow.approvedActionContext.sms.to="+19999999999"','workflow.approvedActionContext.sms.message=" "','workflow.pendingSave="unresolved"']) test(`send refuses ${change}`,async t=>{
   const h=harness(t); h.e(change); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);
 });
 for (const isSpam of [true,null,undefined]) test(`spam ${isSpam} blocks send`,async t=>{
@@ -104,7 +104,7 @@ for (const patch of [{phone:'+12222222222'},{assignedTo:'other'}]) test('fresh c
 });
 test('concurrent-save approval keeps the preflight owner but still rechecks the SMS recipient', async t => {
   const h = harness(t);
-  h.e('Object.assign(approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
+  h.e('Object.assign(workflow.approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
   h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, assignedTo: 'other' } } : undefined);
   await h.send();
   assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, 1);
@@ -112,7 +112,7 @@ test('concurrent-save approval keeps the preflight owner but still rechecks the 
 
 test('a concurrent-save approval never permits a changed SMS phone number', async t => {
   const h = harness(t);
-  h.e('Object.assign(approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
+  h.e('Object.assign(workflow.approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
   h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, phone: '+12222222222' } } : undefined);
   await assert.rejects(h.send());
   assert.equal(h.calls.filter(c => c.init.method === 'POST').length, 0);
@@ -171,7 +171,7 @@ test('durable pre-send intent contains exact consent; ack storage failure cannot
     const journal=h.checkpoint().pendingSave; for(const value of [number.phoneNumber,contact.phone,'Hello'])assert.ok(journal.includes(value));
     h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}');
   }});
-  await assert.rejects(h.send()); assert.match(h.e('pendingSave'),/m1/); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
+  await assert.rejects(h.send()); assert.match(h.e('workflow.pendingSave'),/m1/); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
 });
 test('timeout aborts send once without losing intent',async t=>{
   const h=harness(t); let abort;

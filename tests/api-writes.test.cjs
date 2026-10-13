@@ -29,7 +29,7 @@ function harness(t) {
   };
   const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'user1', sub: 'user1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
-  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({ 'token-id': token })}); startingContact = 'c1'; approvedActionContext = { contact:'c1', route:stageRouteRevision, user:currentUserId, epoch:contactReadEpoch, contactRecord:${JSON.stringify(contact)}, opportunity:${JSON.stringify(opportunity)}, targetStageId:'s2', targetStageName:'Next', ownerId:'owner1', noteText:'A < B & "quoted"\nsecond line', taskTitle:'Call Ada', due:'2026-10-10', actions:{stage:true,note:true,task:true}, taskId:null };`.replace('"quoted"\nsecond', '"quoted"\\nsecond'));
+  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({ 'token-id': token })}); workflow.startingContact = 'c1'; workflow.approvedActionContext = { contact:'c1', route:stageRouteRevision, user:currentUserId, epoch:contactReadEpoch, contactRecord:${JSON.stringify(contact)}, opportunity:${JSON.stringify(opportunity)}, targetStageId:'s2', targetStageName:'Next', ownerId:'owner1', noteText:'A < B & "quoted"\nsecond line', taskTitle:'Call Ada', due:'2026-10-10', actions:{stage:true,note:true,task:true}, taskId:null };`.replace('"quoted"\nsecond', '"quoted"\\nsecond'));
   return { w, e, calls, hook: fn => { hook = fn; }, checkpoint: () => w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`), run: name => e(`${name}()`), flush: () => new Promise(resolve => setImmediate(resolve)) };
 }
 test('exact API requests, confirmed checkpoints, stage lifecycle and no CRM DOM', async t => {
@@ -40,11 +40,11 @@ test('exact API requests, confirmed checkpoints, stage lifecycle and no CRM DOM'
   assert.deepEqual(h.calls[3].body, { body:'<p>A &lt; B &amp; &quot;quoted&quot;<br>\nsecond line</p>', title:'', color:'#fef7c3', relations:[{ objectKey:'contact',recordId:'c1' }] });
   assert.deepEqual(h.calls[5].body, { locationId:L, owners:['owner1'], properties:{ title:'Call Ada', dueDate:'2026-10-10T03:00:00.000Z', completed:false, description:'', contactId:'c1' } });
   assert.equal(h.calls[3].init.headers.developer_version, undefined); assert.equal(h.calls[5].init.headers.developer_version, '');
-  assert.equal(h.e('contactReadEpoch'), epoch + 2); assert.equal(h.e('approvedActionContext.epoch'), epoch + 2);
+  assert.equal(h.e('contactReadEpoch'), epoch + 2); assert.equal(h.e('workflow.approvedActionContext.epoch'), epoch + 2);
   assert.equal(h.e('contactWritesPending + stageWritesPending'), 0);
   assert.equal(JSON.parse(h.checkpoint()).completed.length, 4); assert.equal(JSON.parse(h.checkpoint()).pendingSave, '');
 });
-for (const fn of ['saveStageApi','saveNoteApi','createTaskApi']) for (const change of ['approvedActionContext = null', 'approvedActionContext.actions = {}', 'approvedActionContext.user = "other"', 'approvedActionContext.contactRecord.locationId = "other"', 'identityExpires = 0', 'liveReadHeaders = null']) test(`${fn} refuses ${change}`, async t => {
+for (const fn of ['saveStageApi','saveNoteApi','createTaskApi']) for (const change of ['workflow.approvedActionContext = null', 'workflow.approvedActionContext.actions = {}', 'workflow.approvedActionContext.user = "other"', 'workflow.approvedActionContext.contactRecord.locationId = "other"', 'identityExpires = 0', 'liveReadHeaders = null']) test(`${fn} refuses ${change}`, async t => {
   const h = harness(t); h.e(change); await assert.rejects(h.run(fn)); assert.equal(h.calls.length, 0);
 });
 for (const [label, version, expected] of [['missing', undefined, 1], ['null', null, 1], ['zero', 0, 1],
@@ -99,7 +99,7 @@ for (const patch of [{ id:'bad/id' },{ locationId:'other' },{ owners:['user1'] }
   const h = harness(t); h.hook(c => c.path === '/objects/task/records' ? { record:{ ...c.body,id:'t1',objectKey:'task',...patch,properties:{ ...c.body.properties,...patch.properties } } } : undefined);
   await assert.rejects(h.run('createTaskApi')); assert.equal(h.calls.length, 2); assert.equal(JSON.parse(h.checkpoint()).completed.length, 0);
 });
-for (const change of ['approvedActionContext.ownerId = "user1"','approvedActionContext.due = "2026-02-30"','approvedActionContext.due = "wrong"','approvedActionContext.taskTitle = ""']) test(`invalid task approval ${change}`, async t => {
+for (const change of ['workflow.approvedActionContext.ownerId = "user1"','workflow.approvedActionContext.due = "2026-02-30"','workflow.approvedActionContext.due = "wrong"','workflow.approvedActionContext.taskTitle = ""']) test(`invalid task approval ${change}`, async t => {
   const h = harness(t); h.e(change); await assert.rejects(h.run('createTaskApi')); assert.equal(h.calls.length, 0);
 });
 test('timeout aborts once, retains journal, balances stage lifecycle', async t => {
@@ -116,9 +116,9 @@ test('native fetch exception is redacted and lifecycle ends once', async t => {
   assert.equal(h.e('contactReadEpoch'), epoch + 2); assert.equal(h.e('contactWritesPending + stageWritesPending'), 0);
 });
 test('concurrent mutation preserves confirmed stage evidence but forbids advancing approval', async t => {
-  const h = harness(t), epoch = h.e('approvedActionContext.epoch');
+  const h = harness(t), epoch = h.e('workflow.approvedActionContext.epoch');
   h.hook(c => { if (c.init.method === 'PUT') h.e(`finishContactWrite(observeContactRequest('PUT','${origin}/contacts/c1',()=>({})))`); });
-  await assert.rejects(h.run('saveStageApi')); assert.equal(JSON.parse(h.checkpoint()).completed.length, 1); assert.equal(h.e('approvedActionContext.epoch'), epoch);
+  await assert.rejects(h.run('saveStageApi')); assert.equal(JSON.parse(h.checkpoint()).completed.length, 1); assert.equal(h.e('workflow.approvedActionContext.epoch'), epoch);
 });
 test('stage automation owner change stops subsequent note and task', async t => {
   const h = harness(t); await h.run('saveStageApi');
@@ -127,7 +127,7 @@ test('stage automation owner change stops subsequent note and task', async t => 
   assert.equal(h.calls.filter(c => c.init.method === 'POST').length, 0);
 });
 test('nullable opportunity owner is normalized like approved reads', async t => {
-  const h = harness(t); h.e('approvedActionContext.opportunity.assignedTo = ""');
+  const h = harness(t); h.e('workflow.approvedActionContext.opportunity.assignedTo = ""');
   h.hook(c => c.path === '/opportunities/o1' ? { opportunity:{ ...opportunity,assignedTo:null,indexVersion:7,...c.body } } : undefined);
   await h.run('saveStageApi'); assert.equal(JSON.parse(h.checkpoint()).completed.length, 1);
 });
@@ -137,14 +137,14 @@ test('wrong association retains partial task creation', async t => {
 });
 test('transport rejects arbitrary operations and unapproved target context', async t => {
   const h = harness(t);
-  await assert.rejects(h.e('actionRequest("/conversations/messages", approvedActionContext)'));
-  await assert.rejects(h.e('actionRequest("note", {...approvedActionContext, contact:"c2"})'));
-  h.e('approvedActionContext.actions.note = false'); await assert.rejects(h.e('actionRequest("note", approvedActionContext)'));
+  await assert.rejects(h.e('actionRequest("/conversations/messages", workflow.approvedActionContext)'));
+  await assert.rejects(h.e('actionRequest("note", {...workflow.approvedActionContext, contact:"c2"})'));
+  h.e('workflow.approvedActionContext.actions.note = false'); await assert.rejects(h.e('actionRequest("note", workflow.approvedActionContext)'));
   assert.equal(h.calls.length, 0);
 });
 test('HTML note body preserves line breaks without interpreting approved markup', async t => {
   const h = harness(t);
-  h.e('approvedActionContext.noteText = "First <b>literal</b>\\nSecond"');
+  h.e('workflow.approvedActionContext.noteText = "First <b>literal</b>\\nSecond"');
   await h.run('saveNoteApi');
   const body = h.calls.find(c => c.path === '/notes/').body.body;
   const parsed = new h.w.DOMParser().parseFromString(body, 'text/html');

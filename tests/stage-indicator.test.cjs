@@ -196,7 +196,7 @@ test('background read failure stays unobtrusive and does not repeatedly retry', 
 });
 
 test('verified passive reads update the badge without additional indicator requests', async t => {
-  const h = harness(t, { auth: false }); h.e('busy = true'); h.authenticate();
+  const h = harness(t, { auth: false }); h.e('workflow.busy = true'); h.authenticate();
   await h.e("rememberContactRead(observeContactRequest('GET', 'https://services.leadconnectorhq.com/contacts/c1'), { contact: " + JSON.stringify(h.contacts.c1) + ' })');
   await h.e("rememberContactRead(observeContactRequest('POST', 'https://services.leadconnectorhq.com/opportunities/search', () => JSON.stringify(contactOpportunityQuery('c1'))), " + JSON.stringify({ opportunities: h.opportunities.c1, total: 1 }) + ')');
   await h.flush(); assertStage(h, 'New Lead'); assert.equal(h.requests.length, 0);

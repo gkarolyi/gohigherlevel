@@ -187,13 +187,21 @@ test('native navigation uses exact contact path, preserves stage queue and avoid
 test('repeated Next lead transitions keep the original stage without reinitializing the script', async t => {
   const h = harness(t); h.pin(); h.evaluate("settings.priority = 'stage'");
   const { pushes } = installRouter(h);
+  h.evaluate(`workflow.completed = ['Prior confirmation']; workflow.pendingSave = 'Prior uncertainty';
+    workflow.pendingActions = { note: 'Prior note' }; workflow.startingContact = 'prior-contact'; workflow.step = 'Prior phase';`);
+  const evidence = h.evaluate('workflow.completed'), actions = h.evaluate('workflow.pendingActions');
   let current = 'contact-a';
   for (const next of ['contact-b', 'contact-c', 'contact-d']) {
     h.respond(result([hit(current, `opp-${current}`), hit(next, `opp-${next}`)]));
     await h.evaluate('nextLead()');
     assert.equal(h.evaluate('stageQueueContext().queue.contactId'), next);
     assert.equal(h.evaluate('stageQueueContext().queue.stageId'), 'stage-atc');
-    assert.equal(h.evaluate('busy'), false);
+    assert.equal(h.evaluate('workflow.busy'), false);
+    assert.equal(h.evaluate('workflow.completed'), evidence);
+    assert.equal(h.evaluate('workflow.pendingActions'), actions);
+    assert.equal(h.evaluate('workflow.pendingSave'), 'Prior uncertainty');
+    assert.equal(h.evaluate('workflow.startingContact'), 'prior-contact');
+    assert.equal(h.evaluate('workflow.step'), 'Prior phase');
     current = next;
   }
   assert.equal(pushes.length, 3);
@@ -266,12 +274,12 @@ test('Next lead waits for native navigation and refuses a concurrent workflow', 
   for (let i = 0; i < 30 && !h.navigationErrors.length; i++) await Promise.resolve();
   assert.equal(h.navigationErrors.length, 0, 'must use native navigation');
   await began;
-  assert.equal(h.evaluate('busy'), true);
+  assert.equal(h.evaluate('workflow.busy'), true);
   await h.evaluate('nextLead(); run()');
   assert.equal(h.requests.length, 1);
   release(); await navigation;
   assert.deepEqual(pushes, [NEXT_PATH]);
-  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.evaluate('workflow.busy'), false);
 });
 
 function retainedContactFixture(h, { hidden = false } = {}) {
@@ -304,20 +312,20 @@ test('native transition blocks automation until old contact, task and SMS contro
   const navigation = h.evaluate('nextLead()');
   await flush();
   assert.equal(h.w.location.pathname, NEXT_PATH);
-  assert.equal(h.evaluate('busy'), true, 'route commitment is not contact readiness');
+  assert.equal(h.evaluate('workflow.busy'), true, 'route commitment is not contact readiness');
   await h.evaluate("completeCallTask('contact-b'); run(); nextLead()");
   assert.equal(fixture.clicks(), 0);
   assert.equal(h.requests.length, 1);
   // Replaced names alone do not make retained task/SMS controls safe.
   for (const id of ['contact.first_name', 'contact.last_name', 'owner-dropdown-trigger']) h.w.document.getElementById(id).remove();
   fixture.advance(150); await flush();
-  assert.equal(h.evaluate('busy'), true);
+  assert.equal(h.evaluate('workflow.busy'), true);
   fixture.root.hidden = true;
   fixture.advance(150); await flush();
-  assert.equal(h.evaluate('busy'), true, 'hidden old controls must not be treated as replaced');
+  assert.equal(h.evaluate('workflow.busy'), true, 'hidden old controls must not be treated as replaced');
   fixture.root.remove(); fixture.advance(150);
   await navigation;
-  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.evaluate('workflow.busy'), false);
   assert.equal(fixture.clicks(), 0);
   assert.equal(h.navigationErrors.length, 0);
   assert.ok(plain(h.w.pertamaWorkflowTimings).some(row => row.phase === 'Previous contact controls released' && row.result === 'ok'));
@@ -327,24 +335,24 @@ test('controls hidden before native navigation remain blocked if revealed for th
   const h = harness(t), fixture = retainedContactFixture(h, { hidden: true });
   const navigation = h.evaluate('nextLead()'); await flush();
   assert.equal(h.w.location.pathname, NEXT_PATH);
-  assert.equal(h.evaluate('busy'), true, 'initially hidden source controls also need retirement');
+  assert.equal(h.evaluate('workflow.busy'), true, 'initially hidden source controls also need retirement');
   fixture.root.hidden = false;
   await h.evaluate("completeCallTask('contact-b'); run(); nextLead()");
   assert.equal(fixture.clicks(), 0);
   assert.equal(h.requests.length, 1);
   fixture.root.remove(); fixture.advance(150);
   await navigation;
-  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.evaluate('workflow.busy'), false);
   assert.equal(h.navigationErrors.length, 0);
 });
 
 test('retained controls remain blocked after navigation readiness timeout and unblock only after removal', async t => {
   const h = harness(t), fixture = retainedContactFixture(h);
   const navigation = h.evaluate('nextLead()'); await flush();
-  assert.equal(h.evaluate('busy'), true);
+  assert.equal(h.evaluate('workflow.busy'), true);
   assert.ok(fixture.sleeps.length);
   fixture.advance(30001); await navigation;
-  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.evaluate('workflow.busy'), false);
   assert.equal(h.w.location.pathname, NEXT_PATH);
   h.evaluate('globalThis.__sidebarTouches = 0; globalThis.openSidebar = async () => { __sidebarTouches++; }; openSidebar = globalThis.openSidebar;');
   await h.evaluate("completeCallTask('contact-b')");
@@ -365,12 +373,12 @@ test('retained controls remain blocked after navigation readiness timeout and un
 test('manual route change during control retirement cancels navigation without reviving the source queue', async t => {
   const h = harness(t), fixture = retainedContactFixture(h);
   const navigation = h.evaluate('nextLead()'); await flush();
-  assert.equal(h.evaluate('busy'), true);
+  assert.equal(h.evaluate('workflow.busy'), true);
   h.route(CONTACT_PATH); h.route(NEXT_PATH);
   fixture.root.remove(); fixture.advance(150);
   await navigation;
   assert.equal(h.evaluate('stageQueueContext()'), null);
-  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.evaluate('workflow.busy'), false);
   assert.equal(plain(h.w.pertamaWorkflowTimings).at(-1).result, 'stopped');
   assert.equal(h.navigationErrors.length, 0);
 });
@@ -683,8 +691,8 @@ test('unconfigured stage allows manual stage update and defaults follow-up to tw
   h.w.__apiOpportunities[0].pipelineStageId = 'stage-robot';
   h.w.__selectedActions = [];
   h.evaluate(`prepareStageApi = async () => {};
-    saveStageApi = async () => { __selectedActions.push({ action: 'stage', target: approvedActionContext.targetStageId }); };
-    createTaskApi = async () => { __selectedActions.push({ action: 'task', due: approvedActionContext.due }); };
+    saveStageApi = async () => { __selectedActions.push({ action: 'stage', target: workflow.approvedActionContext.targetStageId }); };
+    createTaskApi = async () => { __selectedActions.push({ action: 'task', due: workflow.approvedActionContext.due }); };
     completeCallTask = async () => {}; findNextActionable = async () => null;`);
   const pending = h.evaluate('run()'); await flush();
   const dialog = h.w.document.getElementById('pertama-confirm-actions');
@@ -727,6 +735,29 @@ for (const mismatch of ['pipeline', 'stage']) {
   });
 }
 
+test('cancelled confirmation resets prior evidence and releases workflow ownership', async t => {
+  const h = harness(t); apiContactFixture(h); h.pin(); h.evaluate("settings.priority = 'stage'");
+  h.evaluate(`workflow.completed = ['Previous evidence']; workflow.pendingSave = 'Previous uncertainty';
+    workflow.pendingActions = { note: 'Previous note' }; workflow.startingContact = 'previous-contact';`);
+  const pending = h.evaluate('run()'); await flush();
+  const dialog = h.w.document.getElementById('pertama-confirm-actions');
+  assert.ok(dialog, h.alerts.join('\n'));
+  assert.equal(h.evaluate('workflow.busy'), true);
+  assert.equal(h.evaluate('workflow.guardedContact'), 'contact-a');
+  assert.equal(h.evaluate('workflow.guardedStageQueue === stageQueueContext().queue'), true);
+  assert.deepEqual(plain(h.evaluate('workflow.completed')), []);
+  assert.equal(h.evaluate('workflow.pendingSave'), '');
+  assert.deepEqual(plain(h.evaluate('workflow.pendingActions')), {});
+  assert.equal(h.evaluate('workflow.startingContact'), 'contact-a');
+  dialog.querySelector('[data-cancel]').click(); await pending;
+  assert.deepEqual(plain(h.evaluate('[workflow.busy, workflow.activeSaveProgress, workflow.guardedContact, workflow.guardedStageQueue, workflow.approvedActionContext]')), [false, null, null, null, null]);
+  assert.equal(h.evaluate('workflow.step'), 'Awaiting confirmation…');
+  assert.equal(h.evaluate('workflow.startingContact'), 'contact-a');
+  assert.equal(h.w.localStorage.getItem(`pertama:no-answer:unfinished:${LOCATION}:contact-a`), null);
+  assert.equal(h.requests.length, 0);
+  assert.deepEqual(h.alerts, []);
+});
+
 test('API context failure drains the other read before releasing the workflow', async t => {
   const h = harness(t); apiContactFixture(h);
   let release;
@@ -737,9 +768,9 @@ test('API context failure drains the other read before releasing the workflow', 
   const pending = h.evaluate('run()').finally(() => { settled = true; });
   await flush();
   assert.equal(settled, false);
-  assert.equal(h.evaluate('busy'), true);
+  assert.equal(h.evaluate('workflow.busy'), true);
   release(h.w.__apiOpportunities); await pending;
-  assert.equal(h.evaluate('busy'), false);
+  assert.equal(h.evaluate('workflow.busy'), false);
   assert.match(h.alerts.join('\n'), /Contact read failed/);
 });
 
@@ -1195,7 +1226,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
     if (!beforeWriteFailure) {
       assert.equal(h.requests.filter(r => new URL(r.url).pathname === '/objects/task/records/search').length, 1, 'preflight checks for an existing task before writes');
     }
-    assert.equal(h.evaluate('busy'), false);
+    assert.equal(h.evaluate('workflow.busy'), false);
     assert.equal(h.navigationErrors.length, 0);
   });
 }
@@ -1247,7 +1278,7 @@ function deferredSmsFixture(t) {
   h.evaluate(`globalThis.prepareSmsApi = async () => { __smsCalls++; return globalThis.__smsGate ? await __smsGate : __smsResult; };
     prepareSmsApi = globalThis.prepareSmsApi;
     globalThis.prepareSms = async () => { __smsCalls++; return { error: 'Legacy UI preparation' }; }; prepareSms = globalThis.prepareSms;
-    globalThis.sendSmsApi = async () => { globalThis.__sentSms = JSON.parse(JSON.stringify(approvedActionContext.sms)); };
+    globalThis.sendSmsApi = async () => { globalThis.__sentSms = JSON.parse(JSON.stringify(workflow.approvedActionContext.sms)); };
     sendSmsApi = globalThis.sendSmsApi; findNextActionable = async () => null; completeCallTask = async () => {};`);
   return h;
 }
@@ -1274,7 +1305,7 @@ for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inven
       release(h.w.__smsResult); await flush();
       assert.equal(h.w.document.getElementById('pertama-confirm-actions'), null);
       assert.equal(h.w.__sentSms, undefined);
-      assert.equal(h.evaluate('busy'), false);
+      assert.equal(h.evaluate('workflow.busy'), false);
       return;
     }
     if (mode === 'stale-result') {
