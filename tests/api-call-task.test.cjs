@@ -146,6 +146,32 @@ for (const patch of [{id:'t2'},{properties:{...task.properties,completed:1}},{pr
 test('storage failure blocks completion', async t => {
   const h = harness(t); h.w.Storage.prototype.setItem = () => {throw new Error('secret');}; await h.run(); assert.equal(h.puts().length,0); assert.doesNotMatch(h.notice(),/secret/); assert.match(h.notice(),/stopped/i);
 });
+test('standalone checkpoint removal failure retains durable completion evidence and blocks repeated PUT', async t => {
+  const h = harness(t); let beforeRemoval;
+  h.w.Storage.prototype.removeItem = function (key) {
+    if (key.includes('unfinished')) {
+      beforeRemoval = h.checkpoint();
+      throw new Error('Storage refused');
+    }
+  };
+  await h.run();
+  const saved = JSON.parse(beforeRemoval);
+  assert.deepEqual(saved.completed, [
+    'Call task completion accepted: t1; readback not yet verified.',
+    'Call task completed and verified: t1: Call again Ada Lee',
+  ]);
+  assert.equal(saved.pendingSave, '');
+  assert.deepEqual(saved.pendingActions, {});
+  assert.equal(h.checkpoint(), beforeRemoval);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), saved.completed);
+  assert.match(h.notice(), /stopped/i);
+  const count = h.calls.length;
+  await h.run();
+  assert.equal(h.calls.length, count);
+  assert.equal(h.checkpoint(), beforeRemoval);
+  assert.equal(h.puts().length, 1);
+  assert.deepEqual(h.puts()[0].body, {completed:true,ids:['t1']});
+});
 test('existing unfinished action is never overwritten', async t => {
   const h = harness(t); h.w.localStorage.setItem(`pertama:no-answer:unfinished:${L}:c1`,'original'); await h.run(); assert.equal(h.calls.length,0); assert.equal(h.checkpoint(),'original');
 });

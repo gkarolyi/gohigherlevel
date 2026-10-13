@@ -133,7 +133,12 @@ for (const change of ['route', 'auth']) test(`${change} changed during send pres
   await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
 });
 test('storage failure prevents send and retry',async t=>{
-  const h=harness(t); h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}'); await assert.rejects(h.send()); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
+  const h=harness(t); h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}');
+  await assert.rejects(h.send());
+  assert.equal(h.e('workflow.pendingSave'), `SMS from ${number.phoneNumber} to ${contact.phone}; message: Hello; acceptance not yet confirmed`);
+  assert.equal(h.e('workflow.completed.length'), 0);
+  assert.equal(h.checkpoint(), null);
+  await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
 });
 for (const status of [401,403,500]) test(`inventory HTTP ${status} sanitized`,async t=>{
   const h=harness(t); h.hook(c=>c.path.startsWith('/phone-system/')?new Response('secret',{status}):undefined); await assert.rejects(h.prep(),e=>!e.message.includes('secret')); if(status!==500)assert.equal(h.e('currentUserId'),null);
@@ -167,11 +172,38 @@ for (const path of ['/contacts/c1', '/phone-system/numbers/v2/location/' + L, '/
   });
 }
 test('durable pre-send intent contains exact consent; ack storage failure cannot resend',async t=>{
-  const h=harness(t); h.hook(c=>{if(c.path==='/conversations/messages'){
-    const journal=h.checkpoint().pendingSave; for(const value of [number.phoneNumber,contact.phone,'Hello'])assert.ok(journal.includes(value));
+  const h=harness(t); let intent;
+  h.hook(c=>{if(c.path==='/conversations/messages'){
+    intent = h.checkpoint();
+    assert.equal(intent.pendingSave, `SMS from ${number.phoneNumber} to ${contact.phone}; message: Hello; acceptance not yet confirmed`);
+    assert.deepEqual(intent.completed, []);
+    assert.deepEqual(intent.pendingActions, {});
     h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}');
   }});
-  await assert.rejects(h.send()); assert.match(h.e('workflow.pendingSave'),/m1/); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
+  await assert.rejects(h.send());
+  assert.equal(h.e('workflow.pendingSave'), 'SMS message m1; conversation v1: accepted; workflow continuation not yet approved');
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), ['SMS message m1; conversation v1: accepted by CRM; delivery not confirmed.']);
+  assert.deepEqual(h.checkpoint(), intent);
+  await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
+  assert.deepEqual(h.calls.find(c=>c.path==='/conversations/messages').body, {contactId:'c1',locationId:L,message:'Hello',fromNumber:number.phoneNumber,toNumber:contact.phone,type:'SMS',channel:'sms',fromOneToOneConversation:true,attachments:[]});
+});
+test('final SMS clear failure restores the unresolved accepted summary without resend', async t => {
+  const h = harness(t), original = h.w.Storage.prototype.setItem;
+  let accepted;
+  h.w.Storage.prototype.setItem = function (key, value) {
+    if (key.includes('unfinished')) {
+      const snapshot = JSON.parse(value);
+      if (!snapshot.pendingSave) throw new Error('Storage refused');
+      if (snapshot.completed.length) accepted = snapshot;
+    }
+    return original.call(this, key, value);
+  };
+  await assert.rejects(h.send());
+  assert.equal(h.e('workflow.pendingSave'), 'SMS message m1; conversation v1: accepted; workflow continuation not yet approved');
+  assert.deepEqual(h.checkpoint(), accepted);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), accepted.completed);
+  await assert.rejects(h.send());
+  assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, 1);
 });
 test('timeout aborts send once without losing intent',async t=>{
   const h=harness(t); let abort;
