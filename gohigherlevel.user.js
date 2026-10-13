@@ -1180,9 +1180,9 @@
   }
 
   function restoreJournalEvidence(saved) {
-    workflow.completed = [...(saved.completed || [])];
+    workflow.completed = saved.completed || [];
     workflow.pendingSave = saved.pendingSave || '';
-    workflow.pendingActions = { ...(saved.pendingActions || {}) };
+    workflow.pendingActions = saved.pendingActions || {};
   }
 
   function appendJournalEvidence(description) {
