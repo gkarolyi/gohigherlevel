@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0';
 const route = `/v2/location/${L}/contacts/detail/c1`;
@@ -19,7 +20,7 @@ function deferred() {
 function harness(t, { oldTask = true } = {}) {
   const dom = new JSDOM('<!doctype html><body></body>', { url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', virtualConsole: new VirtualConsole() });
   const w = dom.window; t.after(() => w.close());
-  for (const key of ['Request', 'Response', 'Headers', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
   w.HTMLDialogElement.prototype.close = function () { this.open = false; };
   w.HTMLElement.prototype.getClientRects = () => [{ width: 200 }];
@@ -53,8 +54,7 @@ function harness(t, { oldTask = true } = {}) {
     return new Response(JSON.stringify(data));
   };
   w.localStorage.setItem(`pertama:pipelines:${L}`, JSON.stringify({ pipelines: [{ id: 'p1', name: 'Sales', stages: { 'Attempted Contact': 's1', 'ATC 2': 's2' } }] }));
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__concurrentTest = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__concurrentTest.evaluate(code);
+  const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'u1', sub: 'u1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
   e(`initializeButtons(); captureReadHeaders('https://services.leadconnectorhq.com/contacts/c1', ${JSON.stringify({ 'token-id': token })});
     pinStageQueue({ contactId: 'c1', opportunityId: 'o1', pipelineId: 'p1', stageId: 's1' });

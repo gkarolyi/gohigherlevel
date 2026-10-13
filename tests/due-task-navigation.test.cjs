@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0';
 const NOW = '2026-10-12T08:00:00.000Z';
@@ -24,7 +25,7 @@ function harness(t, { template, rows = [task('2026-10-12T07:00:00Z')], respectDa
     url: `https://go.pertamaproperty.com/v2/location/${L}/contacts/detail/c1`, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: new VirtualConsole(),
   });
   const w = dom.window; t.after(() => w.close());
-  for (const key of ['Request', 'Response', 'Headers', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   w.HTMLElement.prototype.getClientRects = () => [{ width: 200 }];
   let now = Date.parse(NOW), response = rows;
   const NativeDate = w.Date;
@@ -44,8 +45,7 @@ function harness(t, { template, rows = [task('2026-10-12T07:00:00Z')], respectDa
     return new Response(JSON.stringify(list(selected)));
   };
   if (template) w.localStorage.setItem(KEY, JSON.stringify(template));
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__taskNavigation = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__taskNavigation.evaluate(code);
+  const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'u1', sub: 'u1', locations: [L], exp: now / 1000 + 365 * 86400 })).toString('base64url')}.x`;
   e(`initializeButtons(); captureReadHeaders('https://services.leadconnectorhq.com/opportunities/search', ${JSON.stringify({ 'token-id': token })})`);
   return { w, e, requests, run: () => e('topTaskContact()'), setNow: value => { now = Date.parse(value); }, respond: value => { response = value; } };

@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0';
 const origin = 'https://services.leadconnectorhq.com';
@@ -13,7 +14,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 function harness(t) {
   const dom = new JSDOM('<!doctype html><body></body>', { url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', virtualConsole: new VirtualConsole() });
   const w = dom.window; t.after(() => w.close());
-  for (const key of ['Request', 'Response', 'Headers', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   let now = Date.now(); w.Date.now = () => now;
   const calls = []; let handler = url => url.includes('/contacts/') ? { contact } : { opportunities: [opp], total: 1 };
   w.fetch = async (url, init) => { calls.push({ url, init }); if (url instanceof Request) { if (url.body && init?.body === undefined) await url.text(); url = url.url; } const data = await handler(url, init); return data instanceof Response ? data : new Response(JSON.stringify(data), { status: 200 }); };
@@ -21,8 +22,7 @@ function harness(t) {
     open(method, url) { this.url = url; } setRequestHeader() {} send() {}
     finish(data, status = 200) { this.status = status; this.responseText = JSON.stringify(data); this.dispatchEvent(new w.Event('loadend')); }
   };
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__readTest = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__readTest.evaluate(code);
+  const e = evaluateUserscript(w, source);
   const headers = (id = 'u1', exp = now / 1000 + 3600) => ({ 'token-id': `x.${Buffer.from(JSON.stringify({ user_id: id, sub: id, locations: [L], exp })).toString('base64url')}.x` });
   const auth = (id, exp) => e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify(headers(id, exp))})`);
   auth();

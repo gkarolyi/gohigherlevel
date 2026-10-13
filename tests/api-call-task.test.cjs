@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0', origin = 'https://services.leadconnectorhq.com';
 const route = `/v2/location/${L}/contacts/detail/c1`;
@@ -11,7 +12,7 @@ const list = (rows, total = rows.length) => ({customObjectRecords:rows,total,rec
 function harness(t) {
   const dom = new JSDOM('<!doctype html><body></body>', {url:`https://go.pertamaproperty.com${route}`,runScripts:'outside-only',virtualConsole:new VirtualConsole()});
   const w = dom.window; t.after(() => w.close());
-  for (const key of ['Request','Response','Headers','AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   let hook = () => {}, written = false; const calls = [];
   w.fetch = async (url, init) => {
     const c = {url,path:new URL(url).pathname,init,body:init.body && JSON.parse(init.body)}; calls.push(c);
@@ -20,8 +21,7 @@ function harness(t) {
     if (init.method === 'PUT') { written = true; return new Response(JSON.stringify({succeded:true})); }
     return new Response(JSON.stringify(init.method === 'GET' ? {contact} : list([{...task,properties:{...task.properties,completed:written ? 1 : 0}}])));
   };
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__callTest = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__callTest.evaluate(code);
+  const e = evaluateUserscript(w, source);
   const auth = (user = 'u1') => e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({'token-id':`x.${Buffer.from(JSON.stringify({user_id:user,sub:user,locations:[L],exp:Date.now()/1000+3600})).toString('base64url')}.x`})})`);
   auth();
   // Any legacy UI access is an immediate failure rather than a 30-second wait.

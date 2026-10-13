@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0';
 const route = id => `/v2/location/${L}/contacts/detail/${id}`;
@@ -15,7 +16,7 @@ function harness(t, { mounted = true, auth = true, session = {} } = {}) {
   });
   const w = dom.window, d = w.document; t.after(() => w.close());
   Object.defineProperty(d, 'readyState', { value: 'complete', configurable: true });
-  for (const key of ['Request', 'Response', 'Headers', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   w.HTMLElement.prototype.getClientRects = function () { return this.closest('[hidden]') ? [] : [{ width: 200 }]; };
   const frames = new Map(), timers = new Map(); let serial = 0, now = 0;
   w.requestAnimationFrame = fn => { frames.set(++serial, fn); return serial; };
@@ -36,8 +37,7 @@ function harness(t, { mounted = true, auth = true, session = {} } = {}) {
   };
   w.localStorage.setItem(`pertama:pipelines:${L}`, JSON.stringify({ pipelines: [{ id: 'p1', name: 'Sales', stages: { 'New Lead': 's1', 'Attempted Contact': 's2' } }] }));
   for (const [key, value] of Object.entries(session)) w.sessionStorage.setItem(key, JSON.stringify(value));
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__indicatorTest = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__indicatorTest.evaluate(code);
+  const e = evaluateUserscript(w, source);
   function authenticate(user = 'u1') {
     const token = `x.${Buffer.from(JSON.stringify({ user_id: user, sub: user, locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
     e(`captureReadHeaders('https://services.leadconnectorhq.com/contacts/c1', ${JSON.stringify({ 'token-id': token })})`);

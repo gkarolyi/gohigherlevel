@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0', origin = 'https://services.leadconnectorhq.com';
 const route = `/v2/location/${L}/contacts/detail/c1`;
@@ -10,7 +11,7 @@ const opportunity = { id: 'o1', contactId: 'c1', locationId: L, pipelineId: 'p1'
 function harness(t) {
   const dom = new JSDOM('<!doctype html><body></body>', { url: `https://go.pertamaproperty.com${route}`, runScripts: 'outside-only', virtualConsole: new VirtualConsole() });
   const w = dom.window; t.after(() => w.close());
-  for (const key of ['Request', 'Response', 'Headers', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   const calls = []; let hook = () => {};
   w.fetch = async (url, init) => {
     const path = new URL(url).pathname, body = init.body && JSON.parse(init.body);
@@ -26,8 +27,7 @@ function harness(t) {
     else data = { results: { added: [{ success: true, data: body.add[0] }], errored: [], removed: [] } };
     return new Response(JSON.stringify(data));
   };
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__writes = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__writes.evaluate(code);
+  const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'user1', sub: 'user1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
   e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({ 'token-id': token })}); startingContact = 'c1'; approvedActionContext = { contact:'c1', route:stageRouteRevision, user:currentUserId, epoch:contactReadEpoch, contactRecord:${JSON.stringify(contact)}, opportunity:${JSON.stringify(opportunity)}, targetStageId:'s2', targetStageName:'Next', ownerId:'owner1', noteText:'A < B & "quoted"\nsecond line', taskTitle:'Call Ada', due:'2026-10-10', actions:{stage:true,note:true,task:true}, taskId:null };`.replace('"quoted"\nsecond', '"quoted"\\nsecond'));
   return { w, e, calls, hook: fn => { hook = fn; }, checkpoint: () => w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`), run: name => e(`${name}()`), flush: () => new Promise(resolve => setImmediate(resolve)) };

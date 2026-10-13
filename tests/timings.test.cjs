@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'gohigherlevel.user.js'), 'utf8');
 const LOCATION = '3QixdLNutDXye95tTBK0';
@@ -18,7 +19,7 @@ function harness(t, { route = ROUTE, session = {}, denied = false, hidden = fals
   });
   t.after(() => dom.window.close());
   const w = dom.window;
-  for (const key of ['Headers', 'Request', 'Response', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   w.HTMLElement.prototype.getClientRects = function () { return this.hidden ? [] : [{ width: 200 }]; };
   w.HTMLElement.prototype.scrollIntoView = function () {};
   w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
@@ -41,9 +42,7 @@ function harness(t, { route = ROUTE, session = {}, denied = false, hidden = fals
       w.Storage.prototype[method] = () => { throw new w.DOMException('Storage denied', 'SecurityError'); };
     }
   }
-  assert.match(source, /\}\)\(\);\s*$/);
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__timingTest = { evaluate(code) { return eval(code); } };\n})();'));
-  const evaluate = code => w.__timingTest.evaluate(code);
+  const evaluate = evaluateUserscript(w, source);
   return { w, evaluate, tick(value) { monotonic = value; }, wall(value) { wall = value; },
     rows() { assert.ok(Array.isArray(w.pertamaWorkflowTimings), 'window.pertamaWorkflowTimings must be an array'); return plain(w.pertamaWorkflowTimings); } };
 }

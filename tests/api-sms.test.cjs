@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../gohigherlevel.user.js'), 'utf8');
 const L = '3QixdLNutDXye95tTBK0', origin = 'https://services.leadconnectorhq.com';
 const contact = { id:'c1', locationId:L, firstName:'Ada', lastName:'Lee', phone:'+12345678901', assignedTo:'owner1' };
@@ -9,7 +10,7 @@ const number = { phoneNumber:'+19876543210', capabilities:{sms:true}, linkedUser
 function harness(t) {
   const dom = new JSDOM('<body><textarea id="conv-composer-textarea-input">untouched</textarea></body>', { url:`https://go.pertamaproperty.com/v2/location/${L}/contacts/detail/c1`, runScripts:'outside-only', virtualConsole:new VirtualConsole() });
   const w = dom.window; t.after(() => w.close());
-  for (const k of ['Request','Response','Headers','AbortController']) w[k] = globalThis[k];
+  installWebGlobals(w);
   const calls = []; let hook = () => {};
   w.fetch = async (url, init) => {
     const c = {url, path:new URL(url).pathname, init, body:init.body && JSON.parse(init.body)}; calls.push(c);
@@ -25,8 +26,7 @@ function harness(t) {
     }
     return new Response(JSON.stringify(data));
   };
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__sms = { evaluate(code) { return eval(code); } };\n})();'));
-  const e = code => w.__sms.evaluate(code);
+  const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({user_id:'user1',sub:'user1',locations:[L],exp:Date.now()/1000+3600})).toString('base64url')}.x`;
   e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({'token-id':token})}); startingContact='c1'; approvedActionContext={contact:'c1',route:stageRouteRevision,user:currentUserId,epoch:contactReadEpoch,contactRecord:${JSON.stringify(contact)},actions:{sms:true},sms:{from:'${number.phoneNumber}',to:'${contact.phone}',message:'Hello'}};`);
   return {w,e,calls,hook:fn => {hook=fn;}, prep:()=>e('prepareSmsApi()'), send:()=>e('sendSmsApi()'), checkpoint:()=>JSON.parse(w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`)), flush:()=>new Promise(r=>setImmediate(r))};

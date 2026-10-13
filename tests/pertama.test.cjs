@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 // This option proves RED against the committed baseline even during concurrent source edits.
@@ -26,7 +27,7 @@ function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = f
   });
   t.after(() => dom.window.close());
   const w = dom.window;
-  for (const key of ['Headers', 'Request', 'Response', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   w.HTMLElement.prototype.getClientRects = function () { return this.closest('[hidden]') ? [] : [{ width: 200 }]; };
   w.HTMLElement.prototype.scrollIntoView = function () {};
   w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
@@ -48,9 +49,7 @@ function harness(t, { route = CONTACT_PATH, session = {}, fetchResponse, xhr = f
   w.alert = message => alerts.push(message);
   for (const [key, value] of Object.entries(session)) w.sessionStorage.setItem(key, value);
   w.localStorage.setItem(`pertama:pipelines:${LOCATION}`, JSON.stringify({ pipelines }));
-  assert.match(source, /\}\)\(\);\s*$/);
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__test = { evaluate(code) { return eval(code); } };\n})();'));
-  const evaluate = code => w.__test.evaluate(code);
+  const evaluate = evaluateUserscript(w, source);
   evaluate('initializeButtons()');
   const claims = { user_id: 'user-a', sub: 'user-a', locations: [LOCATION], exp: Math.floor(Date.now() / 1000) + 3600 };
   const token = `test.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.test`;

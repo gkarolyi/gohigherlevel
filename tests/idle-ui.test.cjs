@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const { installWebGlobals, evaluateUserscript } = require('./helpers/userscript.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(ROOT, 'gohigherlevel.user.js'), 'utf8');
@@ -27,7 +28,7 @@ function harness(t, { mounted = true, toolbar = true, route = CONTACT, hidden = 
   t.after(() => w.close());
   Object.defineProperty(d, 'readyState', { configurable: true, value: 'complete' });
   Object.defineProperty(d, 'hidden', { configurable: true, get: () => hidden });
-  for (const key of ['Headers', 'Request', 'Response', 'AbortController']) w[key] = globalThis[key];
+  installWebGlobals(w);
   w.fetch = async () => { throw new Error('UI maintenance must not fetch'); };
   const counts = { scans: 0, visibility: 0, geometry: 0, observerRecords: 0 };
   const originalQuery = d.querySelectorAll.bind(d);
@@ -76,9 +77,7 @@ function harness(t, { mounted = true, toolbar = true, route = CONTACT, hidden = 
   w.localStorage.setItem(`pertama:pipelines:${LOCATION}`, JSON.stringify({ pipelines: [
     { id: 'pipe-a', name: 'Sales', stages: { 'New Lead': 'stage-new', 'Attempted Contact': 'stage-atc' } },
   ] }));
-  assert.match(source, /\}\)\(\);\s*$/);
-  w.eval(source.replace(/\}\)\(\);\s*$/, 'globalThis.__idleTest = { evaluate(code) { return eval(code); } };\n})();'));
-  const evaluate = code => w.__idleTest.evaluate(code);
+  const evaluate = evaluateUserscript(w, source);
   async function flush() {
     for (let round = 0; round < 12; round++) {
       await Promise.resolve();
