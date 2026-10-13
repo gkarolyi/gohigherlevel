@@ -2454,7 +2454,7 @@
   }
   refreshButtons = () => {
     if (document.hidden || frame !== null) return;
-    frame = requestAnimationFrame(() => { frame = null; placeButton(); });
+    frame = requestAnimationFrame(() => { frame = null; refreshToolbar(); });
   };
   function wakeDiscovery() {
     stopDiscovery(); discoveryExpired = false;
@@ -2469,21 +2469,7 @@
       refreshButtons();
     }, 1000);
   }
-  function placeButton() {
-    if (document.hidden) return;
-    recordNavigationReady();
-    syncStageQueue();
-    if (lastPath !== location.pathname) {
-      lastPath = location.pathname;
-      stopDiscovery(); discoveryExpired = false;
-      rootsToDiscover.add(document);
-    }
-    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
-      setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
-      hostObserver.disconnect(); stopDiscovery(); widthObserver?.disconnect();
-      observedWidthTarget = null; observedWidth = null;
-      return;
-    }
+  function discoverHosts() {
     const validHub = messageHub?.isConnected && /^message hub$/i.test(text(messageHub));
     const validSettings = settingsAnchor?.isConnected && /^settings$/i.test(text(settingsAnchor));
     const lostAnchor = messageHub && !validHub || settingsAnchor && !validSettings;
@@ -2494,7 +2480,8 @@
     rootsToDiscover.clear();
     companies = document.getElementById('tb_business');
     centralName = document.querySelector('[data-testid="CENTRALPANEL_NAME"]');
-
+  }
+  function placeButton() {
     // Finish layout reads before any writes; never measure unrelated page controls.
     const showRun = Boolean(contactId() && visible(companies));
     const visibleName = visible(centralName) ? centralName : null;
@@ -2523,6 +2510,9 @@
       if (settingsButton.style.fontSize !== settingsSize) settingsButton.style.fontSize = settingsSize;
     }
     updateStageIndicator(visibleName);
+    return widthTarget;
+  }
+  function reconcileDiscovery(widthTarget) {
     watchHosts();
     const missingNavHosts = !widthTarget;
     const missingToolbar = Boolean(contactId() && !companies);
@@ -2536,6 +2526,25 @@
       scheduleDiscoveryRetry(missingNavHosts);
     }
   }
+  function refreshToolbar() {
+    if (document.hidden) return;
+    recordNavigationReady();
+    syncStageQueue();
+    if (lastPath !== location.pathname) {
+      lastPath = location.pathname;
+      stopDiscovery(); discoveryExpired = false;
+      rootsToDiscover.add(document);
+    }
+    if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
+      setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
+      hostObserver.disconnect(); stopDiscovery(); widthObserver?.disconnect();
+      observedWidthTarget = null; observedWidth = null;
+      return;
+    }
+    discoverHosts();
+    const widthTarget = placeButton();
+    reconcileDiscovery(widthTarget);
+  }
   window.addEventListener('resize', () => { observedWidth = null; rootsToDiscover.add(document); refreshButtons(); });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
@@ -2548,7 +2557,7 @@
       (!(messageHub?.isConnected || settingsAnchor?.isConnected)
         || contactId() && (!companies?.isConnected || currentUserId && !centralName?.isConnected))) wakeDiscovery();
   }, true);
-  placeButton();
+  refreshToolbar();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initializeButtons, { once: true });
   else initializeButtons();
