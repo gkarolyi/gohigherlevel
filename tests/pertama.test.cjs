@@ -1353,6 +1353,8 @@ for (const mode of ['cancel', 'send', 'toggle-off', 'prep-failure', 'empty-inven
     for (const field of ['stage', 'note', 'task']) form.elements.namedItem(field).checked = false;
     if (mode === 'cancel') { dialog.querySelector('[data-cancel]').click(); await pending; return; }
     sms.checked = true; sms.dispatchEvent(new h.w.Event('change', { bubbles: true })); await flush();
+    assert.equal(form.elements.namedItem('smsText').hidden, false);
+    assert.equal(form.elements.namedItem('smsText').rows, 7, 'expanded SMS shows several lines without manual resizing');
     assert.equal(h.w.__smsCalls, 1);
     if (mode === 'cancel-loading') {
       dialog.querySelector('[data-cancel]').click(); await pending;
