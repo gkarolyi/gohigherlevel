@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.15
+// @version      1.0.16
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.15';
+  const VERSION = '1.0.16';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -57,9 +57,8 @@
       if (!stage.trim() || !rule || typeof rule.next !== 'string' || !rule.next.trim()
         || typeof rule.updateStage !== 'boolean'
         || ['addNote', 'addTask', 'sendSms'].some(key => Object.hasOwn(rule, key) && typeof rule[key] !== 'boolean')
-        || rule.addTask === true && rule.days === null
         || rule.days !== null && (!Number.isInteger(rule.days) || rule.days < 0 || rule.days > 36500)) {
-        throw new Error('Each stage rule needs a destination and whole follow-up days from 0 to 36500, or no task.');
+        throw new Error('Each stage rule needs a destination and whole follow-up days from 0 to 36500, or blank days for 3 hours later.');
       }
     }
     if (value.smsFrom != null && value.smsFrom !== '' && (typeof value.smsFrom !== 'string' || !/^\+[1-9]\d{6,14}$/.test(value.smsFrom))) {
@@ -876,7 +875,7 @@
   }
   function verifyTask(data, sent, id, title, due) {
     const saved = data.record;
-    const expectedTime = Date.parse(`${due}T11:00:00+08:00`);
+    const expectedTime = Date.parse(due);
     requireSaved(!data.errors?.length && Boolean(saved?.id) && saved.objectKey === 'task'
       && saved.locationId === LOCATION_ID && sent?.properties?.contactId === id,
       'task creation returned errors or the wrong task/contact/location.');
@@ -884,7 +883,7 @@
       'saved task title did not match.');
     requireSaved(Date.parse(saved.properties?.dueDate) === expectedTime
       && Date.parse(sent.properties.dueDate) === expectedTime,
-      `expected task deadline ${due}, 11am WITA; returned ${saved.properties?.dueDate}.`);
+      `expected task deadline ${taskDueLabel(due)}; returned ${saved.properties?.dueDate}.`);
     requireSaved([false, 0].includes(saved.properties?.completed), 'new task was not pending.');
     requireSaved(sent.owners?.length === 1 && saved.owners?.length === 1 && saved.owners[0] === sent.owners[0],
       'saved task owner did not match the submitted owner.');
@@ -938,10 +937,10 @@
         body: { body: `<p>${escaped.replace(/\r\n?|\n/g, '<br>\n')}</p>`, title: '', color: '#fef7c3', relations: [{ objectKey: 'contact', recordId: context.contact }] } };
     }
     if (operation === 'task') {
-      const due = typeof context.due === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(context.due) && new Date(`${context.due}T03:00:00Z`);
+      const due = typeof context.due === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(context.due) && new Date(context.due);
       if (!safeActionId(context.ownerId) || context.ownerId !== context.contactRecord.assignedTo
         || typeof context.taskTitle !== 'string' || !context.taskTitle.trim()
-        || !due || !Number.isFinite(due.getTime()) || due.toISOString().slice(0, 10) !== context.due || context.taskId !== null) throw new Error('Invalid approved task owner/title/deadline or task already created.');
+        || !due || !Number.isFinite(due.getTime()) || due.toISOString() !== context.due || context.taskId !== null) throw new Error('Invalid approved task owner/title/deadline or task already created.');
       return { action: 'task', method: 'POST', path: '/objects/task/records', body: { locationId: LOCATION_ID, owners: [context.ownerId],
         properties: { title: context.taskTitle, dueDate: due.toISOString(), completed: false, description: '', contactId: context.contact } } };
     }
@@ -964,7 +963,7 @@
       const description = operation === 'link' ? `Contact association for task ${context.taskId}`
         : action === 'stage' ? `Stage: ${context.targetStageName} (${context.targetStageId}); opportunity ${context.opportunity.id}`
         : action === 'note' ? `Note: ${context.noteText}`
-        : `Task: ${context.taskTitle}; ${context.due}, 11am WITA; owner ${context.ownerId}`;
+        : `Task: ${context.taskTitle}; ${taskDueLabel(context.due)}; owner ${context.ownerId}`;
       setPendingAction(operation, description); // No request before this operation's durable journal entry.
       attempts.add(operation);
     }
@@ -1057,7 +1056,7 @@
     verifyTask(data, body, context.contact, context.taskTitle, context.due);
     context.taskId = data.record.id;
     workflow.activeSaveProgress?.created();
-    appendJournalEvidence(`Task created: ${context.taskId}; ${context.due}, 11am WITA (server confirmed)`);
+    appendJournalEvidence(`Task created: ${context.taskId}; ${taskDueLabel(context.due)} (server confirmed)`);
     setPendingAction('task', `Contact association for task ${context.taskId}`);
     requireActionApproval('task', context);
     const linked = await actionRequest('link', context);
@@ -1653,11 +1652,27 @@
       throw new Error('Contact, opportunity or session changed after confirmation. Further saves stopped; review the record before trying again.');
     }
   }
-  function futureDate(days) {
+  function futureDate(days, now = Date.now()) {
     const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
       timeZone: 'Asia/Makassar', year: 'numeric', month: '2-digit', day: '2-digit',
-    }).formatToParts(new Date()).map(p => [p.type, p.value]));
+    }).formatToParts(new Date(now)).map(p => [p.type, p.value]));
     return new Date(Date.UTC(+parts.year, +parts.month - 1, +parts.day + days)).toISOString().slice(0, 10);
+  }
+  // datetime-local has no timezone: always interpret its wall-clock value as WITA (UTC+08:00).
+  function taskDueInput(due) {
+    return new Date(Date.parse(due) + 8 * 3600000).toISOString().slice(0, 16);
+  }
+  function taskDueFromInput(value) {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return null;
+    const time = Date.parse(`${value}:00+08:00`);
+    if (!Number.isFinite(time)) return null;
+    const due = new Date(time).toISOString();
+    return taskDueInput(due) === value ? due : null;
+  }
+  function taskDueLabel(due) {
+    const local = taskDueInput(due), date = local.slice(0, 10);
+    const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'UTC' }).format(new Date(`${date}T00:00:00Z`));
+    return `${date} ${weekday} at ${local.slice(11)} WITA`;
   }
 
   function progress(message) {
@@ -2238,10 +2253,10 @@
     };
   }
 
-  function confirmActions({ contact, name, firstName, phone, stage, rule, due, ownerId, taskTitle, pipelineName, stageOptions }, onConfirm = null) {
+  function confirmActions({ contact, name, firstName, phone, stage, rule, ownerId, taskTitle, pipelineName, stageOptions }, onConfirm = null) {
     return new Promise(resolve => {
       let closed = false, sms = null, smsLoading = false, smsError = '', smsLoadVersion = 0;
-      const confirmationUser = currentUserId, confirmationRoute = stageRouteRevision;
+      const confirmationUser = currentUserId, confirmationRoute = stageRouteRevision, openedAt = Date.now();
       const previousFocus = document.activeElement;
       const dialog = document.createElement('dialog');
       dialog.id = 'pertama-confirm-actions';
@@ -2268,6 +2283,8 @@
           #pertama-confirm-actions input:disabled+.track{opacity:.45}
           #pertama-confirm-actions .detail{margin-top:4px;font-size:13px;color:#667085;white-space:pre-line}
           #pertama-confirm-actions input[type=number]{width:90px;margin:6px 8px 0 0;padding:8px 10px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit}
+          #pertama-confirm-actions .task-due{display:block;margin-top:6px}
+          #pertama-confirm-actions input[type=datetime-local]{display:block;max-width:100%;margin-top:4px;padding:6px 8px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
           #pertama-confirm-actions select{display:block;width:100%;margin-top:6px;padding:8px 10px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
           #pertama-confirm-actions select:disabled{background:#f9fafb;color:#98a2b3}
           #pertama-confirm-actions textarea{display:block;width:100%;resize:vertical;min-height:54px;margin-top:6px;padding:8px 10px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
@@ -2284,7 +2301,7 @@
           <div class="actions">
             <section><label class="toggle">Update stage<span class="switch"><input name="stage" type="checkbox" role="switch" checked><span class="track"></span></span></label><p class="detail" data-stage></p><select name="targetStage" aria-label="Stage to update to"></select></section>
             <section><label class="toggle">Add note<span class="switch"><input name="note" type="checkbox" role="switch" checked><span class="track"></span></span></label><textarea name="noteText" aria-label="Note text" rows="2"></textarea></section>
-            <section><label class="toggle">Add task<span class="switch"><input name="task" type="checkbox" role="switch"><span class="track"></span></span></label><label class="detail" data-task-days>Follow up in <input name="taskDays" type="number" min="0" step="1" aria-label="Follow up in days">days</label><p class="detail" data-task></p></section>
+            <section><label class="toggle">Add task<span class="switch"><input name="task" type="checkbox" role="switch"><span class="track"></span></span></label><label class="detail" data-task-days>Follow up in <input name="taskDays" type="number" min="0" max="36500" step="1" aria-label="Follow up in days">days</label><p class="detail">0 or blank = 3 hours later</p><label class="detail task-due">Scheduled for (WITA)<input name="taskDue" type="datetime-local" step="60"></label><p class="detail" data-task></p></section>
             <section><label class="toggle">Send SMS<span class="switch"><input name="sms" type="checkbox" role="switch"><span class="track"></span></span></label><p class="detail" data-recipient></p><p class="detail" data-sms-status></p><textarea name="smsText" aria-label="SMS message" placeholder="Write your message…" rows="7" disabled hidden></textarea></section>
           </div>
           <footer><p class="detail" data-next></p><div class="buttons"><button type="button" data-cancel>Cancel</button><button type="submit">Confirm &amp; next</button></div></footer>
@@ -2307,23 +2324,27 @@
       if (!rule.next) dialog.querySelector('[data-stage]').textContent += ' · No rule for this stage. Stage update is off by default; choose a destination to turn it on.';
       else if (!stageOptions.includes(rule.next)) dialog.querySelector('[data-stage]').textContent += ` · Suggested stage ${rule.next} is unavailable; choose a destination to update.`;
       field('taskDays').value = rule.days == null ? '' : String(rule.days);
-      function taskDate() {
-        const raw = field('taskDays').value.trim();
-        const days = Number(raw);
-        if (!raw || !Number.isSafeInteger(days) || days < 0) return null;
-        try {
-          const date = futureDate(days);
-          return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
-        } catch { return null; }
+      function daysDue() {
+        const days = Number(field('taskDays').value.trim());
+        if (field('taskDays').validity.badInput || !Number.isSafeInteger(days) || days < 0 || days > 36500) return null;
+        return days === 0 ? new Date(Math.floor(openedAt / 60000) * 60000 + 3 * 3600000).toISOString()
+          : `${futureDate(days, openedAt)}T03:00:00.000Z`;
       }
       function updateTaskDate() {
-        field('taskDays').setCustomValidity('');
-        const date = taskDate();
+        const due = taskDueFromInput(field('taskDue').value);
+        field('taskDays').setCustomValidity(daysDue() ? '' : 'Enter whole days from 0 to 36500, or leave blank for 3 hours later.');
+        field('taskDue').setCustomValidity(due ? '' : 'Choose a valid date and time in WITA.');
         dialog.querySelector('[data-task]').textContent = !ownerId ? 'No valid contact owner assigned. Task creation is unavailable.'
-          : date ? `${taskTitle}\n${date} ${new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'UTC' }).format(new Date(`${date}T00:00:00Z`))} at 11am WITA`
-            : 'Enter a whole number of days, 0 or greater.';
+          : due ? `${taskTitle}\n${taskDueLabel(due)}` : 'Choose a valid date and time in WITA.';
       }
-      field('taskDays').addEventListener('input', updateTaskDate);
+      function resetTaskDate() {
+        const due = daysDue();
+        field('taskDue').value = due ? taskDueInput(due) : '';
+        updateTaskDate();
+      }
+      field('taskDays').addEventListener('input', resetTaskDate);
+      field('taskDue').addEventListener('input', updateTaskDate);
+      resetTaskDate();
       dialog.querySelector('[data-recipient]').textContent = `To: ${name}${phone ? ` · ${phone}` : ''}`;
       field('sms').checked = rule.sendSms === true;
       async function loadSmsOptions() {
@@ -2356,12 +2377,13 @@
         : 'After saving: open the next lead using your selected pipelines and lead priority.';
       field('note').checked = rule.addNote !== false;
       field('noteText').value = renderTemplate(settings.note, { firstName, name });
-      field('task').checked = (rule.addTask ?? Boolean(due)) && Boolean(ownerId);
+      field('task').checked = (rule.addTask ?? rule.days != null) && Boolean(ownerId);
       field('task').disabled = !ownerId;
       function updateFields() {
         field('targetStage').disabled = !field('stage').checked;
         field('taskDays').disabled = !field('task').checked || field('task').disabled;
-        field('taskDays').required = !field('taskDays').disabled;
+        field('taskDue').disabled = field('taskDays').disabled;
+        field('taskDue').required = !field('taskDue').disabled;
         updateTaskDate();
         field('noteText').disabled = !field('note').checked;
         field('noteText').required = field('note').checked;
@@ -2394,9 +2416,8 @@
         event.preventDefault();
         if (field('sms').checked && (smsLoading || !sms)) return;
         const taskSelected = field('task').checked && !field('task').disabled;
-        const selectedDue = taskSelected ? taskDate() : null;
-        field('taskDays').setCustomValidity(taskSelected && !selectedDue
-          ? 'Enter a whole number of days, 0 or greater, within the supported date range.' : '');
+        updateTaskDate();
+        const selectedDue = taskSelected ? taskDueFromInput(field('taskDue').value) : null;
         const targetStage = field('targetStage').value;
         field('targetStage').setCustomValidity(field('stage').checked && !stageOptions.includes(targetStage) ? 'Choose an available stage.' : '');
         const noteText = field('noteText').value.trim();
@@ -2486,10 +2507,9 @@
       const rule = Object.hasOwn(settings.rules, stage) ? settings.rules[stage]
         : { next: '', days: 2, updateStage: false };
       const ownerId = typeof contact.assignedTo === 'string' && /^[a-zA-Z0-9_-]+$/.test(contact.assignedTo) ? contact.assignedTo : '';
-      const due = rule.days === null ? null : futureDate(rule.days);
       const taskTitle = renderTemplate(settings.task, { name, firstName });
       progress('Awaiting confirmation…');
-      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, due, ownerId, taskTitle, pipelineName, stageOptions }, choices => {
+      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, ownerId, taskTitle, pipelineName, stageOptions }, choices => {
         saveProgress = createSaveProgress({ name, pipelineName, choices });
         workflow.activeSaveProgress = saveProgress;
       });
@@ -2692,7 +2712,7 @@
       <p>Same stage only stays in the original pipeline and stage, even after moving the current lead. It skips the current contact and never falls back to tasks. Open a lead from its board to capture the queue; otherwise its current pipeline and stage are inferred automatically. You will only be asked to choose a queue if multiple opportunities make it ambiguous. The queue survives refreshes in this tab. Pipeline selections and the new-lead stage below apply to the other two modes.</p>
       <label>New lead stage<select name="newLeadStage" required></select></label>
       <h3>Pipelines</h3><p>Select your pipelines and use Up/Down to set their order. New installations start with none selected. Lead searches use the verified signed-in user (assigned to you or followed by you). Pipeline selection controls new-lead queues; follow-ups preserve your other task-list filters and sorting, but only include tasks already due, with a fresh cutoff on every lookup. Open the Opportunities board and reopen Settings to refresh the available pipelines. Visiting a pipeline board captures your filters; otherwise lead searches use the default order.</p><div data-pipelines></div>
-      <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Checked actions start selected in Save and next; you can override them before confirming. Stages come from the pipelines checked above. Task deadlines remain 11am WITA.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
+      <h3>Shared stage defaults</h3><p>These rules apply to every pipeline. Checked actions start selected in Save and next; you can override them before confirming. Stages come from the pipelines checked above. Follow-up days of 0 or blank default to 3 hours later; positive days default to 11am WITA. Adjust the exact date and time before confirming.</p><div data-rules></div><button type="button" data-add-rule>Add stage rule</button>
       <section data-checkpoint hidden><h3>Unfinished action</h3><p>Check this contact’s CRM record before removing its retry block.</p><button type="button" data-clear-checkpoint>Clear unfinished action</button></section><section><h3>Reports</h3><div data-call-count><strong>Outgoing calls</strong><button type="button" data-call-count-load>Load call counts</button><div data-call-count-rows></div><small data-call-count-status role="status"></small></div><button type="button" data-lead-access>Inaccessible leads →</button></section><p data-error role="alert" style="color:#b42318"></p><div class="settings-footer"><button type="button" data-cancel>Cancel</button><button type="submit">Save settings</button></div></form>`;
     const form = dialog.querySelector('form');
     dialog.querySelector('[data-lead-access]').addEventListener('click', event => { event.currentTarget.focus(); openLeadAccessReport(); });
@@ -2788,7 +2808,6 @@
       function updateDays() {
         days.closest('label').hidden = !task.checked;
         days.disabled = !task.checked;
-        days.required = task.checked;
       }
       updateDays(); task.addEventListener('change', updateDays);
       row.querySelector('[data-stage]').addEventListener('change', refreshRuleStages);

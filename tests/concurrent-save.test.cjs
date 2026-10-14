@@ -58,7 +58,7 @@ function harness(t, { oldTask = true } = {}) {
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'u1', sub: 'u1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
   e(`initializeButtons(); captureReadHeaders('https://services.leadconnectorhq.com/contacts/c1', ${JSON.stringify({ 'token-id': token })});
     pinStageQueue({ contactId: 'c1', opportunityId: 'o1', pipelineId: 'p1', stageId: 's1' });
-    confirmActions = async (context, accept) => { const choices = { stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3), sms: false }; accept(choices); return choices; };
+    confirmActions = async (context, accept) => { const choices = { stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3) + 'T03:00:00.000Z', sms: false }; accept(choices); return choices; };
     globalThis.__nextCalls = 0; findNextActionable = async () => { __nextCalls++; return null; };`);
   return { w, e, writes, reads, gates, alerts, run: () => e('run()'), hook: fn => { hook = fn; },
     checkpoint: () => JSON.parse(w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`) || 'null') };
@@ -162,7 +162,7 @@ test('progress SMS waits for saves and retains accepted receipt after continuati
   const h = harness(t), sms = deferred();
   h.w.__contact = contact;
   h.e(`confirmActions = async (context, accept) => {
-    const choices = { stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3), sms: true,
+    const choices = { stage: true, targetStage: 'ATC 2', note: true, noteText: 'No answer', task: true, due: futureDate(3) + 'T03:00:00.000Z', sms: true,
       smsFrom: '+15555550101', smsTo: '+628123456789', smsText: 'Approved message' };
     accept(choices); return choices;
   }; prepareSmsApi = async () => ({ contact: __contact, from: '+15555550101', to: '+628123456789' });`);

@@ -691,9 +691,10 @@ for (const key of ['addNote', 'addTask', 'sendSms']) {
     }
   });
 }
-test('enabled task defaults require valid non-null days', t => {
+test('enabled task defaults accept blank days but reject invalid days', t => {
   const h = harness(t);
-  for (const days of [null, -1, 0.5, 36501, '2']) assert.throws(() => h.evaluate(`validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: ${JSON.stringify(days)}, updateStage: false, addTask: true } } })`), /days|task/i);
+  assert.doesNotThrow(() => h.evaluate("validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: null, updateStage: false, addTask: true } } })"));
+  for (const days of [-1, 0.5, 36501, '2']) assert.throws(() => h.evaluate(`validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: ${JSON.stringify(days)}, updateStage: false, addTask: true } } })`), /days|task/i);
   assert.doesNotThrow(() => h.evaluate("validateSettings({ ...settings, rules: { Lead: { next: 'Robot', days: null, updateStage: false, addTask: false } } })"));
 });
 
@@ -763,12 +764,7 @@ for (const days of [0, 7, null]) test(`rule task toggle preserves days ${days} a
   assert.match(form.closest('dialog').querySelector('style').textContent, /#pertama-settings \[hidden\]\{display:none!important\}/, 'hidden days must override the label display:block rule');
   assert.equal(input.value, days === null ? '' : String(days));
   task.checked = true; change(h, task);
-  assert.equal(input.closest('label').hidden, false); assert.equal(input.required, true);
-  if (days === null) {
-    submitSettings(h, form);
-    assert.equal(savedSettings(h), null);
-    assert.match(form.querySelector('[data-error]').textContent, /days|task/i);
-  }
+  assert.equal(input.closest('label').hidden, false); assert.equal(input.required, false);
   task.checked = false; change(h, task);
   assert.equal(input.required, false);
   assert.equal(input.value, days === null ? '' : String(days));
@@ -917,7 +913,7 @@ test('unconfigured stage allows manual stage update and defaults follow-up to tw
   form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
   await pending;
   assert.deepEqual(plain(h.w.__selectedActions), [
-    { action: 'stage', target: 'stage-new' }, { action: 'task', due: h.evaluate('futureDate(2)') },
+    { action: 'stage', target: 'stage-new' }, { action: 'task', due: `${h.evaluate('futureDate(2)')}T03:00:00.000Z` },
   ]);
   assert.deepEqual(h.alerts, []);
 });
@@ -1036,11 +1032,12 @@ for (const defaults of [
   }
   assert.equal(field('sms').checked, false);
   assert.equal(field('taskDays').value, '0', 'retain deadline even with task off');
+  const expectedDue = new Date(`${field('taskDue').value}+08:00`).toISOString();
   field('noteText').value = 'Manual note';
   submitSettings(h, form);
   const choices = await pending;
   for (const [action, key] of [['note', 'addNote'], ['task', 'addTask'], ['stage', 'updateStage']]) assert.equal(choices[action], defaults[key] === false);
-  assert.equal(choices.due, choices.task ? h.evaluate('futureDate(0)') : null);
+  assert.equal(choices.due, choices.task ? expectedDue : null);
 });
 
 test('no matching rule preserves legacy note and follow-up defaults', async t => {
@@ -1056,17 +1053,17 @@ test('no matching rule preserves legacy note and follow-up defaults', async t =>
 
 test('task preview shows weekday and time without exposing owner ID', t => {
   const h = harness(t);
-  h.evaluate("futureDate = days => days === 0 ? '2026-10-14' : '2026-10-15'");
+  h.evaluate("Date.now = () => Date.parse('2026-10-14T00:00:00Z'); futureDate = () => '2026-10-15'");
   const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada Test', firstName: 'Ada',
     phone: '', stage: 'New Lead', rule: { next: 'Attempted Contact', days: 0, updateStage: true }, due: '2026-10-14',
     ownerId: 'owner-a', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Attempted Contact'] })`);
   const dialog = h.w.document.getElementById('pertama-confirm-actions');
   const preview = dialog.querySelector('[data-task]');
-  assert.equal(preview.textContent, 'Call Ada\n2026-10-14 Wed at 11am WITA');
+  assert.equal(preview.textContent, 'Call Ada\n2026-10-14 Wed at 11:00 WITA');
   const days = dialog.querySelector('[name="taskDays"]');
   days.value = '1';
   days.dispatchEvent(new h.w.Event('input', { bubbles: true }));
-  assert.equal(preview.textContent, 'Call Ada\n2026-10-15 Thu at 11am WITA');
+  assert.equal(preview.textContent, 'Call Ada\n2026-10-15 Thu at 11:00 WITA');
   dialog.querySelector('[data-cancel]').click();
   return pending;
 });
@@ -1087,12 +1084,9 @@ test('Robot rule permits opt-in tasks and validates a user-entered deadline', as
   task.checked = true;
   form.dispatchEvent(new h.w.Event('change', { bubbles: true }));
   assert.equal(days.disabled, false);
-  assert.equal(days.required, true);
+  assert.equal(days.required, false);
   assert.equal(dialog.querySelector('[data-task-days]').hidden, false);
   form.elements.namedItem('note').checked = false;
-  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
-  assert.equal(dialog.isConnected, true, 'missing deadline must not close confirmation');
-  assert.equal(days.checkValidity(), false);
   days.value = '-1';
   days.dispatchEvent(new h.w.Event('input', { bubbles: true }));
   form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
@@ -1102,7 +1096,112 @@ test('Robot rule permits opt-in tasks and validates a user-entered deadline', as
   form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true }));
   const choices = await pending;
   assert.equal(choices.task, true);
-  assert.equal(choices.due, h.evaluate('futureDate(3)'));
+  assert.equal(choices.due, `${h.evaluate('futureDate(3)')}T03:00:00.000Z`);
+});
+
+for (const days of [0, null]) for (const [now, localDue, utcDue] of [
+  ['2026-10-14T02:15:42Z', '2026-10-14T13:15', '2026-10-14T05:15:00.000Z'],
+  ['2026-12-31T15:30:00Z', '2027-01-01T02:30', '2026-12-31T18:30:00.000Z'],
+]) test(`follow-up ${days} defaults to three hours after opening at ${now}`, async t => {
+  const h = harness(t);
+  h.evaluate(`Date.now = () => Date.parse('${now}')`);
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada', stage: 'Robot',
+    rule: { next: 'Robot', days: ${days}, addTask: true }, due: null, ownerId: 'owner-a',
+    taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const dialog = h.w.document.querySelector('#pertama-confirm-actions'), form = dialog.querySelector('form');
+  const picker = form.elements.namedItem('taskDue');
+  assert.ok(picker, 'compact date/time picker');
+  assert.equal(picker.type, 'datetime-local');
+  assert.match(picker.labels[0].textContent, /WITA/);
+  assert.equal(picker.value, localDue);
+  assert.equal(form.elements.namedItem('taskDays').required, false);
+  h.evaluate(`Date.now = () => Date.parse('${now}') + 3600000`);
+  change(h, form.elements.namedItem('note'));
+  assert.equal(picker.value, localDue, 'unrelated changes never move the opening-time default');
+  form.querySelector('[type=submit]').click();
+  assert.equal((await pending).due, utcDue);
+  assert.equal(h.requests.length, 0);
+});
+
+test('picker overrides survive toggles; days edits reset the picker, without saving defaults', async t => {
+  const h = harness(t);
+  h.evaluate("Date.now = () => Date.parse('2026-10-14T15:30:00Z')");
+  const before = plain(h.evaluate('settings'));
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada', stage: 'Robot',
+    rule: { next: 'Robot', days: 2, addTask: true }, ownerId: 'owner-a',
+    taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const form = h.w.document.querySelector('#pertama-confirm-actions form'), field = name => form.elements.namedItem(name);
+  assert.equal(field('taskDue').value, '2026-10-16T11:00');
+  field('taskDue').value = '2026-10-17T00:45'; change(h, field('taskDue'));
+  assert.match(form.querySelector('[data-task]').textContent, /2026-10-17 Sat at 00:45 WITA/);
+  field('task').checked = false; change(h, field('task'));
+  assert.equal(field('taskDue').disabled, true);
+  field('task').checked = true; change(h, field('task'));
+  assert.equal(field('taskDue').value, '2026-10-17T00:45');
+  field('taskDays').value = ''; field('taskDays').dispatchEvent(new h.w.Event('input', { bubbles: true }));
+  assert.equal(field('taskDue').value, '2026-10-15T02:30');
+  field('taskDays').value = '1'; field('taskDays').dispatchEvent(new h.w.Event('input', { bubbles: true }));
+  assert.equal(field('taskDue').value, '2026-10-15T11:00');
+  field('taskDue').value = '2026-10-17T00:45'; change(h, field('taskDue'));
+  form.querySelector('[type=submit]').click();
+  assert.equal((await pending).due, '2026-10-16T16:45:00.000Z');
+  assert.deepEqual(plain(h.evaluate('settings')), before);
+});
+
+for (const invalid of ['-1', '1.5', '36501']) test(`invalid days ${invalid} block confirmation even with a valid picker`, async t => {
+  const h = harness(t);
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada', stage: 'Robot',
+    rule: { next: 'Robot', days: 0, addTask: true }, ownerId: 'owner-a',
+    taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const dialog = h.w.document.querySelector('#pertama-confirm-actions'), form = dialog.querySelector('form');
+  form.elements.namedItem('taskDays').value = invalid;
+  form.elements.namedItem('taskDays').dispatchEvent(new h.w.Event('input', { bubbles: true }));
+  form.elements.namedItem('taskDue').value = '2026-10-17T00:45';
+  submitSettings(h, form);
+  assert.equal(dialog.isConnected, true);
+  assert.equal(form.elements.namedItem('taskDays').checkValidity(), false);
+  dialog.querySelector('[data-cancel]').click(); await pending;
+});
+
+test('empty picker blocks enabled tasks but does not block skipping tasks', async t => {
+  const h = harness(t);
+  const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada', stage: 'Robot',
+    rule: { next: 'Robot', days: 0, addTask: true }, ownerId: 'owner-a',
+    taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
+  const dialog = h.w.document.querySelector('#pertama-confirm-actions'), form = dialog.querySelector('form');
+  const picker = form.elements.namedItem('taskDue');
+  picker.value = ''; change(h, picker); submitSettings(h, form);
+  assert.equal(dialog.isConnected, true);
+  assert.equal(picker.checkValidity(), false);
+  form.elements.namedItem('task').checked = false; change(h, form.elements.namedItem('task'));
+  form.querySelector('[type=submit]').click();
+  assert.equal((await pending).due, null);
+});
+
+test('WITA picker parsing rejects impossible dates and preserves leap-day times', t => {
+  const h = harness(t);
+  for (const value of ['', '2026-02-30T12:00', '2026-10-17T25:00', '2026-10-17', '2026-10-17T12:00Z']) {
+    assert.equal(h.evaluate(`taskDueFromInput(${JSON.stringify(value)})`), null, value);
+  }
+  const due = h.evaluate("taskDueFromInput('2028-02-29T00:15')");
+  assert.equal(due, '2028-02-28T16:15:00.000Z');
+  assert.equal(h.evaluate(`taskDueInput('${due}')`), '2028-02-29T00:15');
+});
+
+test('blank settings days with Add task enabled save and reload without changing other rules', t => {
+  const h = harness(t);
+  const before = plain(h.evaluate('settings.rules'));
+  const form = settingsForm(h), row = form.querySelector('.rule-row');
+  row.querySelector('[data-days]').value = '';
+  assert.equal(row.querySelector('[data-task]').checked, true);
+  form.querySelector('[type=submit]').click();
+  const saved = savedSettings(h);
+  assert.ok(saved, 'blank days must be accepted by native and settings validation');
+  assert.equal(saved.rules['New Lead'].days, null);
+  assert.equal(saved.rules['New Lead'].addTask, true);
+  for (const stage of Object.keys(before).filter(stage => stage !== 'New Lead')) assert.equal(saved.rules[stage].days, before[stage].days);
+  const loaded = harness(t, { storedSettings: saved });
+  assert.deepEqual(plain(loaded.evaluate('settings')), saved);
 });
 
 test('Robot rule still disables task creation without a valid owner', async t => {
@@ -1112,6 +1211,7 @@ test('Robot rule still disables task creation without a valid owner', async t =>
     owner: '', ownerId: '', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Robot'] })`);
   const dialog = h.w.document.getElementById('pertama-confirm-actions');
   assert.equal(dialog.querySelector('[name="task"]').disabled, true);
+  assert.equal(dialog.querySelector('[name="taskDue"]').disabled, true);
   assert.match(dialog.querySelector('[data-task]').textContent, /owner/i);
   dialog.querySelector('[data-cancel]').click();
   assert.equal(await pending, null);
@@ -1319,13 +1419,13 @@ test('overlapping writes reject snapshots before and during writes, even after s
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
 });
 
-for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unavailable', 'sms-navigation-failure', 'stale-confirmation', 'navigation-failure', 'stage-mismatch', 'retained-modal',
+for (const mode of ['saved', 'all-actions', 'custom-time', 'all-actions-sms', 'sms-history-unavailable', 'sms-navigation-failure', 'stale-confirmation', 'navigation-failure', 'stage-mismatch', 'retained-modal',
   'mutation-after-recheck', 'user-after-recheck', 'route-after-recheck', 'stage-owner-automation', 'link-failure', 'task-route-change', 'empty-queue']) {
   test(`API Save and next without CRM forms: ${mode}`, { timeout: 3000 }, async t => {
     const contact = { id: 'contact-a', locationId: LOCATION, firstName: 'Ada', lastName: 'Test', phone: '+628123456789', assignedTo: 'owner-a' };
     const opportunity = { id: 'opp-a', contactId: 'contact-a', locationId: LOCATION, pipelineId: 'pipe-a', pipelineStageId: 'stage-atc', assignedTo: 'owner-a', indexVersion: 7, isAttribute: true };
     const smsEnabled = ['all-actions-sms', 'sms-history-unavailable', 'sms-navigation-failure'].includes(mode);
-    const allActions = smsEnabled || ['all-actions', 'stage-owner-automation', 'link-failure', 'task-route-change'].includes(mode);
+    const allActions = smsEnabled || ['all-actions', 'custom-time', 'stage-owner-automation', 'link-failure', 'task-route-change'].includes(mode);
     const writes = [];
     const checkpointKey = `pertama:no-answer:unfinished:${LOCATION}:contact-a`;
     const h = harness(t, { fetchResponse: request => {
@@ -1371,7 +1471,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
       if (url.pathname === '/objects/task/records') {
         assert.deepEqual(body.owners, ['owner-a'], 'assign contact owner, not current user');
         assert.equal(body.properties.contactId, 'contact-a');
-        assert.equal(body.properties.dueDate, `${h.evaluate('futureDate(3)')}T03:00:00.000Z`);
+        assert.equal(body.properties.dueDate, mode === 'custom-time' ? '2026-10-16T16:45:00.000Z' : `${h.evaluate('futureDate(3)')}T03:00:00.000Z`);
         if (mode === 'task-route-change') h.route(CONTACT_PATH.replace('contact-a', 'contact-other'));
         return { record: { id: 'task-created', locationId: LOCATION, objectKey: 'task', owners: body.owners,
           properties: { title: body.properties.title, dueDate: body.properties.dueDate.replace('.000Z', 'Z'), completed: 0 } }, errors: [] };
@@ -1405,7 +1505,7 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
     const pending = h.evaluate('run()'); await flush();
     const dialog = h.w.document.getElementById('pertama-confirm-actions');
     assert.ok(dialog, h.alerts.join('\n'));
-    assert.match(dialog.querySelector('[data-task]').textContent, /\d{4}-\d{2}-\d{2} (Mon|Tue|Wed|Thu|Fri|Sat|Sun) at 11am WITA/);
+    assert.match(dialog.querySelector('[data-task]').textContent, /\d{4}-\d{2}-\d{2} (Mon|Tue|Wed|Thu|Fri|Sat|Sun) at 11:00 WITA/);
     assert.doesNotMatch(dialog.querySelector('[data-task]').textContent, /owner-a|Contact owner/);
     const form = dialog.querySelector('form');
     form.elements.namedItem('stage').checked = true;
@@ -1413,6 +1513,11 @@ for (const mode of ['saved', 'all-actions', 'all-actions-sms', 'sms-history-unav
     form.elements.namedItem('note').checked = allActions;
     form.elements.namedItem('task').checked = allActions;
     form.elements.namedItem('taskDays').value = '3';
+    form.elements.namedItem('taskDays').dispatchEvent(new h.w.Event('input', { bubbles: true }));
+    if (mode === 'custom-time') {
+      form.elements.namedItem('taskDue').value = '2026-10-17T00:45';
+      change(h, form.elements.namedItem('taskDue'));
+    }
     form.elements.namedItem('noteText').value = 'No answer <b>literal</b>\nFollow up';
     assert.equal(form.elements.namedItem('sms').checked, false);
     assert.equal(h.requests.some(r => /phone-system|conversations/.test(r.url)), false, 'non-SMS confirmation must not fetch SMS data');

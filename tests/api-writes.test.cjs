@@ -29,7 +29,7 @@ function harness(t) {
   };
   const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'user1', sub: 'user1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
-  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({ 'token-id': token })}); workflow.startingContact = 'c1'; workflow.approvedActionContext = { contact:'c1', route:stageRouteRevision, user:currentUserId, epoch:contactReadEpoch, contactRecord:${JSON.stringify(contact)}, opportunity:${JSON.stringify(opportunity)}, targetStageId:'s2', targetStageName:'Next', ownerId:'owner1', noteText:'A < B & "quoted"\nsecond line', taskTitle:'Call Ada', due:'2026-10-10', actions:{stage:true,note:true,task:true}, taskId:null };`.replace('"quoted"\nsecond', '"quoted"\\nsecond'));
+  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({ 'token-id': token })}); workflow.startingContact = 'c1'; workflow.approvedActionContext = { contact:'c1', route:stageRouteRevision, user:currentUserId, epoch:contactReadEpoch, contactRecord:${JSON.stringify(contact)}, opportunity:${JSON.stringify(opportunity)}, targetStageId:'s2', targetStageName:'Next', ownerId:'owner1', noteText:'A < B & "quoted"\nsecond line', taskTitle:'Call Ada', due:'2026-10-10T03:00:00.000Z', actions:{stage:true,note:true,task:true}, taskId:null };`.replace('"quoted"\nsecond', '"quoted"\\nsecond'));
   return { w, e, calls, hook: fn => { hook = fn; }, checkpoint: () => w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`), run: name => e(`${name}()`), flush: () => new Promise(resolve => setImmediate(resolve)) };
 }
 test('exact API requests, confirmed checkpoints, stage lifecycle and no CRM DOM', async t => {
@@ -102,6 +102,35 @@ for (const patch of [{ id:'bad/id' },{ locationId:'other' },{ owners:['user1'] }
 for (const change of ['workflow.approvedActionContext.ownerId = "user1"','workflow.approvedActionContext.due = "2026-02-30"','workflow.approvedActionContext.due = "wrong"','workflow.approvedActionContext.taskTitle = ""']) test(`invalid task approval ${change}`, async t => {
   const h = harness(t); h.e(change); await assert.rejects(h.run('createTaskApi')); assert.equal(h.calls.length, 0);
 });
+test('custom deadline is sent, verified, journaled and remembered without reverting to 11am', async t => {
+  const h = harness(t), due = '2026-10-16T16:45:00.000Z';
+  h.e(`workflow.approvedActionContext.due = '${due}'`);
+  h.hook(c => c.path === '/objects/task/records' ? { record: { ...c.body, id: 't1', objectKey: 'task',
+    properties: { ...c.body.properties, dueDate: '2026-10-17T00:45:00+08:00' } }, errors: [] } : undefined);
+  await h.run('createTaskApi');
+  assert.equal(h.calls.find(c => c.path === '/objects/task/records').body.properties.dueDate, due);
+  assert.match(JSON.parse(h.checkpoint()).completed.join('\n'), /2026-10-17 Sat at 00:45 WITA/);
+  h.e('flushLeadHistory()');
+  const history = JSON.parse(h.w.localStorage.getItem(`pertama:lead-access:${L}:user1`));
+  assert.equal(history[0].tasks[0].due, due);
+});
+
+test('custom deadline rejects a server receipt rounded back to 11am', async t => {
+  const h = harness(t);
+  h.e("workflow.approvedActionContext.due = '2026-10-10T05:15:00.000Z'");
+  await assert.rejects(h.run('createTaskApi'), /expected task deadline/);
+  assert.equal(h.calls.filter(c => c.path.startsWith('/associations')).length, 0);
+  assert.match(JSON.parse(h.checkpoint()).pendingSave, /13:15 WITA/);
+});
+
+for (const due of ['2026-02-30T03:00:00.000Z', '2026-10-10T25:00:00.000Z', '2026-10-10T03:00', '2026-10-10', null]) {
+  test(`invalid timestamp approval ${due} fails before any request`, async t => {
+    const h = harness(t); h.e(`workflow.approvedActionContext.due = ${JSON.stringify(due)}`);
+    await assert.rejects(h.run('createTaskApi'), /Invalid approved task/);
+    assert.equal(h.calls.length, 0);
+  });
+}
+
 test('timeout aborts once, retains journal, balances stage lifecycle', async t => {
   const h = harness(t); let abortTimer;
   const nativeTimer = h.w.setTimeout.bind(h.w);

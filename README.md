@@ -14,7 +14,9 @@ The script's `@updateURL` and `@downloadURL` point to the raw file on the `main`
 
 In **Workflow settings**, each shared stage rule chooses the default actions for **Save and next**: update stage, add note, add follow-up task, and send SMS. You can override every selection before confirming; selecting SMS only loads its options, and does not send a message.
 
-Current and suggested next stages come from the checked pipelines. Saved stages that are no longer available remain visibly labeled and can be kept when saving unrelated settings. The suggested next stage stays editable even when stage updates are off. Follow-up days appear only when the task default is on; turning it off preserves the saved days (including zero). Tasks require a valid contact owner and are due at 11am WITA.
+Current and suggested next stages come from the checked pipelines. Saved stages that are no longer available remain visibly labeled and can be kept when saving unrelated settings. The suggested next stage stays editable even when stage updates are off. Follow-up days appear only when the task default is on; turning it off preserves the saved days (including zero). Tasks require a valid contact owner. With Add task enabled, **0 or blank follow-up days** defaults to three hours after opening confirmation (to the minute), even if that crosses midnight. Positive days default to 11am WITA on that future day.
+
+In **Save and next**, use **Scheduled for (WITA)** to choose an exact date and time for this save only. Changing follow-up days recalculates this picker; other action toggles preserve your chosen time. All picker values use WITA (UTC+8), regardless of your browser timezone. Existing saved rules are not changed.
 
 Older rules retain their defaults: notes on, SMS off, and tasks on when follow-up days were set. Stages without a rule retain their existing defaults.
 
