@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.16
+// @version      1.0.17
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.16';
+  const VERSION = '1.0.17';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -2282,9 +2282,10 @@
           #pertama-confirm-actions input:focus-visible+.track{outline:3px solid #84adff;outline-offset:3px}
           #pertama-confirm-actions input:disabled+.track{opacity:.45}
           #pertama-confirm-actions .detail{margin-top:4px;font-size:13px;color:#667085;white-space:pre-line}
-          #pertama-confirm-actions input[type=number]{width:90px;margin:6px 8px 0 0;padding:8px 10px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit}
-          #pertama-confirm-actions .task-due{display:block;margin-top:6px}
-          #pertama-confirm-actions input[type=datetime-local]{display:block;max-width:100%;margin-top:4px;padding:6px 8px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
+          #pertama-confirm-actions .task-schedule{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-top:6px}
+          #pertama-confirm-actions .task-schedule label{display:flex;align-items:center;gap:6px;max-width:100%;white-space:nowrap}
+          #pertama-confirm-actions .task-schedule input{min-width:0;margin:0;padding:6px 8px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
+          #pertama-confirm-actions input[name=taskDays]{width:60px}
           #pertama-confirm-actions select{display:block;width:100%;margin-top:6px;padding:8px 10px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
           #pertama-confirm-actions select:disabled{background:#f9fafb;color:#98a2b3}
           #pertama-confirm-actions textarea{display:block;width:100%;resize:vertical;min-height:54px;margin-top:6px;padding:8px 10px;border:1px solid #d0d5dd;border-radius:8px;font:inherit;color:inherit;background:#fff}
@@ -2301,7 +2302,7 @@
           <div class="actions">
             <section><label class="toggle">Update stage<span class="switch"><input name="stage" type="checkbox" role="switch" checked><span class="track"></span></span></label><p class="detail" data-stage></p><select name="targetStage" aria-label="Stage to update to"></select></section>
             <section><label class="toggle">Add note<span class="switch"><input name="note" type="checkbox" role="switch" checked><span class="track"></span></span></label><textarea name="noteText" aria-label="Note text" rows="2"></textarea></section>
-            <section><label class="toggle">Add task<span class="switch"><input name="task" type="checkbox" role="switch"><span class="track"></span></span></label><label class="detail" data-task-days>Follow up in <input name="taskDays" type="number" min="0" max="36500" step="1" aria-label="Follow up in days">days</label><p class="detail">0 or blank = 3 hours later</p><label class="detail task-due">Scheduled for (WITA)<input name="taskDue" type="datetime-local" step="60"></label><p class="detail" data-task></p></section>
+            <section><label class="toggle">Add task<span class="switch"><input name="task" type="checkbox" role="switch"><span class="track"></span></span></label><div class="detail task-schedule"><label data-task-days>In <input name="taskDays" type="number" min="0" max="36500" step="1" aria-label="Follow up in days" title="0 or blank = 3 hours later" aria-describedby="pertama-task-days-help">days</label><label><input name="taskDue" type="datetime-local" step="60" aria-label="Scheduled for (WITA)">WITA</label></div><span id="pertama-task-days-help" hidden>0 or blank = 3 hours later</span><p class="detail" data-task></p></section>
             <section><label class="toggle">Send SMS<span class="switch"><input name="sms" type="checkbox" role="switch"><span class="track"></span></span></label><p class="detail" data-recipient></p><p class="detail" data-sms-status></p><textarea name="smsText" aria-label="SMS message" placeholder="Write your message…" rows="7" disabled hidden></textarea></section>
           </div>
           <footer><p class="detail" data-next></p><div class="buttons"><button type="button" data-cancel>Cancel</button><button type="submit">Confirm &amp; next</button></div></footer>
@@ -2335,7 +2336,7 @@
         field('taskDays').setCustomValidity(daysDue() ? '' : 'Enter whole days from 0 to 36500, or leave blank for 3 hours later.');
         field('taskDue').setCustomValidity(due ? '' : 'Choose a valid date and time in WITA.');
         dialog.querySelector('[data-task]').textContent = !ownerId ? 'No valid contact owner assigned. Task creation is unavailable.'
-          : due ? `${taskTitle}\n${taskDueLabel(due)}` : 'Choose a valid date and time in WITA.';
+          : due ? taskTitle : 'Choose a valid date and time in WITA.';
       }
       function resetTaskDate() {
         const due = daysDue();

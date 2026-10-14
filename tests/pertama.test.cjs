@@ -1051,7 +1051,7 @@ test('no matching rule preserves legacy note and follow-up defaults', async t =>
   dialog.querySelector('[data-cancel]').click(); await pending;
 });
 
-test('task preview shows weekday and time without exposing owner ID', t => {
+test('task controls share a compact row with tooltip help and no duplicate deadline', t => {
   const h = harness(t);
   h.evaluate("Date.now = () => Date.parse('2026-10-14T00:00:00Z'); futureDate = () => '2026-10-15'");
   const pending = h.evaluate(`confirmActions({ contact: { id: 'contact-a' }, name: 'Ada Test', firstName: 'Ada',
@@ -1059,11 +1059,24 @@ test('task preview shows weekday and time without exposing owner ID', t => {
     ownerId: 'owner-a', taskTitle: 'Call Ada', pipelineName: 'Sales', stageOptions: ['Attempted Contact'] })`);
   const dialog = h.w.document.getElementById('pertama-confirm-actions');
   const preview = dialog.querySelector('[data-task]');
-  assert.equal(preview.textContent, 'Call Ada\n2026-10-14 Wed at 11:00 WITA');
+  assert.equal(preview.textContent, 'Call Ada');
   const days = dialog.querySelector('[name="taskDays"]');
+  const picker = dialog.querySelector('[name="taskDue"]');
+  const row = days.closest('.task-schedule');
+  assert.ok(row, 'shared schedule row');
+  assert.ok(row.contains(picker));
+  assert.equal(h.w.getComputedStyle(row).display, 'flex');
+  assert.equal(h.w.getComputedStyle(row).flexWrap, 'wrap', 'wrap on narrow screens');
+  assert.equal(days.title, '0 or blank = 3 hours later');
+  const help = dialog.querySelector(`#${days.getAttribute('aria-describedby')}`);
+  assert.equal(help.hidden, true, 'helper is not another visible row');
+  assert.equal(help.textContent, days.title);
+  assert.equal(picker.getAttribute('aria-label'), 'Scheduled for (WITA)');
+  assert.equal(picker.value, '2026-10-14T11:00');
   days.value = '1';
   days.dispatchEvent(new h.w.Event('input', { bubbles: true }));
-  assert.equal(preview.textContent, 'Call Ada\n2026-10-15 Thu at 11:00 WITA');
+  assert.equal(picker.value, '2026-10-15T11:00');
+  assert.equal(preview.textContent, 'Call Ada', 'date only appears in the picker');
   dialog.querySelector('[data-cancel]').click();
   return pending;
 });
@@ -1133,7 +1146,7 @@ test('picker overrides survive toggles; days edits reset the picker, without sav
   const form = h.w.document.querySelector('#pertama-confirm-actions form'), field = name => form.elements.namedItem(name);
   assert.equal(field('taskDue').value, '2026-10-16T11:00');
   field('taskDue').value = '2026-10-17T00:45'; change(h, field('taskDue'));
-  assert.match(form.querySelector('[data-task]').textContent, /2026-10-17 Sat at 00:45 WITA/);
+  assert.equal(form.querySelector('[data-task]').textContent, 'Call Ada');
   field('task').checked = false; change(h, field('task'));
   assert.equal(field('taskDue').disabled, true);
   field('task').checked = true; change(h, field('task'));
@@ -1505,7 +1518,8 @@ for (const mode of ['saved', 'all-actions', 'custom-time', 'all-actions-sms', 's
     const pending = h.evaluate('run()'); await flush();
     const dialog = h.w.document.getElementById('pertama-confirm-actions');
     assert.ok(dialog, h.alerts.join('\n'));
-    assert.match(dialog.querySelector('[data-task]').textContent, /\d{4}-\d{2}-\d{2} (Mon|Tue|Wed|Thu|Fri|Sat|Sun) at 11:00 WITA/);
+    assert.equal(dialog.querySelector('[data-task]').textContent, 'Call again Ada Test');
+    assert.match(dialog.querySelector('[name="taskDue"]').value, /^\d{4}-\d{2}-\d{2}T11:00$/);
     assert.doesNotMatch(dialog.querySelector('[data-task]').textContent, /owner-a|Contact owner/);
     const form = dialog.querySelector('form');
     form.elements.namedItem('stage').checked = true;
