@@ -36,3 +36,16 @@
 - Chunk 4 complete: test commit `f4524d1`; script commit `3c094a1`. Constant-size revision identities, single serialization of captured queries, identical catalog recaptures suppressed. 697/697 tests pass.
 - Chunk 5 complete: test commit `21126d0`; script commit `f8473cc`. Fetch/XHR share one parsed URL and memoized request-body clone/decode across passive consumers. Existing response consumers are endpoint-disjoint, so no speculative shared-response abstraction was added. 699/699 tests pass.
 - Chunk 6 complete: characterization commit `744e689`; script commit `4a9ec02`. Five request lifetimes share timeout/cleanup; four wrappers share native HTTP/JSON mechanics. Reports intentionally retain their distinct denial and abort-race semantics. 709/709 tests pass.
+- Chunk 7 complete: test commit `5b5b262`; script commit `ea7a02f`. Journal state and mutation/rollback now belong to one closure with explicit methods; general workflow state no longer owns journal fields. 714/714 tests pass.
+- Chunk 8 complete: test commit `2b34050`; script commit `2932dbf`. Stable host subscriptions are retained, four formatters reused per report dialog, and exact observed board snapshots avoid page-wide label scans. No verified picker selector was available in repository fixtures, so the fast path uses validated server record identity instead of inventing a DOM selector; ambiguous label fallback is preserved. 719/719 tests pass.
+
+## Deterministic work reductions
+
+- Native task search observers: two Request clones/body decodes reduced to one shared clone/decode (fetch and XHR tested).
+- Stable toolbar: no serialization of whole catalog/query objects; five stable refreshes incur zero observer subscriptions/disconnections instead of 45 observe calls.
+- Validated board click with 600 unrelated nested controls: 1,205 geometry checks reduced to fewer than 10.
+- Report rendering 90 dates: 360 Intl formatters reduced to four, reused on rerun.
+- Settings sender selection: only inventory is requested, rather than contact + inventory + drafts; no valid recipient phone is required.
+- History updates: contact lookup uses an index and no row serialization, with explicit tests across 2,000 contacts, task batches, eviction and flush replacement.
+
+These are operation-count guarantees, not measured live-browser latency improvements. No release version bump or push is part of this session.

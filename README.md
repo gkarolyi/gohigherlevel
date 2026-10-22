@@ -66,3 +66,16 @@ npm test
 ```
 
 Edit `gohigherlevel.user.js` directly. The tests in `tests/` load that file; there is no generated copy. Do not commit HAR captures, CRM credentials, contact data, or private business documents to this public repository.
+
+### Runtime boundaries
+
+The script stays single-file, with deliberately small internal boundaries:
+
+- **Session and contact reads:** route/session revisions and contact epochs retire stale work. Approved saves account explicitly for their own invalidations; external mutations still stop continuation.
+- **Transport:** `requestLifetime` owns timeout/cleanup; `fetchCrmJson` shares native HTTP/JSON mechanics only. Endpoint permissions, final guards, durable intent, receipt verification and no-retry policy remain in the endpoint callers. Reports retain their special permission-denial and cancellation handling.
+- **Journal:** `journal` owns completed evidence, pending operations, SMS uncertainty, persistence and rollback. Treat its getters as read-only; mutate through its methods. An accepted write can still leave an unfinished checkpoint if continuation is unsafe.
+- **History:** persisted arrays retain their existing format and cross-tab merge rules. In-memory contact indexes follow array identity and eviction; observation callbacks explicitly report changes instead of serializing rows.
+- **Queue counts:** settings/catalog/query/queue revisions form the small snapshot key. Keep revision increments with the corresponding input mutations, including lazy query initialization and navigation rollback; do not restore whole-object serialization to toolbar refreshes.
+- **DOM:** stable hosts retain observer subscriptions. Validated opportunity snapshots identify board clicks without a global label scan; the label-based fallback remains for missing snapshots.
+
+Performance regression tests count work rather than assert wall-clock timings: one native body clone/decode across observers, no large-object queue serialization during stable refreshes, no stable-host resubscriptions, indexed history updates, inventory-only Settings requests, and four report date formatters reused across rows/reruns. jsdom cannot establish real browser layout costs or live CRM compatibility.
