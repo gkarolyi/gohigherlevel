@@ -114,13 +114,15 @@ for (const result of ['missing','otherId','pending','renamed','wrongAssociation'
   await assert.rejects(h.run()); assert.equal(h.puts().length,1); assert.match(h.checkpoint(),/accepted/); assert.doesNotMatch(h.checkpoint(),/completed and verified/);
 });
 test('bounded readback tolerates indexing lag without retrying PUT', async t => {
-  const h = harness(t); let reads = 0; const delays = [], timer = h.w.setTimeout.bind(h.w);
+  const h = harness(t); let reads = 0;
+  h.hook(c => c.init.method === 'POST' && h.puts().length && ++reads < 3 ? list([task]) : undefined);
+  await h.prepare(); // History's flush timer is scheduled during preflight, not readback.
+  const delays = [], timer = h.w.setTimeout.bind(h.w);
   h.w.setTimeout = (fn, ms, ...args) => {
     if ([500, 1000].includes(ms)) { delays.push(ms); return timer(fn, 0, ...args); }
     return timer(fn, ms, ...args);
   };
-  h.hook(c => c.init.method === 'POST' && h.puts().length && ++reads < 3 ? list([task]) : undefined);
-  await h.run(); assert.equal(h.puts().length,1); assert.match(h.checkpoint(),/completed and verified/); assert.deepEqual(delays,[500,1000]);
+  await h.complete(); assert.equal(h.puts().length,1); assert.match(h.checkpoint(),/completed and verified/); assert.deepEqual(delays,[500,1000]);
 });
 test('route change after accepted PUT journals acceptance on original contact only', async t => {
   const h = harness(t); h.hook(c => {if(c.init.method === 'PUT') h.w.history.pushState({},'',route.replace('c1','c2'));});
