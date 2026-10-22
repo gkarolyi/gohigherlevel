@@ -84,6 +84,37 @@ test('history index follows eviction and replacement on flush', t => {
   }`);
 });
 
+test('passive consumers share one native Request body clone and decode', async t => {
+  const h = harness(t); h.handler(() => list([task()]));
+  const raw = JSON.stringify({ locationId: L, page: 1, includeTopRelations: true,
+    filters: [{ field: 'properties.completed', operator: 'eq', value: 0 }] });
+  const request = new Request(`${origin}/objects/task/records/search`, { method: 'POST', body: raw });
+  let clones = 0;
+  const clone = request.clone.bind(request);
+  request.clone = () => { clones++; return clone(); };
+  h.w.__rawBody = raw;
+  h.e(`globalThis.__bodyDecodes = 0; const parseBody = JSON.parse;
+    JSON.parse = function(value, ...args) { if (value === globalThis.__rawBody) globalThis.__bodyDecodes++; return parseBody.call(this, value, ...args); }`);
+  await h.w.fetch(request); await h.flush();
+  assert.equal(clones, 1);
+  assert.equal(h.e('globalThis.__bodyDecodes'), 1);
+  assert.equal(h.history()[0].tasks[0].id, 't1');
+  assert.equal(h.e('queryTemplates.tasks.page'), 1);
+});
+
+test('passive XHR consumers share one request body decode', async t => {
+  const h = harness(t);
+  const raw = JSON.stringify({ locationId: L, page: 1, includeTopRelations: true,
+    filters: [{ field: 'properties.completed', operator: 'eq', value: 0 }] });
+  h.w.__rawBody = raw;
+  h.e(`globalThis.__bodyDecodes = 0; const parseBody = JSON.parse;
+    JSON.parse = function(value, ...args) { if (value === globalThis.__rawBody) globalThis.__bodyDecodes++; return parseBody.call(this, value, ...args); }`);
+  const xhr = new h.w.XMLHttpRequest(); xhr.open('POST', `${origin}/objects/task/records/search`);
+  xhr.send(raw); xhr.finish(list([task()])); await h.flush();
+  assert.equal(h.e('globalThis.__bodyDecodes'), 1);
+  assert.equal(h.history()[0].tasks[0].id, 't1');
+});
+
 test('native Request task search is captured before original fetch consumes its body', async t => {
   const h = harness(t); h.handler(() => list([task()]));
   const request = new Request(`${origin}/objects/task/records/search`, { method: 'POST', body: JSON.stringify({ locationId: L }) });
