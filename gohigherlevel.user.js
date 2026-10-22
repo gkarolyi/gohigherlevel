@@ -1107,6 +1107,12 @@
   // Local, bounded last-known history. Never stores credentials, phone numbers or full responses.
   const LEAD_RETENTION = 180 * 86400000;
   const leadHistories = new Map();
+  const leadHistoryIndexes = new WeakMap();
+  function leadHistoryIndex(rows) {
+    if (!leadHistoryIndexes.has(rows)) leadHistoryIndexes.set(rows, new Map(rows.map(row => [row.id, row])));
+    return leadHistoryIndexes.get(rows);
+  }
+  function rememberedLead(id, context) { return leadHistoryIndex(leadHistory(context)).get(id); }
   let leadHistoryTimer = null, leadStorageWarning = '', leadReportRun = null, leadReportDialog = null, callCounterView = null;
   const leadId = id => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id);
   const leadHistoryKey = user => `pertama:lead-access:${LOCATION_ID}:${user}`;
@@ -1161,22 +1167,28 @@
   window.addEventListener('pagehide', flushLeadHistory);
   function updateLeadHistory(id, context, update) {
     if (!leadId(id) || !validLeadContext(context)) return;
-    const rows = leadHistory(context), old = rows.find(r => r.id === id);
+    const rows = leadHistory(context), index = leadHistoryIndex(rows), old = index.get(id);
     const row = old || { id, name: '', lastAccessible: null, lastCall: null, observedAt: Date.now(), tasks: [] };
-    const before = JSON.stringify(row); update(row);
-    if (!old) rows.push(row);
-    if (before !== JSON.stringify(row) || !old) {
-      if (rows.length > 2000) { rows.sort((a, b) => b.observedAt - a.observedAt); rows.splice(2000); }
+    const changed = update(row);
+    if (!old) { rows.push(row); index.set(id, row); }
+    if (changed || !old) {
+      if (rows.length > 2000) {
+        rows.sort((a, b) => b.observedAt - a.observedAt);
+        for (const removed of rows.splice(2000)) index.delete(removed.id);
+      }
       if (leadHistoryTimer === null) leadHistoryTimer = setTimeout(flushLeadHistory, 1000);
     }
   }
   function rememberLeadContact(contact, context, report = false) {
     if (contact?.locationId !== LOCATION_ID) return;
     updateLeadHistory(contact.id, context, row => {
-      row.name = [contact.firstName, contact.lastName].filter(v => typeof v === 'string').join(' ').trim().slice(0, 300) || row.name;
-      row.lastAccessible = Date.now();
+      const name = [contact.firstName, contact.lastName].filter(v => typeof v === 'string').join(' ').trim().slice(0, 300) || row.name;
+      const now = Date.now(), observedAt = report ? row.observedAt : now;
+      const changed = row.name !== name || row.lastAccessible !== now || row.observedAt !== observedAt;
+      row.name = name; row.lastAccessible = now;
       // A synthetic report check is not new activity and must not extend retention.
-      if (!report) row.observedAt = Date.now();
+      row.observedAt = observedAt;
+      return changed;
     });
   }
   function newerLeadTask(task, previous) {
@@ -1188,14 +1200,16 @@
       const saved = { id: task.id, title: task.title.slice(0, 500), due: typeof task.due === 'string' ? task.due.slice(0, 100) : '',
         completed: task.completed, observedAt: task.observedAt };
       const index = row.tasks.findIndex(t => t.id === task.id);
-      if (!newerLeadTask(saved, row.tasks[index])) return;
+      const previous = row.tasks[index];
+      if (!newerLeadTask(saved, previous) || previous && ['title', 'due', 'completed', 'observedAt'].every(key => saved[key] === previous[key])) return false;
       if (index < 0) row.tasks.push(saved); else row.tasks[index] = saved;
       row.tasks = row.tasks.filter(t => t.observedAt > Date.now() - LEAD_RETENTION).sort((a, b) => b.observedAt - a.observedAt).slice(0, 20);
       row.observedAt = Math.max(row.observedAt, task.observedAt);
+      return true;
     });
   }
   function completeRememberedLeadTask(id, taskId, context) {
-    const task = leadHistory(context).find(r => r.id === id)?.tasks.find(t => t.id === taskId);
+    const task = rememberedLead(id, context)?.tasks.find(t => t.id === taskId);
     if (task) rememberLeadTask(id, { ...task, completed: true, observedAt: Date.now() }, context);
   }
   function normalizedLeadTasks(data) {
@@ -1216,7 +1230,7 @@
     try {
       for (const { row, contact } of normalizedLeadTasks(data)) {
         if (!contact) continue;
-        const known = leadHistory(context).find(r => r.id === contact)?.tasks.some(t => t.id === row.id);
+        const known = rememberedLead(contact, context)?.tasks.some(t => t.id === row.id);
         if (row.owners.includes(context.user) || known) rememberLeadTask(contact, { id: row.id, title: row.properties.title,
           due: row.properties.dueDate, completed: Boolean(row.properties.completed), observedAt: context.observedAt ?? Date.now() }, context);
       }
@@ -1343,7 +1357,12 @@
           const date = Date.parse(row.dateAdded);
           if (row.userId !== run.context.user || date < Date.parse(body.startDate) || date > Date.parse(body.endDate)) continue;
           candidates.add(row.contactId);
-          updateLeadHistory(row.contactId, run.context, saved => { saved.lastCall = Math.max(saved.lastCall || 0, date); saved.observedAt = Math.max(saved.observedAt, date); });
+          updateLeadHistory(row.contactId, run.context, saved => {
+            const lastCall = Math.max(saved.lastCall || 0, date), observedAt = Math.max(saved.observedAt, date);
+            const changed = saved.lastCall !== lastCall || saved.observedAt !== observedAt;
+            saved.lastCall = lastCall; saved.observedAt = observedAt;
+            return changed;
+          });
         }
         if (calls.size === total) break;
         if (!added || data.rows.length !== 50 || (page + 1) * 50 >= total) throw new Error('Repeated or incomplete call pages.');
@@ -1375,7 +1394,7 @@
         try {
           const data = await leadReportRequest(run, 'contact', id);
           if (data.denied) {
-            const saved = leadHistory(run.context).find(r => r.id === id);
+            const saved = rememberedLead(id, run.context);
             result.rows.push({ id, name: saved?.name || id, lastCall: saved?.lastCall, lastAccessible: saved?.lastAccessible,
               tasks: (saved?.tasks || []).filter(t => !t.completed) });
           } else rememberLeadContact(normalizeContactRead('details', data, id), run.context, true);
