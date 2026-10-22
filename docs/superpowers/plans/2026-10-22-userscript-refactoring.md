@@ -32,3 +32,7 @@
 - Planning/baseline complete: clean baseline, 657/657 tests pass.
 - Chunk 1 complete: test commits `762d6b7`, `9699abb`, `bf7b62b`; script commit `f61c408`. Removed sequential approval mode and standalone task-completion orchestration; 668/668 tests pass.
 - Chunk 2 complete: test commits `1b9c93e`, `ac4c6fb`; script commit `33ffd47`. Settings reads inventory only, independent of contact recipient validity; sender and send guards retained. Parent reran default `npm test`: 691/691 pass.
+- Chunk 3 complete: test commits `25844fc`, `9adf233`; script commit `b135b01`. Weakly cached contact-ID indexes follow array replacement/eviction; observations report changes without serializing rows. 694/694 tests pass.
+- Chunk 4 complete: test commit `f4524d1`; script commit `3c094a1`. Constant-size revision identities, single serialization of captured queries, identical catalog recaptures suppressed. 697/697 tests pass.
+- Chunk 5 complete: test commit `21126d0`; script commit `f8473cc`. Fetch/XHR share one parsed URL and memoized request-body clone/decode across passive consumers. Existing response consumers are endpoint-disjoint, so no speculative shared-response abstraction was added. 699/699 tests pass.
+- Chunk 6 complete: characterization commit `744e689`; script commit `4a9ec02`. Five request lifetimes share timeout/cleanup; four wrappers share native HTTP/JSON mechanics. Reports intentionally retain their distinct denial and abort-race semantics. 709/709 tests pass.
