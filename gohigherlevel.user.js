@@ -44,6 +44,8 @@
     },
   };
   let settings = JSON.parse(JSON.stringify(SETTINGS_DEFAULTS));
+  let settingsRevision = 0, catalogRevision = 0, queryRevision = 0, stageQueueRevision = 0;
+  let catalogSerialized = '';
   function validateSettings(value) {
     if (!value || !['leads', 'tasks', 'stage'].includes(value.priority)
       || !Array.isArray(value.pipelineIds) || value.pipelineIds.some(id => typeof id !== 'string')
@@ -107,8 +109,12 @@
   }
   function rememberPipelines(data) {
     const pipelines = normalizePipelines(data);
-    localStorage.setItem(CATALOG_KEY, JSON.stringify({ pipelines }));
+    const serialized = JSON.stringify({ pipelines });
+    if (serialized === catalogSerialized) return;
+    localStorage.setItem(CATALOG_KEY, serialized);
+    catalogSerialized = serialized;
     NAV_PIPELINES.splice(0, NAV_PIPELINES.length, ...pipelines);
+    catalogRevision++;
     refreshButtons();
   }
   try {
@@ -116,6 +122,7 @@
     if (cached) {
       const raw = { pipelines: cached.pipelines.map(p => ({ ...p, stages: Object.entries(p.stages).map(([name, id]) => ({ name, id })) })) };
       NAV_PIPELINES.splice(0, NAV_PIPELINES.length, ...normalizePipelines(raw));
+      catalogSerialized = JSON.stringify({ pipelines: NAV_PIPELINES });
     }
   } catch { /* Discovery will populate the catalog when the CRM loads its list. */ }
   function pipelineListRequest(url) {
@@ -181,6 +188,7 @@
   // Generic request shape; captured CRM searches preserve the user's filters/order.
   const queryTemplates = {};
   const persistedQueries = new Map();
+  const serializedQueries = new Map();
   function defaultPipelineQuery(pipeline) {
     return {
       locationId: LOCATION_ID,
@@ -213,6 +221,7 @@
       const saved = JSON.parse(localStorage.getItem(`pertama:query:${key}`) || 'null');
       if (saved?.locationId === LOCATION_ID) queryTemplates[key] = saved;
     } catch { /* Use the recorded filters and sort as defaults. */ }
+    serializedQueries.set(key, JSON.stringify(queryTemplates[key]));
   }
   // Query templates contain filters/order only. Authentication stays in memory.
   let liveReadHeaders = null;
@@ -252,10 +261,11 @@
       && body.page === 1 && filterValues(body.filters, 'properties.completed').includes(0)
       && !JSON.stringify(body.filters).includes('TASK_CONTACT_ASSOCIATION')) key = 'tasks';
     if (key) {
-      const changed = JSON.stringify(queryTemplates[key]) !== JSON.stringify(body);
-      queryTemplates[key] = body;
-      if (changed) { hideQueueSummary(); refreshButtons(); }
       const serialized = JSON.stringify(body);
+      const previous = serializedQueries.get(key) ?? JSON.stringify(queryTemplates[key]);
+      queryTemplates[key] = body;
+      serializedQueries.set(key, serialized);
+      if (previous !== serialized) { queryRevision++; hideQueueSummary(); refreshButtons(); }
       if (persistedQueries.get(key) !== serialized) {
         try {
           localStorage.setItem(`pertama:query:${key}`, serialized);
@@ -361,8 +371,10 @@
     if (!pipeline?.stages[stage]) throw new Error(`Unrecognised pipeline/stage: ${stage}`);
     if (!queryTemplates[pipeline.id]) {
       try { const saved = JSON.parse(localStorage.getItem(`pertama:query:${pipeline.id}`) || 'null'); if (saved?.locationId === LOCATION_ID) queryTemplates[pipeline.id] = saved; } catch { /* Board visit required. */ }
+      if (!queryTemplates[pipeline.id]) queryTemplates[pipeline.id] = defaultPipelineQuery(pipeline);
+      serializedQueries.set(pipeline.id, JSON.stringify(queryTemplates[pipeline.id]));
+      queryRevision++;
     }
-    if (!queryTemplates[pipeline.id]) queryTemplates[pipeline.id] = defaultPipelineQuery(pipeline);
     const body = JSON.parse(JSON.stringify(queryTemplates[pipeline.id]));
     body.locationId = LOCATION_ID;
     const ids = filterValues(body.filters, 'pipeline_id');
@@ -548,6 +560,7 @@
         if (location.pathname === sourcePath && stageRouteRevision === sourceRevision) {
           retiringContactControls = [];
           stageQueue = previousQueue;
+          stageQueueRevision++;
           if (previousQueue) sessionStorage.setItem(STAGE_QUEUE_KEY, JSON.stringify(previousQueue));
           else sessionStorage.removeItem(STAGE_QUEUE_KEY);
           if (previousOrigin === null) sessionStorage.removeItem(originKey);
@@ -580,6 +593,7 @@
   } catch { /* Without a readable queue, require explicit selection. */ }
 
   function clearStageQueue() {
+    if (stageQueue) stageQueueRevision++;
     stageQueue = null;
     refreshButtons();
     sessionStorage.removeItem(STAGE_QUEUE_KEY);
@@ -625,6 +639,7 @@
     }));
     sessionStorage.setItem(STAGE_QUEUE_KEY, JSON.stringify(queue));
     stageQueue = queue;
+    stageQueueRevision++;
     refreshButtons();
   }
   function stageQueueLabel() {
@@ -2945,7 +2960,7 @@
           const pipeline = NAV_PIPELINES.find(p => p.id === id);
           if (!pipeline || !pipeline.stages[next.newLeadStage]) throw new Error(`${pipeline?.name || 'Unavailable pipeline'} has no ${next.newLeadStage} stage. Disable it or change the stage name.`);
         }
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); settings = next; close();
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); settings = next; settingsRevision++; close();
         hideQueueSummary(); refreshButtons(); taskNotice('Workflow settings saved.');
       } catch (error) { dialog.querySelector('[data-error]').textContent = error.message; }
     });
@@ -2980,7 +2995,7 @@
   };
   function queueIdentity() {
     return JSON.stringify([location.pathname, stageRouteRevision, currentUserId, readSessionRevision, contactReadEpoch, queueSaveRevision,
-      settings.priority, settings.pipelineIds, settings.newLeadStage, stageQueue, NAV_PIPELINES, queryTemplates]);
+      settingsRevision, stageQueueRevision, catalogRevision, queryRevision]);
   }
   function updateQueueSummary(show, allowReads) {
     const context = contactReadContext();
