@@ -307,6 +307,29 @@
     requestDiagnostics.push(diagnostic);
     if (requestDiagnostics.length > 30) requestDiagnostics.shift();
   }
+  function requestLifetime(diagnostic = null) {
+    const controller = new AbortController(), started = Date.now();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    if (diagnostic) recordRequest(diagnostic);
+    return { controller, finish() {
+      clearTimeout(timeout);
+      if (diagnostic) diagnostic.elapsedMs = Date.now() - started;
+    } };
+  }
+  // Mechanics only: endpoint policy, final guards, journaling and receipts stay with callers.
+  // No await before native dispatch and no retries. Reports retain their denial/cancellation policy.
+  async function fetchCrmJson(url, init, diagnostic, rejectAuthorization = rejectCrmAuthorization) {
+    const response = await originalFetch.call(window, url, init);
+    diagnostic.status = response.status;
+    if (!response.ok) {
+      if ([401, 403].includes(response.status)) rejectAuthorization();
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+  function validCrmData(data) {
+    return data && typeof data === 'object' && !Array.isArray(data) && !data.error && !data.errors?.length;
+  }
   async function crmRequest(method, path, body, saveDescription = '') {
     const contactRead = method === 'GET' && /^\/contacts\/[a-zA-Z0-9_-]+$/.test(path) && body === undefined;
     const listRead = method === 'POST' && ['/opportunities/search', '/objects/task/records/search'].includes(path) && body?.locationId === LOCATION_ID;
@@ -318,23 +341,14 @@
     const wire = wireRequest(method, path, body);
     const diagnostic = { method, url: contactRead ? 'https://services.leadconnectorhq.com/contacts/{id}' : wire.url, started: new Date().toISOString(), status: null,
       result: 'pending', requestFields: Object.keys(body || {}) };
-    recordRequest(diagnostic);
-    const started = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const lifetime = requestLifetime(diagnostic), { controller } = lifetime;
     try {
-      const response = await originalFetch.call(window, wire.url, {
+      const data = await fetchCrmJson(wire.url, {
         method, headers: { ...wire.headers, ...requestHeaders },
         redirect: 'error',
         ...(contactRead ? { cache: 'no-store' } : {}),
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: controller.signal,
-      });
-      diagnostic.status = response.status;
-      if (!response.ok) {
-        if ([401, 403].includes(response.status) && liveReadHeaders === requestHeaders) rejectCrmAuthorization();
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const data = await response.json();
+      }, diagnostic, () => { if (liveReadHeaders === requestHeaders) rejectCrmAuthorization(); });
       if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Expected a JSON object response.');
       diagnostic.responseFields = Object.keys(data);
       if (data.error || data.errors?.length) throw new Error('Server returned an error in its response.');
@@ -347,7 +361,7 @@
       const detail = diagnostic.status === null && error.name !== 'AbortError'
         ? ' Browser supplied no HTTP response. Inspect Network/Console for a connection, CORS or redirect error; the cause cannot be determined here.' : '';
       throw new Error(`${method} ${new URL(diagnostic.url).pathname}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : error.message}. Lookup failed.${detail} No automatic retry.`);
-    } finally { diagnostic.elapsedMs = Date.now() - started; clearTimeout(timeout); }
+    } finally { lifetime.finish(); }
   }
   function opportunityFromResponse(data, pipeline, stage, excludedContact) {
     const group = data.aggregations?.pipelines;
@@ -1036,9 +1050,7 @@
     }
     const diagnostic = { method, url: `https://services.leadconnectorhq.com${action === 'stage' ? '/opportunities/{id}' : path.split('?')[0]}`,
       started: new Date().toISOString(), status: null, result: 'pending' };
-    recordRequest(diagnostic);
-    const controller = new AbortController(), started = Date.now();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const lifetime = requestLifetime(diagnostic), { controller } = lifetime;
     let contactObservation, stageObservation;
     try {
       // No await between this final approval/auth check and the native request.
@@ -1053,13 +1065,9 @@
         stageObservation = observeStageRequest(method, wire.url);
       }
       if (method !== 'GET') workflow.activeSaveProgress?.dispatched(action, operation);
-      const response = await originalFetch.call(window, wire.url, { method, headers: { ...wire.headers, ...liveReadHeaders },
-        redirect: 'error', ...(method === 'GET' ? { cache: 'no-store' } : { body: JSON.stringify(body) }), signal: controller.signal });
-      diagnostic.status = response.status;
-      if ([401, 403].includes(response.status)) rejectCrmAuthorization();
-      if (!response.ok) throw new Error('HTTP failure');
-      const data = await response.json();
-      if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.errors?.length) throw new Error('Invalid response');
+      const data = await fetchCrmJson(wire.url, { method, headers: { ...wire.headers, ...liveReadHeaders },
+        redirect: 'error', ...(method === 'GET' ? { cache: 'no-store' } : { body: JSON.stringify(body) }), signal: controller.signal }, diagnostic);
+      if (!validCrmData(data)) throw new Error('Invalid response');
       diagnostic.result = 'response received';
       return { data, body };
     } catch (error) {
@@ -1072,7 +1080,7 @@
         context.ownedWritesPending--;
       }
       finishContactWrite(contactObservation); finishStageWrite(stageObservation);
-      clearTimeout(timeout); diagnostic.elapsedMs = Date.now() - started;
+      lifetime.finish();
     }
   }
   async function prepareStageApi() {
@@ -1284,10 +1292,8 @@
     if (!liveReadHeaders?.['token-id']) throw new Error('Verified CRM token-id required.');
     const url = backend ? `https://backend.leadconnectorhq.com${contact ? `/contacts/${body}` : '/reporting/calls/get-all-phone-calls-new'}`
       : `https://services.leadconnectorhq.com${kind === 'numbers' ? `/phone-system/numbers/v2/location/${LOCATION_ID}?includeRcsSenderIds=true` : '/objects/task/records/search'}`;
-    const controller = new AbortController(); run.controller = controller;
-    let timeout;
+    const lifetime = requestLifetime(), { controller } = lifetime; run.controller = controller;
     const aborted = new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new Error(run.cancelled ? 'Report cancelled.' : 'Report request timed out.')), { once: true }));
-    timeout = setTimeout(() => controller.abort(), 30000);
     try {
       const result = await Promise.race([aborted, (async () => {
         const response = await originalFetch.call(window, url, { method: reading ? 'GET' : 'POST',
@@ -1306,7 +1312,7 @@
         return data;
       })()]);
       requireLeadReport(run, controller); return result;
-    } finally { clearTimeout(timeout); if (run.controller === controller) run.controller = null; }
+    } finally { lifetime.finish(); if (run.controller === controller) run.controller = null; }
   }
   function leadCallsBody(selectedPool, days) {
     return { locationId: LOCATION_ID, source: [], sourceType: [], keyword: [], landingPage: [], referrer: [], campaign: [],
@@ -1974,23 +1980,15 @@
     if (!/^[a-zA-Z0-9_-]+$/.test(taskId)) throw new Error('Invalid task ID.');
     const diagnostic = { method: 'PUT', url: `https://services.leadconnectorhq.com/locations/${LOCATION_ID}/tasks/bulk/update`,
       started: new Date().toISOString(), status: null, result: 'pending', requestFields: ['completed', 'ids'] };
-    recordRequest(diagnostic);
-    const controller = new AbortController(), started = Date.now();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const lifetime = requestLifetime(diagnostic), { controller } = lifetime;
     try {
       requireCallTaskContext(context);
       workflow.activeSaveProgress?.dispatched('complete');
-      const response = await originalFetch.call(window, diagnostic.url, {
+      const data = await fetchCrmJson(diagnostic.url, {
         method: 'PUT', headers: { ...CRM_HEADERS, 'content-type': 'application/json',
           developer_version: '', ...liveReadHeaders },
         redirect: 'error', body: JSON.stringify({ completed: true, ids: [taskId] }), signal: controller.signal,
-      });
-      diagnostic.status = response.status;
-      if (!response.ok) {
-        if ([401, 403].includes(response.status)) rejectCrmAuthorization();
-        throw new Error('Completion HTTP response rejected.');
-      }
-      const data = await response.json();
+      }, diagnostic);
       if (data?.succeded !== true || data.error || data.errors?.length) throw new Error('Completion acknowledgment missing.');
       diagnostic.result = 'completion accepted';
       completeRememberedLeadTask(context.id, taskId, { user: context.user });
@@ -2002,8 +2000,7 @@
       if (diagnostic.result !== 'completion accepted') diagnostic.result = error?.name === 'AbortError' ? 'timeout' : 'completion unverified';
       throw new Error('Call task completion is unverified.');
     } finally {
-      diagnostic.elapsedMs = Date.now() - started;
-      clearTimeout(timeout);
+      lifetime.finish();
     }
   }
 
@@ -2140,21 +2137,15 @@
     } else throw new Error('SMS operation is not permitted.');
     const method = body ? 'POST' : 'GET';
     const diagnostic = { method, url: `https://services.leadconnectorhq.com${diagnosticPath}`, status: null, result: 'pending' };
-    recordRequest(diagnostic);
-    const controller = new AbortController(), started = Date.now();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const lifetime = requestLifetime(diagnostic), { controller } = lifetime;
     try {
       guard();
       if (operation === 'send') workflow.activeSaveProgress?.dispatched('sms');
-      const response = await originalFetch.call(window, `https://services.leadconnectorhq.com${path}`, {
+      const data = await fetchCrmJson(`https://services.leadconnectorhq.com${path}`, {
         method, headers: { ...CRM_HEADERS, ...liveReadHeaders, ...(body ? { 'content-type': 'application/json' } : {}) },
         redirect: 'error', cache: 'no-store', signal: controller.signal, ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-      diagnostic.status = response.status;
-      if ([401, 403].includes(response.status)) rejectCrmAuthorization();
-      if (!response.ok) throw new Error('HTTP failure');
-      const data = await response.json();
-      if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.errors?.length) throw new Error('Invalid response');
+      }, diagnostic);
+      if (!validCrmData(data)) throw new Error('Invalid response');
       diagnostic.result = 'response received';
       // Send acknowledgment must be journaled by the caller before its post-await guard.
       if (reading || operation === 'spam') guard();
@@ -2162,7 +2153,7 @@
     } catch (error) {
       diagnostic.result = error.name === 'AbortError' ? 'timeout' : 'response rejected';
       throw new Error(`API SMS ${operation}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : diagnostic.status ? `HTTP ${diagnostic.status}; response not verified` : 'No verified HTTP response'}. No automatic retry.`);
-    } finally { clearTimeout(timeout); diagnostic.elapsedMs = Date.now() - started; }
+    } finally { lifetime.finish(); }
   }
   function selectSmsSenders(inventory, user) {
     if (!Array.isArray(inventory.numbers) || !Number.isSafeInteger(inventory.total)
