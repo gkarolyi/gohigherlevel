@@ -1,5 +1,7 @@
 # Single-file userscript refactoring plan
 
+> Execution completed sequentially on `refactor/userscript-performance`; tests and production changes were committed separately.
+
 **Goal:** Reduce unnecessary CPU/network work and make state ownership explicit without changing CRM write safety or introducing a build step.
 
 **Architecture:** Keep `gohigherlevel.user.js` as the directly installed artifact. Use small internal closures and narrow helpers, not a framework. Preserve account/session/route guards, durable intent before writes, receipt verification, no write retries, sibling draining, retention and cross-tab merges.
@@ -49,3 +51,13 @@
 - History updates: contact lookup uses an index and no row serialization, with explicit tests across 2,000 contacts, task batches, eviction and flush replacement.
 
 These are operation-count guarantees, not measured live-browser latency improvements. No release version bump or push is part of this session.
+
+## Final verification
+
+- Default `npm test`: 719 passed, zero failed (baseline: 657 passed).
+- `node --test --test-concurrency=1 tests/*.test.cjs`: 719 passed, zero failed.
+- `node --check gohigherlevel.user.js` and `git diff --check 26ca7ed..HEAD`: pass.
+- Commit inspection confirms no commit mixes production-script changes with test changes.
+- Independent read-only adversarial review: no evidenced high/medium regressions. Checked snapshot identity, revision mutations, history indexes/merges, native fetch/XHR behavior, journal-before-dispatch, receipt retention, sibling draining and no-retry guards.
+- Residual risks requiring live-browser validation: CRM board/response timing, out-of-tab opportunity changes, simultaneous cross-tab storage races, native navigation and observer behavior. Existing safety boundaries are preserved; no claim of atomic server or localStorage snapshots is made.
+- All planned chunks completed; runtime ownership and performance contracts are documented in `README.md`.
