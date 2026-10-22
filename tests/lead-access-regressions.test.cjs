@@ -87,6 +87,7 @@ for (const failedLink of [false, true]) test(`actual task creation remembers onl
   h.handler(c => c.url.includes('/contacts/') ? { contact }
     : c.url.endsWith('/objects/task/records') ? { record: { ...c.body, id: 't1', objectKey: 'task' }, errors: [] }
     : { results: { added: failedLink ? [] : [{ success: true, data: c.body.add[0] }], errored: [] } });
+  await h.e('readContactDetails({ fresh: true })'); // run() records this contact during preflight.
   if (failedLink) await assert.rejects(h.e('createTaskApi()'), /association/); else await h.e('createTaskApi()');
   h.e('flushLeadHistory(); leadHistories.clear()');
   assert.equal(h.history()[0].name, 'Ada Lee'); assert.equal(h.history()[0].tasks.length, failedLink ? 0 : 1);
