@@ -125,9 +125,10 @@
       catalogSerialized = JSON.stringify({ pipelines: NAV_PIPELINES });
     }
   } catch { /* Discovery will populate the catalog when the CRM loads its list. */ }
+  function requestUrl(url) { return url instanceof URL ? url : new URL(url, location.href); }
   function pipelineListRequest(url) {
     try {
-      const parsed = new URL(url, location.href);
+      const parsed = requestUrl(url);
       return parsed.origin === 'https://backend.leadconnectorhq.com'
         && parsed.pathname === '/opportunities/pipelines' && parsed.searchParams.get('locationId') === LOCATION_ID;
     } catch { return false; }
@@ -228,7 +229,7 @@
   let readSessionRevision = 0;
   function captureReadHeaders(url, headers) {
     try {
-      if (new URL(url, location.href).origin !== 'https://services.leadconnectorhq.com') return;
+      if (requestUrl(url).origin !== 'https://services.leadconnectorhq.com') return;
       const incoming = new Headers(headers);
       if (!incoming.has('token-id') && !incoming.has('authorization')) return;
       // Ignore other service clients; these requests use the CRM's web session.
@@ -276,11 +277,11 @@
   }
   function captureQuery(method, url, body) {
     try {
-      const parsed = new URL(url, location.href);
+      const parsed = requestUrl(url);
       const path = parsed.pathname.replace(/\/$/, '');
       if (method !== 'POST' || parsed.origin !== 'https://services.leadconnectorhq.com'
         || !['/opportunities/search', '/objects/task/records/search'].includes(path)) return;
-      Promise.resolve().then(body).then(raw => rememberQuery(path, jsonValue(raw)), () => {});
+      Promise.resolve(body()).then(raw => rememberQuery(path, jsonValue(raw))).catch(() => {});
     } catch { /* Observer only. */ }
   }
   async function readList(path, body) {
@@ -657,7 +658,7 @@
   }
   function observeStageRequest(method, url) {
     syncStageQueue();
-    const parsed = new URL(url, location.href);
+    const parsed = requestUrl(url);
     if (parsed.origin !== 'https://services.leadconnectorhq.com') return null;
     const path = parsed.pathname.replace(/\/$/, '');
     if (['PUT', 'PATCH', 'DELETE'].includes(method) && /^\/opportunities\/[^/]+$/.test(path)
@@ -788,7 +789,7 @@
           && Array.isArray(f.value) && f.value.length > 0 && f.value.every(id => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id)) && !f.filters);
   }
   function observeContactRequest(method, url, body) {
-    const parsed = new URL(url, location.href);
+    const parsed = requestUrl(url);
     if (!['https://services.leadconnectorhq.com', 'https://backend.leadconnectorhq.com'].includes(parsed.origin)) return null;
     const path = parsed.pathname.replace(/\/$/, '');
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && /^\/(contacts|opportunities)(\/|$)/.test(path)
@@ -824,19 +825,31 @@
     try { return typeof value === 'string' ? JSON.parse(value) : value; }
     catch { return null; }
   }
+  function requestDescriptor(method, url, headers, readRawBody) {
+    let body;
+    return { method: method.toUpperCase(), url: requestUrl(url), headers, readBody() {
+      // Clone a native Request synchronously, before the CRM consumes it; decode once.
+      if (!body) {
+        try { body = Promise.resolve(readRawBody()).then(jsonValue); }
+        catch (error) { body = Promise.reject(error); }
+      }
+      return body;
+    } };
+  }
   const originalFetch = window.fetch;
   window.fetch = function(input, init) {
-    let stageObservation = null, contactObservation = null, taskObservation = null;
+    let stageObservation = null, contactObservation = null, taskObservation = null, pipelineObservation = false;
     try {
       const request = input instanceof Request ? input : null;
-      stageObservation = observeStageRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input));
-      captureReadHeaders(request?.url || String(input), init?.headers || request?.headers);
-      contactObservation = observeContactRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
+      const { method, url, headers, readBody } = requestDescriptor(init?.method || request?.method || 'GET',
+        request?.url || String(input), init?.headers || request?.headers,
         () => init?.body ?? (request ? request.clone().text() : null));
-      taskObservation = observeLeadTaskRequest((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
-        () => init?.body ?? (request ? request.clone().text() : null));
-      captureQuery((init?.method || request?.method || 'GET').toUpperCase(), request?.url || String(input),
-        () => init?.body ?? (request ? request.clone().text() : null));
+      stageObservation = observeStageRequest(method, url);
+      captureReadHeaders(url, headers);
+      contactObservation = observeContactRequest(method, url, readBody);
+      taskObservation = observeLeadTaskRequest(method, url, readBody);
+      captureQuery(method, url, readBody);
+      pipelineObservation = pipelineListRequest(url);
     } catch { /* Observing must never prevent the CRM request. */ }
     let result;
     try { result = originalFetch.apply(this, arguments); }
@@ -857,7 +870,7 @@
     else if (typeof stageObservation === 'number') {
       result.then(response => response.ok ? response.clone().json().then(data => rememberStageResults(data, stageObservation)) : null).catch(() => {});
     }
-    if (pipelineListRequest(input instanceof Request ? input.url : String(input))) {
+    if (pipelineObservation) {
       result.then(response => response.ok ? response.clone().json().then(rememberPipelines) : null).catch(() => {});
     }
     return result;
@@ -880,14 +893,15 @@
   XMLHttpRequest.prototype.send = function(body) {
     let contactObservation = null, stageObservation = null;
     try {
-      const info = xhrInfo.get(this);
-      if (info) { captureReadHeaders(info.url, info.headers); captureQuery(info.method, info.url, () => body); }
-      const taskObservation = info ? observeLeadTaskRequest(info.method, info.url, () => body) : null;
+      const saved = xhrInfo.get(this);
+      const info = saved && requestDescriptor(saved.method, saved.url, saved.headers, () => body);
+      if (info) { captureReadHeaders(info.url, info.headers); captureQuery(info.method, info.url, info.readBody); }
+      const taskObservation = info ? observeLeadTaskRequest(info.method, info.url, info.readBody) : null;
       if (taskObservation) this.addEventListener('loadend', async () => {
         try { if (this.status >= 200 && this.status < 300 && await taskObservation.query && validLeadContext(taskObservation.context))
           rememberLeadTasks(this.responseType === 'json' ? this.response : JSON.parse(this.responseText), taskObservation.context); } catch { /* Passive only. */ }
       }, { once: true });
-      contactObservation = info ? observeContactRequest(info.method, info.url, () => body) : null;
+      contactObservation = info ? observeContactRequest(info.method, info.url, info.readBody) : null;
       if (contactObservation) this.addEventListener('loadend', async () => {
         if (contactObservation.write) finishContactWrite(contactObservation);
         else try {
@@ -1253,7 +1267,7 @@
   }
   function observeLeadTaskRequest(method, url, body) {
     try {
-      const parsed = new URL(url, location.href), context = leadAccessContext();
+      const parsed = requestUrl(url), context = leadAccessContext();
       if (method !== 'POST' || parsed.origin !== 'https://services.leadconnectorhq.com'
         || parsed.pathname !== '/objects/task/records/search' || parsed.search || !validLeadContext(context)) return null;
       return { context, query: Promise.resolve(body()).then(raw => jsonValue(raw)?.locationId === LOCATION_ID, () => false) };
