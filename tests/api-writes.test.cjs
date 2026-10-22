@@ -196,6 +196,24 @@ for (const [fn, details] of [['saveStageApi', ['Next', 's2', 'o1']], ['saveNoteA
   });
 }
 
+for (const fn of ['saveNoteApi', 'createTaskApi']) for (const payload of ['not JSON', '[]', 'null', '{"error":"private server error"}', '{"errors":["private server error"]}']) {
+  test(`${fn} rejects invalid JSON envelopes and finalizes request lifetime: ${payload}`, async t => {
+    const h = harness(t), active = new Set();
+    const setTimeout = h.w.setTimeout.bind(h.w), clearTimeout = h.w.clearTimeout.bind(h.w);
+    h.w.setTimeout = (callback, ms) => { const id = setTimeout(callback, ms); if (ms === 30000) active.add(id); return id; };
+    h.w.clearTimeout = id => { active.delete(id); clearTimeout(id); };
+    h.hook(() => new Response(payload));
+    await assert.rejects(h.run(fn), error => !error.message.includes('private server error'));
+    assert.equal(active.size, 0, 'request timeout must be released');
+    assert.equal(h.calls.length, 1, 'invalid envelope must not dispatch another operation');
+    const diagnostic = h.w.pertamaRequestDiagnostics.at(-1);
+    assert.equal(diagnostic.status, 200);
+    assert.ok(Number.isFinite(diagnostic.elapsedMs));
+    assert.equal(diagnostic.result, 'response rejected');
+    assert.ok(JSON.parse(h.checkpoint()).pendingSave);
+  });
+}
+
 test('storage refusal prevents write', async t => {
   const h = harness(t); h.e('Storage.prototype.setItem = function() { throw new Error("storage full"); }');
   await assert.rejects(h.run('saveStageApi'), /storage/); assert.equal(h.calls.length, 1);
