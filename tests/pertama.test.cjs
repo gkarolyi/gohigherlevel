@@ -1652,6 +1652,88 @@ function fastPolling(h) {
     return 0;
   };
 }
+test('SMS templates migrate legacy text and validate template identities and placeholders', t => {
+  const h = harness(t);
+  const legacy = plain(h.evaluate('settings'));
+  delete legacy.smsTemplates;
+  legacy.sms = 'Legacy {firstName}';
+  const loaded = harness(t, { storedSettings: legacy });
+  assert.ok(loaded.evaluate('settings.smsTemplates'), 'legacy settings gain a template collection');
+  assert.deepEqual(plain(loaded.evaluate('settings.smsTemplates')), [{ id: 'default', name: 'Default', message: legacy.sms }]);
+  for (const templates of [[], [{ id: 'x', name: 'Other', message: 'Hi' }],
+    [{ id: 'default', name: 'Default', message: '{unknown}' }],
+    [{ id: 'default', name: 'Default', message: 'Hi' }, { id: 'default', name: 'Again', message: 'Hi' }],
+    [{ id: 'default', name: 'Default', message: 'Hi' }, { id: 'x', name: 'default', message: 'Hi' }]]) {
+    assert.throws(() => h.evaluate(`validateSettings({ ...settings, smsTemplates: ${JSON.stringify(templates)} })`), /template|placeholder/i);
+  }
+});
+
+test('SMS template settings save named templates and stable rule selections', t => {
+  const h = harness(t);
+  const form = settingsForm(h);
+  assert.ok(form.querySelector('[data-add-sms-template]'));
+  form.querySelector('[data-add-sms-template]').click();
+  const rows = form.querySelectorAll('[data-sms-template-row]');
+  assert.equal(rows.length, 2);
+  rows[1].querySelector('[data-template-name]').value = 'Follow up';
+  change(h, rows[1].querySelector('[data-template-name]'));
+  rows[1].querySelector('[data-template-message]').value = 'Hello {fullName}';
+  const rule = form.querySelector('.rule-row');
+  const select = rule.querySelector('[data-sms-template]');
+  select.value = rows[1].dataset.templateId;
+  assert.equal(select.disabled, false, 'template selection is independent of SMS toggle');
+  submitSettings(h, form);
+  const saved = savedSettings(h);
+  assert.equal(saved.smsTemplates[1].name, 'Follow up');
+  assert.equal(saved.smsTemplates[1].message, 'Hello {fullName}');
+  assert.equal(saved.rules[rule.querySelector('[data-stage]').value].smsTemplateId, saved.smsTemplates[1].id);
+  const loaded = harness(t, { storedSettings: saved });
+  const reopened = settingsForm(loaded);
+  assert.equal(reopened.querySelector('.rule-row [data-sms-template]').value, saved.smsTemplates[1].id);
+  const renamed = reopened.querySelectorAll('[data-template-name]')[1];
+  renamed.value = 'Renamed'; change(loaded, renamed);
+  assert.equal(reopened.querySelector('.rule-row [data-sms-template]').selectedOptions[0].textContent, 'Renamed');
+  assert.equal(reopened.querySelector('.rule-row [data-sms-template]').value, saved.smsTemplates[1].id);
+  reopened.querySelectorAll('[data-remove-sms-template]')[1].click();
+  assert.equal(reopened.querySelectorAll('[data-sms-template-row]').length, 2, 'referenced template cannot be silently removed');
+  assert.match(reopened.querySelector('[data-error]').textContent, /stage|rule/i);
+  const selected = reopened.querySelector('.rule-row [data-sms-template]');
+  selected.value = ''; change(loaded, selected);
+  reopened.querySelectorAll('[data-remove-sms-template]')[1].click();
+  assert.equal(reopened.querySelectorAll('[data-sms-template-row]').length, 1);
+  assert.equal(reopened.querySelector('[data-remove-sms-template]').disabled, true);
+});
+
+for (const selection of ['follow', '', 'missing', 'no-rule']) test(`SMS buttons replace text with rendered templates; stage selection ${selection || 'fallback'}`, async t => {
+  const h = deferredSmsFixture(t);
+  h.evaluate(`settings.smsTemplates = [{ id: 'default', name: 'Default', message: 'Default {firstName}' },
+    { id: 'follow', name: 'Follow up', message: 'Hello {fullName}' }];
+    settings.rules['Attempted Contact'].smsTemplateId = ${JSON.stringify(selection)};`);
+  if (selection === 'no-rule') h.evaluate("delete settings.rules['Attempted Contact']");
+  const pending = h.evaluate('run()'); await flush();
+  const dialog = h.w.document.querySelector('#pertama-confirm-actions');
+  const form = dialog.querySelector('form'), editor = form.elements.namedItem('smsText');
+  const buttons = dialog.querySelectorAll('[data-use-sms-template]');
+  assert.equal(buttons.length, 2);
+  const expected = h.evaluate(`renderTemplate(settings.smsTemplates[${selection === 'follow' ? 1 : 0}].message, { firstName: __apiContact.firstName, name: [__apiContact.firstName, __apiContact.lastName].filter(Boolean).join(' ') })`);
+  assert.equal(editor.value, expected);
+  assert.equal(dialog.querySelector('[data-sms-templates]').hidden, true);
+  const toggle = form.elements.namedItem('sms'); toggle.checked = true; change(h, toggle); await flush();
+  assert.equal(dialog.querySelector('[data-sms-templates]').hidden, false);
+  editor.value = 'Manual edit'; buttons[1].click();
+  assert.match(editor.value, /^Hello /);
+  assert.equal(editor.value.includes('{'), false);
+  assert.equal(dialog.open, true); assert.equal(h.w.__sentSms, undefined);
+  editor.value = 'Keep this'; toggle.checked = false; change(h, toggle);
+  toggle.checked = true; change(h, toggle); await flush();
+  assert.equal(editor.value, 'Keep this');
+  buttons[0].click(); assert.match(editor.value, /^Default /);
+  const approvedMessage = editor.value;
+  for (const key of ['stage', 'note', 'task']) form.elements.namedItem(key).checked = false;
+  form.dispatchEvent(new h.w.Event('submit', { bubbles: true, cancelable: true })); await pending;
+  assert.equal(h.w.__sentSms.message, approvedMessage);
+});
+
 function deferredSmsFixture(t) {
   const h = harness(t); apiContactFixture(h); h.pin();
   h.w.__smsCalls = 0;

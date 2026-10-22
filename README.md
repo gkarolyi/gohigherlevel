@@ -18,6 +18,14 @@ Current and suggested next stages come from the checked pipelines. Saved stages 
 
 In **Save and next**, use **Scheduled for (WITA)** to choose an exact date and time for this save only. Changing follow-up days recalculates this picker; other action toggles preserve your chosen time. All picker values use WITA (UTC+8), regardless of your browser timezone. Existing saved rules are not changed.
 
+### SMS templates
+
+In **Workflow settings → SMS templates**, add named messages using `{firstName}` and `{fullName}`. Your previous SMS message becomes **Default** automatically. Default's message is editable, but its name and entry are kept as the global fallback. Templates remain local to this browser and CRM account.
+
+Each shared stage rule has a **Default SMS template** selector, independent of its **Send SMS** toggle. Stages with no rule or no selected template use Default. Renaming a template preserves rule selections; to remove a referenced template, first change those rules to another template.
+
+With SMS enabled in **Save and next**, click a template button to immediately replace the message with its personalized text. This discards any edits in the editor without a warning. Editing the message does not change the saved template, and toggling SMS off and back on preserves the current text. Template buttons never send: sending still requires **Confirm & next**, with existing sender/recipient checks and no automatic retries. Native CRM drafts remain untouched.
+
 Older rules retain their defaults: notes on, SMS off, and tasks on when follow-up days were set. Stages without a rule retain their existing defaults.
 
 ## Inaccessible leads

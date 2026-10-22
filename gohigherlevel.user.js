@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.17
+// @version      1.0.18
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.17';
+  const VERSION = '1.0.18';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -31,7 +31,7 @@
   const CATALOG_KEY = `pertama:pipelines:${LOCATION_ID}`;
   const SETTINGS_DEFAULTS = {
     note: 'No answer. Will contact again.', task: 'Call again {fullName}',
-    sms: 'Hi {firstName}, following up on your property enquiry. Please let me know a convenient time to speak. Thanks!',
+    smsTemplates: [{ id: 'default', name: 'Default', message: 'Hi {firstName}, following up on your property enquiry. Please let me know a convenient time to speak. Thanks!' }],
     smsFrom: '', priority: 'leads', newLeadStage: 'New Lead', pipelineIds: [],
     rules: {
       'New Lead': { next: 'Attempted Contact', days: 1, updateStage: true },
@@ -46,16 +46,31 @@
     if (!value || !['leads', 'tasks', 'stage'].includes(value.priority)
       || !Array.isArray(value.pipelineIds) || value.pipelineIds.some(id => typeof id !== 'string')
       || new Set(value.pipelineIds).size !== value.pipelineIds.length) throw new Error('Invalid pipeline selection or priority.');
-    for (const key of ['note', 'task', 'sms', 'newLeadStage']) {
+    for (const key of ['note', 'task', 'newLeadStage']) {
       if (typeof value[key] !== 'string' || !value[key].trim()) throw new Error(`${key} cannot be blank.`);
     }
-    for (const key of ['note', 'task', 'sms']) {
+    for (const key of ['note', 'task']) {
       if (/\{(?!firstName\}|fullName\})[^{}]*\}/.test(value[key])) throw new Error('Use only {firstName} and {fullName} placeholders.');
     }
+    const smsTemplates = value.smsTemplates === undefined
+      ? [{ id: 'default', name: 'Default', message: value.sms }] : value.smsTemplates;
+    const templateIds = new Set(), templateNames = new Set();
+    if (!Array.isArray(smsTemplates) || !smsTemplates.length) throw new Error('At least the Default SMS template is required.');
+    for (const template of smsTemplates) {
+      if (!template || typeof template.id !== 'string' || !template.id.trim() || templateIds.has(template.id)
+        || typeof template.name !== 'string' || !template.name.trim() || templateNames.has(template.name.trim().toLowerCase())
+        || typeof template.message !== 'string' || !template.message.trim()
+        || /\{(?!firstName\}|fullName\})[^{}]*\}/.test(template.message)) {
+        throw new Error('SMS templates need unique names and IDs, a message, and only {firstName} or {fullName} placeholders.');
+      }
+      templateIds.add(template.id); templateNames.add(template.name.trim().toLowerCase());
+    }
+    if (!smsTemplates.some(template => template.id === 'default' && template.name === 'Default')) throw new Error('The Default SMS template is required.');
     if (!value.rules || typeof value.rules !== 'object' || Array.isArray(value.rules)) throw new Error('Invalid shared stage rules.');
     for (const [stage, rule] of Object.entries(value.rules)) {
       if (!stage.trim() || !rule || typeof rule.next !== 'string' || !rule.next.trim()
         || typeof rule.updateStage !== 'boolean'
+        || rule.smsTemplateId !== undefined && typeof rule.smsTemplateId !== 'string'
         || ['addNote', 'addTask', 'sendSms'].some(key => Object.hasOwn(rule, key) && typeof rule[key] !== 'boolean')
         || rule.days !== null && (!Number.isInteger(rule.days) || rule.days < 0 || rule.days > 36500)) {
         throw new Error('Each stage rule needs a destination and whole follow-up days from 0 to 36500, or blank days for 3 hours later.');
@@ -64,7 +79,8 @@
     if (value.smsFrom != null && value.smsFrom !== '' && (typeof value.smsFrom !== 'string' || !/^\+[1-9]\d{6,14}$/.test(value.smsFrom))) {
       throw new Error('Invalid SMS sender number.');
     }
-    return { ...value, smsFrom: value.smsFrom || '' };
+    const { sms: legacySms, ...normalized } = value;
+    return { ...normalized, smsTemplates, smsFrom: value.smsFrom || '' };
   }
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
@@ -2303,7 +2319,7 @@
             <section><label class="toggle">Update stage<span class="switch"><input name="stage" type="checkbox" role="switch" checked><span class="track"></span></span></label><p class="detail" data-stage></p><select name="targetStage" aria-label="Stage to update to"></select></section>
             <section><label class="toggle">Add note<span class="switch"><input name="note" type="checkbox" role="switch" checked><span class="track"></span></span></label><textarea name="noteText" aria-label="Note text" rows="2"></textarea></section>
             <section><label class="toggle">Add task<span class="switch"><input name="task" type="checkbox" role="switch"><span class="track"></span></span></label><div class="detail task-schedule"><label data-task-days>In <input name="taskDays" type="number" min="0" max="36500" step="1" aria-label="Follow up in days" title="0 or blank = 3 hours later" aria-describedby="pertama-task-days-help">days</label><label><input name="taskDue" type="datetime-local" step="60" aria-label="Scheduled for (WITA)">WITA</label></div><span id="pertama-task-days-help" hidden>0 or blank = 3 hours later</span><p class="detail" data-task></p></section>
-            <section><label class="toggle">Send SMS<span class="switch"><input name="sms" type="checkbox" role="switch"><span class="track"></span></span></label><p class="detail" data-recipient></p><p class="detail" data-sms-status></p><textarea name="smsText" aria-label="SMS message" placeholder="Write your message…" rows="7" disabled hidden></textarea></section>
+            <section><label class="toggle">Send SMS<span class="switch"><input name="sms" type="checkbox" role="switch"><span class="track"></span></span></label><p class="detail" data-recipient></p><p class="detail" data-sms-status></p><div data-sms-templates hidden style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0" aria-label="SMS templates"></div><textarea name="smsText" aria-label="SMS message" placeholder="Write your message…" rows="7" disabled hidden></textarea></section>
           </div>
           <footer><p class="detail" data-next></p><div class="buttons"><button type="button" data-cancel>Cancel</button><button type="submit">Confirm &amp; next</button></div></footer>
         </form>`;
@@ -2372,7 +2388,21 @@
         if (field('sms').checked) void loadSmsOptions();
         else { smsLoadVersion++; sms = null; smsLoading = false; smsError = ''; updateFields(); }
       });
-      field('smsText').value = renderTemplate(settings.sms, { firstName, name });
+      const defaultSmsTemplate = settings.smsTemplates.find(template => template.id === rule.smsTemplateId)
+        || settings.smsTemplates.find(template => template.id === 'default');
+      field('smsText').value = renderTemplate(defaultSmsTemplate.message, { firstName, name });
+      const templateButtons = dialog.querySelector('[data-sms-templates]');
+      for (const template of settings.smsTemplates) {
+        const button = document.createElement('button'); button.type = 'button';
+        button.dataset.useSmsTemplate = template.id;
+        button.textContent = template.name + (template.id === defaultSmsTemplate.id ? ' (default)' : '');
+        button.addEventListener('click', () => {
+          field('smsText').value = renderTemplate(template.message, { firstName, name });
+          field('smsText').setCustomValidity('');
+          field('smsText').focus();
+        });
+        templateButtons.appendChild(button);
+      }
       dialog.querySelector('[data-next]').textContent = settings.priority === 'stage'
         ? `After saving — ${stageQueueLabel()}. No other queues or tasks will be used.`
         : 'After saving: open the next lead using your selected pipelines and lead priority.';
@@ -2389,6 +2419,7 @@
         field('noteText').disabled = !field('note').checked;
         field('noteText').required = field('note').checked;
         const enabled = field('sms').checked;
+        templateButtons.hidden = !enabled;
         field('smsText').hidden = !enabled;
         field('smsText').disabled = !enabled;
         field('smsText').required = enabled;
@@ -2705,7 +2736,7 @@
       <form><h2>Workflow settings</h2><p data-user></p><p>Templates support {firstName} and {fullName}. Settings are saved in this browser for this CRM account.</p>
       <label>Default note<textarea name="note" rows="2" required></textarea></label>
       <label>Task title template<input name="task" required></label>
-      <label>Default SMS<textarea name="sms" rows="4" required></textarea></label>
+      <h3>SMS templates</h3><p>Default is used when a stage has no template selected. Template buttons replace the current message without sending it.</p><div data-sms-template-list></div><button type="button" data-add-sms-template>Add SMS template</button>
       <label>SMS sender number<select name="smsFrom" disabled><option value="">Open a contact to load your numbers…</option></select></label>
       <p data-sms-settings-status>SMS is available only with a number linked to your CRM user.</p>
       <p>Save and next completes a matching existing Call task before creating a new follow-up. Tasks created with an older title template need manual completion.</p>
@@ -2737,7 +2768,7 @@
     const stageSelect = form.elements.namedItem('newLeadStage');
     stageSelect.replaceChildren(new Option('Select a new-lead stage…', ''), ...availableStages.map(stage => new Option(stage, stage)));
     if (!availableStages.includes(settings.newLeadStage)) stageSelect.add(new Option(`${settings.newLeadStage} (saved; not in loaded pipelines)`, settings.newLeadStage));
-    for (const key of ['note', 'task', 'sms', 'priority', 'newLeadStage']) form.elements.namedItem(key).value = settings[key];
+    for (const key of ['note', 'task', 'priority', 'newLeadStage']) form.elements.namedItem(key).value = settings[key];
     const senderSelect = form.elements.namedItem('smsFrom');
     if (contactId() && location.pathname.includes(`/location/${LOCATION_ID}/`)) {
       void prepareSmsApi().then(prepared => {
@@ -2772,6 +2803,39 @@
       pipelineRoot.appendChild(row);
     }
     const ruleRoot = dialog.querySelector('[data-rules]');
+    const templateRoot = dialog.querySelector('[data-sms-template-list]');
+    function refreshSmsTemplates() {
+      for (const select of ruleRoot.querySelectorAll('[data-sms-template]')) {
+        const value = select.value;
+        select.replaceChildren(new Option('Default (global)', ''), ...[...templateRoot.children].map(row =>
+          new Option(row.querySelector('[data-template-name]').value || 'Unnamed template', row.dataset.templateId)));
+        if (value && ![...templateRoot.children].some(row => row.dataset.templateId === value)) {
+          select.add(new Option('Unavailable template — uses Default', value));
+        }
+        select.value = value;
+      }
+    }
+    function addSmsTemplate(template) {
+      const row = document.createElement('div'); row.dataset.smsTemplateRow = ''; row.dataset.templateId = template.id;
+      row.innerHTML = '<label>Template name<input data-template-name required></label><label>Message<textarea data-template-message rows="4" required></textarea></label><button type="button" data-remove-sms-template>Remove template</button>';
+      const name = row.querySelector('[data-template-name]'); name.value = template.name; name.readOnly = template.id === 'default';
+      row.querySelector('[data-template-message]').value = template.message;
+      name.addEventListener('input', refreshSmsTemplates); name.addEventListener('change', refreshSmsTemplates);
+      const remove = row.querySelector('[data-remove-sms-template]'); remove.disabled = template.id === 'default';
+      remove.addEventListener('click', () => {
+        if ([...ruleRoot.querySelectorAll('[data-sms-template]')].some(select => select.value === template.id)) {
+          dialog.querySelector('[data-error]').textContent = 'Choose a different template for stage rules using this template before removing it.';
+          return;
+        }
+        row.remove(); refreshSmsTemplates(); dialog.querySelector('[data-error]').textContent = '';
+      });
+      templateRoot.appendChild(row); refreshSmsTemplates();
+    }
+    for (const template of settings.smsTemplates) addSmsTemplate(template);
+    dialog.querySelector('[data-add-sms-template]').addEventListener('click', () => {
+      addSmsTemplate({ id: crypto.randomUUID(), name: '', message: '' });
+      templateRoot.lastElementChild.querySelector('input').focus();
+    });
     const selectedStages = () => [...new Set([...pipelineRoot.children]
       .filter(row => row.querySelector('input').checked)
       .flatMap(row => Object.keys(NAV_PIPELINES.find(p => p.id === row.dataset.pipelineId)?.stages || {})))];
@@ -2797,7 +2861,7 @@
     function addRule(stage = '', rule = { next: '', days: 2, updateStage: false }) {
       const row = document.createElement('div'); row.className = 'rule-row';
       row.dataset.savedStage = stage; row.dataset.savedNext = rule.next;
-      row.innerHTML = '<label>Current stage<select data-stage required></select></label><label>Suggested next stage<select data-next required></select></label><label><input data-update type="checkbox"> Update stage</label><label><input data-note type="checkbox"> Add note</label><label><input data-task type="checkbox"> Add follow-up task</label><label><input data-sms type="checkbox"> Send SMS</label><label>Follow-up days<input data-days type="number" min="0" max="36500" step="1"></label><button type="button">Remove rule</button>';
+      row.innerHTML = '<label>Current stage<select data-stage required></select></label><label>Suggested next stage<select data-next required></select></label><label><input data-update type="checkbox"> Update stage</label><label><input data-note type="checkbox"> Add note</label><label><input data-task type="checkbox"> Add follow-up task</label><label><input data-sms type="checkbox"> Send SMS</label><label>Default SMS template<select data-sms-template></select></label><label>Follow-up days<input data-days type="number" min="0" max="36500" step="1"></label><button type="button">Remove rule</button>';
       row.querySelector('[data-stage]').add(new Option(stage, stage));
       row.querySelector('[data-next]').add(new Option(rule.next, rule.next));
       const days = row.querySelector('[data-days]'), task = row.querySelector('[data-task]');
@@ -2813,7 +2877,12 @@
       updateDays(); task.addEventListener('change', updateDays);
       row.querySelector('[data-stage]').addEventListener('change', refreshRuleStages);
       row.querySelector('button').addEventListener('click', () => { row.remove(); refreshRuleStages(); });
-      ruleRoot.appendChild(row); refreshRuleStages();
+      ruleRoot.appendChild(row); refreshRuleStages(); refreshSmsTemplates();
+      const templateSelect = row.querySelector('[data-sms-template]');
+      if (rule.smsTemplateId && ![...templateSelect.options].some(option => option.value === rule.smsTemplateId)) {
+        templateSelect.add(new Option('Unavailable template — uses Default', rule.smsTemplateId));
+      }
+      templateSelect.value = rule.smsTemplateId || '';
     }
     for (const [stage, rule] of Object.entries(settings.rules)) addRule(stage, rule);
     pipelineRoot.addEventListener('change', refreshRuleStages);
@@ -2827,7 +2896,9 @@
       event.preventDefault();
       try {
         const next = { rules: Object.create(null), pipelineIds: [...pipelineRoot.children].filter(row => row.querySelector('input').checked).map(row => row.dataset.pipelineId) };
-        for (const key of ['note', 'task', 'sms', 'priority', 'newLeadStage']) next[key] = form.elements.namedItem(key).value.trim();
+        for (const key of ['note', 'task', 'priority', 'newLeadStage']) next[key] = form.elements.namedItem(key).value.trim();
+        next.smsTemplates = [...templateRoot.children].map(row => ({ id: row.dataset.templateId,
+          name: row.querySelector('[data-template-name]').value.trim(), message: row.querySelector('[data-template-message]').value.trim() }));
         next.smsFrom = senderSelect.value || (senderSelect.disabled ? settings.smsFrom : '');
         for (const row of ruleRoot.children) {
           const stage = row.querySelector('[data-stage]').value.trim(), rawDays = row.querySelector('[data-days]').value.trim();
@@ -2841,6 +2912,8 @@
           next.rules[stage] = { next: destination, days: rawDays === '' ? null : Number(rawDays),
             updateStage: row.querySelector('[data-update]').checked, addNote: row.querySelector('[data-note]').checked,
             addTask: row.querySelector('[data-task]').checked, sendSms: row.querySelector('[data-sms]').checked };
+          const smsTemplateId = row.querySelector('[data-sms-template]').value;
+          if (smsTemplateId) next.rules[stage].smsTemplateId = smsTemplateId;
         }
         validateSettings(next);
         if (!availableStages.includes(next.newLeadStage) && next.newLeadStage !== settings.newLeadStage) throw new Error('Open the Opportunities board and reopen Settings to choose an available new-lead stage.');
