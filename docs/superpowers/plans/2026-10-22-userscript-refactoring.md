@@ -30,3 +30,5 @@
 ## Progress
 
 - Planning/baseline complete: clean baseline, 657/657 tests pass.
+- Chunk 1 complete: test commits `762d6b7`, `9699abb`, `bf7b62b`; script commit `f61c408`. Removed sequential approval mode and standalone task-completion orchestration; 668/668 tests pass.
+- Chunk 2 complete: test commits `1b9c93e`, `ac4c6fb`; script commit `33ffd47`. Settings reads inventory only, independent of contact recipient validity; sender and send guards retained. Parent reran default `npm test`: 691/691 pass.
