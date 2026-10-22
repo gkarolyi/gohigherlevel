@@ -1489,16 +1489,24 @@
     const period = dialog.querySelector('select'), warning = dialog.querySelector('[data-warning]');
     status.textContent = 'Choose a period and run the report.';
     dialog.querySelector('[data-storage]').textContent = leadStorageWarning;
+    let dateFormats = null;
     const date = (value, due = false) => {
       if (value === null || value === undefined || value === '') return ['—', ''];
       const dateOnly = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
       const parsed = new Date(dateOnly ? `${value}T11:00:00+08:00` : value);
       if (!Number.isFinite(parsed.getTime()) || dateOnly && parsed.toISOString().slice(0, 10) !== value) return ['—', ''];
-      const options = { timeZone: 'Asia/Makassar' };
-      const year = new Intl.DateTimeFormat('en-GB', { ...options, year: 'numeric' });
-      const day = new Intl.DateTimeFormat('en-GB', { ...options, day: 'numeric', month: 'short', ...(year.format(parsed) !== year.format(new Date()) ? { year: 'numeric' } : {}) }).format(parsed);
-      const hour = new Intl.DateTimeFormat('en-GB', { ...options, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(parsed);
-      const fullDay = new Intl.DateTimeFormat('en-GB', { ...options, day: 'numeric', month: 'short', year: 'numeric' }).format(parsed);
+      if (!dateFormats) {
+        const options = { timeZone: 'Asia/Makassar' };
+        dateFormats = {
+          year: new Intl.DateTimeFormat('en-GB', { ...options, year: 'numeric' }),
+          day: new Intl.DateTimeFormat('en-GB', { ...options, day: 'numeric', month: 'short' }),
+          full: new Intl.DateTimeFormat('en-GB', { ...options, day: 'numeric', month: 'short', year: 'numeric' }),
+          hour: new Intl.DateTimeFormat('en-GB', { ...options, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
+        };
+      }
+      const { year, day: shortDay, full, hour: time } = dateFormats;
+      const day = (year.format(parsed) === year.format(new Date()) ? shortDay : full).format(parsed);
+      const hour = time.format(parsed), fullDay = full.format(parsed);
       return [day, due ? hour : '', `${fullDay}, ${hour} WITA`];
     };
     const showWarnings = messages => {
@@ -1525,6 +1533,7 @@
         }
         const table = document.createElement('table');
         table.innerHTML = '<thead><tr><th scope="col">Contact</th><th scope="col">Last call</th><th scope="col">Remembered follow-up</th><th scope="col">Due</th></tr></thead><tbody></tbody>';
+        const tbody = table.tBodies[0];
         for (const row of result.rows) {
           const tr = document.createElement('tr'), contact = document.createElement('td'), lastCall = document.createElement('td'), tasks = document.createElement('td'), due = document.createElement('td');
           const link = document.createElement('a'), id = document.createElement('small');
@@ -1542,7 +1551,7 @@
             tasks.appendChild(title); due.appendChild(deadline);
           }
           if (!row.tasks.length) { tasks.textContent = '—'; due.textContent = '—'; }
-          tr.append(contact, lastCall, tasks, due); table.querySelector('tbody').appendChild(tr);
+          tr.append(contact, lastCall, tasks, due); tbody.appendChild(tr);
         }
         rows.appendChild(table);
       } catch (error) { status.textContent = 'Report incomplete.'; showWarnings([error.message]); }
@@ -1794,15 +1803,21 @@
     if (!link) return;
     const url = new URL(link.href, location.href);
     const id = url.pathname.match(/\/(?:contacts|customers)\/detail\/([^/]+)/)?.[1];
-    const pipeline = selectedPipeline();
     const opportunityId = link.closest('.card')?.id;
-    if (!id || !pipeline || !opportunityId) return;
+    if (!id || !opportunityId) return;
     try {
       syncStageQueue();
+      const snapshot = stageResults.get(opportunityId);
+      // Exact observed record identity is authoritative; no page-wide label/geometry scan.
+      if (snapshot?.contactId === id && NAV_PIPELINES.some(p => p.id === snapshot.pipelineId && Object.values(p.stages).includes(snapshot.stageId))) {
+        clearStageQueue();
+        pinStageQueue(snapshot);
+        return;
+      }
+      const pipeline = selectedPipeline();
+      if (!pipeline) return;
       clearStageQueue();
       sessionStorage.setItem(`pertama:origin:${id}`, JSON.stringify({ pipeline, opportunityId }));
-      const snapshot = stageResults.get(opportunityId);
-      if (snapshot?.contactId === id && NAV_PIPELINES.some(p => p.id === snapshot.pipelineId && p.name === pipeline)) pinStageQueue(snapshot);
     } catch { /* Without a remembered origin, only an unambiguous opportunity is allowed. */ }
   }
 
@@ -3127,6 +3142,7 @@
     if (changed) refreshButtons();
   }
   const hostObserver = new MutationObserver(relevantMutations);
+  const hostSubscriptions = new Map();
   const discoveryObserver = new MutationObserver(relevantMutations);
   const widthObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => {
     const entry = entries.find(item => item.target === observedWidthTarget);
@@ -3154,7 +3170,6 @@
     }
   }
   function watchHosts() {
-    hostObserver.disconnect();
     for (const el of knownAnchors) if (!el.isConnected) knownAnchors.delete(el);
     const hosts = [companies, centralName, ...knownAnchors].filter(el => el?.isConnected);
     // A host's parent could be the entire app. Only controls, navigation and the name
@@ -3169,10 +3184,16 @@
     const ancestors = new Set([document.body]);
     if (nameContainer?.isConnected) ancestors.add(nameContainer);
     for (const el of hosts) for (let node = el; node; node = node.parentElement) ancestors.add(node);
-    for (const node of ancestors) hostObserver.observe(node, {
-      childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'], characterData: true,
-      subtree: localRoots.has(node) && node !== document.body && node !== document.documentElement,
-    });
+    const subtree = node => localRoots.has(node) && node !== document.body && node !== document.documentElement;
+    if (ancestors.size === hostSubscriptions.size && [...ancestors].every(node => hostSubscriptions.get(node) === subtree(node))) return;
+    hostObserver.disconnect(); hostSubscriptions.clear();
+    for (const node of ancestors) {
+      const deep = subtree(node);
+      hostSubscriptions.set(node, deep);
+      hostObserver.observe(node, {
+        childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'], characterData: true, subtree: deep,
+      });
+    }
   }
   function setDisplay(button, show, display) {
     if (button.hidden !== !show) button.hidden = !show;
@@ -3269,7 +3290,7 @@
       cancelLeadAccessReport();
       hideQueueSummary();
       setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
-      hostObserver.disconnect(); stopDiscovery(); widthObserver?.disconnect();
+      hostObserver.disconnect(); hostSubscriptions.clear(); stopDiscovery(); widthObserver?.disconnect();
       observedWidthTarget = null; observedWidth = null;
       return;
     }
