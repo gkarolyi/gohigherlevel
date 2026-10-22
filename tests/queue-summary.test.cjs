@@ -73,7 +73,7 @@ test('count queries equal navigation builders and use fresh due cutoff, priority
   const cutoff = task.filters[0].filters.find(f => f.field === 'properties.dueDate').value.lte;
   assert.ok(Date.parse(cutoff) >= before && Date.parse(cutoff) <= Date.now());
   assert.deepEqual(task, JSON.parse(h.evaluate(`JSON.stringify(dueTaskQueueQuery(${JSON.stringify(cutoff)}))`)));
-  h.evaluate('settings.pipelineIds = []'); h.refresh(); await h.flush();
+  h.evaluate('settings.pipelineIds = []; settingsRevision++'); h.refresh(); await h.flush();
   assert.equal(h.summary().textContent, 'Follow-ups due 2 · New leads 0');
 });
 test('new-lead total sums only selected pipelines and preserves verified user scope', async t => {
@@ -126,7 +126,7 @@ for (const change of ['route', 'account', 'settings', 'user']) test(`discards st
   const pending = []; const h = harness(t, { reply: (url) => new Promise(resolve => pending.push({ url, resolve })) }); await h.flush();
   if (change === 'route') h.w.history.pushState({}, '', route.replace(/a$/, 'b'));
   if (change === 'account') h.w.history.pushState({}, '', '/v2/location/other/contacts/detail/a');
-  if (change === 'settings') { h.evaluate("settings.priority = 'tasks'"); h.refresh(); }
+  if (change === 'settings') { h.evaluate("settings.priority = 'tasks'; settingsRevision++"); h.refresh(); }
   if (change === 'user') h.auth('user-b');
   const old = pending.splice(0); await h.flush();
   old.forEach(r => r.resolve(new Response(JSON.stringify(r.url.includes('/objects/') ? tasks(99) : leads(99))))); await h.flush();
@@ -175,6 +175,49 @@ test('run finally refreshes even when contact does not navigate', async t => {
   await h.evaluate('run()'); await h.flush();
   assert.equal(h.requests.length, 4); assert.equal(h.summary().textContent, 'New leads 3 · Follow-ups due 2');
 });
+test('stable toolbar refreshes never serialize the catalog or captured queries', async t => {
+  const h = harness(t); await h.flush();
+  h.evaluate(`{
+    const stringify = JSON.stringify;
+    JSON.stringify = function(value, ...args) {
+      if (value === NAV_PIPELINES || value === queryTemplates || Array.isArray(value) && (value.includes(NAV_PIPELINES) || value.includes(queryTemplates))) throw new Error('large queue identity serialization');
+      return stringify.call(this, value, ...args);
+    };
+  }`);
+  for (let i = 0; i < 5; i++) { h.refresh(); await h.flush(); }
+  assert.equal(h.summary().textContent, 'New leads 3 · Follow-ups due 2');
+  assert.equal(h.requests.length, 2);
+});
+
+test('captured queries serialize once and identical recaptures do not invalidate counts', async t => {
+  const h = harness(t); await h.flush();
+  const calls = h.evaluate(`(() => {
+    const body = pipelineQueueQuery(NAV_PIPELINES[0], 'New Lead'); body.query = 'new filter';
+    const stringify = JSON.stringify; let calls = 0;
+    JSON.stringify = function(value, ...args) { if (value === body) calls++; return stringify.call(this, value, ...args); };
+    try { rememberQuery('/opportunities/search', body); } finally { JSON.stringify = stringify; }
+    return calls;
+  })()`);
+  assert.equal(calls, 1);
+  await h.flush(); assert.equal(h.requests.length, 4);
+  h.evaluate("rememberQuery('/opportunities/search', queryTemplates.p)");
+  await h.flush(); assert.equal(h.requests.length, 4);
+});
+
+test('identical pipeline metadata does not persist or refetch queue counts', async t => {
+  const h = harness(t); await h.flush();
+  h.evaluate(`{
+    const metadata = { pipelines: [{ id: 'p', name: 'Sales', stages: [{ name: 'New Lead', id: 's' }] }] };
+    let writes = 0; const setItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key, value) { if (key === CATALOG_KEY) writes++; return setItem.call(this, key, value); };
+    try { rememberPipelines(metadata); rememberPipelines(metadata); } finally { Storage.prototype.setItem = setItem; }
+    if (writes !== 0) throw new Error('unchanged catalog persisted');
+  }`);
+  await h.flush(); assert.equal(h.requests.length, 2);
+  h.evaluate("rememberPipelines({ pipelines: [{ id: 'p', name: 'Renamed', stages: [{ name: 'New Lead', id: 's' }] }] })");
+  await h.flush(); assert.equal(h.requests.length, 4);
+});
+
 test('native query filter changes refresh counts', async t => {
   const h = harness(t); await h.flush();
   h.evaluate("const body = pipelineQueueQuery(NAV_PIPELINES[0], 'New Lead', false); body.query = 'changed'; rememberQuery('/opportunities/search', body)"); await h.flush();
