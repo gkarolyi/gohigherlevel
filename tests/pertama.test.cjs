@@ -255,9 +255,9 @@ test('native navigation uses exact contact path, preserves stage queue and avoid
 test('repeated Next lead transitions keep the original stage without reinitializing the script', async t => {
   const h = harness(t); h.pin(); h.evaluate("settings.priority = 'stage'");
   const { pushes } = installRouter(h);
-  h.evaluate(`workflow.completed = ['Prior confirmation']; workflow.pendingSave = 'Prior uncertainty';
-    workflow.pendingActions = { note: 'Prior note' }; workflow.startingContact = 'prior-contact'; workflow.step = 'Prior phase';`);
-  const evidence = h.evaluate('workflow.completed'), actions = h.evaluate('workflow.pendingActions');
+  h.evaluate(`journal.restore({ completed: ['Prior confirmation'], pendingSave: 'Prior uncertainty',
+    pendingActions: { note: 'Prior note' } }); workflow.startingContact = 'prior-contact'; workflow.step = 'Prior phase';`);
+  const evidence = h.evaluate('journal.completed'), actions = h.evaluate('journal.pendingActions');
   let current = 'contact-a';
   for (const next of ['contact-b', 'contact-c', 'contact-d']) {
     h.respond(result([hit(current, `opp-${current}`), hit(next, `opp-${next}`)]));
@@ -265,9 +265,9 @@ test('repeated Next lead transitions keep the original stage without reinitializ
     assert.equal(h.evaluate('stageQueueContext().queue.contactId'), next);
     assert.equal(h.evaluate('stageQueueContext().queue.stageId'), 'stage-atc');
     assert.equal(h.evaluate('workflow.busy'), false);
-    assert.equal(h.evaluate('workflow.completed'), evidence);
-    assert.equal(h.evaluate('workflow.pendingActions'), actions);
-    assert.equal(h.evaluate('workflow.pendingSave'), 'Prior uncertainty');
+    assert.equal(h.evaluate('journal.completed'), evidence);
+    assert.equal(h.evaluate('journal.pendingActions'), actions);
+    assert.equal(h.evaluate('journal.pendingSave'), 'Prior uncertainty');
     assert.equal(h.evaluate('workflow.startingContact'), 'prior-contact');
     assert.equal(h.evaluate('workflow.step'), 'Prior phase');
     current = next;
@@ -942,17 +942,17 @@ for (const mismatch of ['pipeline', 'stage']) {
 
 test('cancelled confirmation resets prior evidence and releases workflow ownership', async t => {
   const h = harness(t); apiContactFixture(h); h.pin(); h.evaluate("settings.priority = 'stage'");
-  h.evaluate(`workflow.completed = ['Previous evidence']; workflow.pendingSave = 'Previous uncertainty';
-    workflow.pendingActions = { note: 'Previous note' }; workflow.startingContact = 'previous-contact';`);
+  h.evaluate(`journal.restore({ completed: ['Previous evidence'], pendingSave: 'Previous uncertainty',
+    pendingActions: { note: 'Previous note' } }); workflow.startingContact = 'previous-contact';`);
   const pending = h.evaluate('run()'); await flush();
   const dialog = h.w.document.getElementById('pertama-confirm-actions');
   assert.ok(dialog, h.alerts.join('\n'));
   assert.equal(h.evaluate('workflow.busy'), true);
   assert.equal(h.evaluate('workflow.guardedContact'), 'contact-a');
   assert.equal(h.evaluate('workflow.guardedStageQueue === stageQueueContext().queue'), true);
-  assert.deepEqual(plain(h.evaluate('workflow.completed')), []);
-  assert.equal(h.evaluate('workflow.pendingSave'), '');
-  assert.deepEqual(plain(h.evaluate('workflow.pendingActions')), {});
+  assert.deepEqual(plain(h.evaluate('journal.completed')), []);
+  assert.equal(h.evaluate('journal.pendingSave'), '');
+  assert.deepEqual(plain(h.evaluate('journal.pendingActions')), {});
   assert.equal(h.evaluate('workflow.startingContact'), 'contact-a');
   dialog.querySelector('[data-cancel]').click(); await pending;
   assert.deepEqual(plain(h.evaluate('[workflow.busy, workflow.activeSaveProgress, workflow.guardedContact, workflow.guardedStageQueue, workflow.approvedActionContext]')), [false, null, null, null, null]);

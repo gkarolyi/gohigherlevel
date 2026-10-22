@@ -77,6 +77,58 @@ for (const field of ['assignedTo', 'firstName', 'lastName', 'phone']) for (const
   });
 }
 
+for (const [operation, description] of [['note', 'New note'], ['stage', 'Changed stage'], ['stage', null]]) {
+  test(`journal.setPending storage failure restores prior state and evidence: ${operation}=${description}`, t => {
+    const h = harness(t);
+    h.e(`workflow.startingContact = 'c1'; workflow.approvedActionContext = { stopSaves: false };
+      journal.restore({ completed: ['Prior confirmation'], pendingSave: 'Prior uncertainty', pendingActions: { stage: 'Prior stage' } });
+      journal.save();`);
+    const saved = h.checkpoint(), evidence = h.e('journal.completed');
+    h.w.Storage.prototype.setItem = () => { throw new Error('Storage refused'); };
+    assert.throws(() => h.e(`journal.setPending(${JSON.stringify(operation)}, ${JSON.stringify(description)})`));
+    assert.equal(h.e('journal.completed'), evidence);
+    assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), saved.completed);
+    assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.pendingActions)')), saved.pendingActions);
+    assert.equal(h.e('journal.pendingSave'), saved.pendingSave);
+    assert.deepEqual(h.checkpoint(), saved);
+    assert.equal(h.e('workflow.approvedActionContext.stopSaves'), true);
+    assert.equal(h.writes.length, 0);
+  });
+}
+
+test('journal.clearSummary storage failure retains the unresolved summary and evidence', t => {
+  const h = harness(t);
+  h.e(`workflow.startingContact = 'c1';
+    journal.restore({ completed: ['SMS accepted'], pendingSave: 'Continuation unresolved', pendingActions: { note: 'Prior note' } });
+    journal.save();`);
+  const saved = h.checkpoint(), evidence = h.e('journal.completed'), actions = h.e('journal.pendingActions');
+  h.w.Storage.prototype.setItem = () => { throw new Error('Storage refused'); };
+  assert.throws(() => h.e('journal.clearSummary()'));
+  assert.equal(h.e('journal.pendingSave'), saved.pendingSave);
+  assert.equal(h.e('journal.completed'), evidence);
+  assert.equal(h.e('journal.pendingActions'), actions);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), saved.completed);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.pendingActions)')), saved.pendingActions);
+  assert.deepEqual(h.checkpoint(), saved);
+});
+
+test('journal.reset clears in-memory state without changing stored evidence or starting contact', t => {
+  const h = harness(t);
+  h.e(`workflow.startingContact = 'c1';
+    journal.restore({ completed: ['Prior confirmation'], pendingSave: 'Prior uncertainty', pendingActions: { note: 'Prior note' } });
+    journal.save();`);
+  const saved = h.w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`);
+  h.w.Storage.prototype.setItem = h.w.Storage.prototype.removeItem = h.w.Storage.prototype.clear = () => {
+    assert.fail('journal.reset must not mutate storage');
+  };
+  h.e('journal.reset()');
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), []);
+  assert.equal(h.e('journal.pendingSave'), '');
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.pendingActions)')), {});
+  assert.equal(h.e('workflow.startingContact'), 'c1');
+  assert.equal(h.w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`), saved);
+});
+
 test('production workflow restores an unfinished journal before any request or evidence reset', async t => {
   const h = harness(t), saved = { completed: ['Prior confirmation'], pendingSave: 'Prior uncertainty',
     pendingActions: { note: 'Prior note' }, time: new Date().toISOString() };
@@ -84,8 +136,8 @@ test('production workflow restores an unfinished journal before any request or e
   await h.run();
   assert.deepEqual(h.checkpoint(), saved);
   assert.equal(h.reads.length + h.writes.length, 0);
-  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), saved.completed);
-  assert.equal(h.e('workflow.pendingSave'), saved.pendingSave);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), saved.completed);
+  assert.equal(h.e('journal.pendingSave'), saved.pendingSave);
   assert.equal(h.e('workflow.busy'), false);
   assert.match(h.alerts.join('\n'), /Repeat run blocked/);
 });
@@ -319,9 +371,9 @@ test('a failed save drains siblings and preserves their outcomes without navigat
   assert.match(h.checkpoint().completed.join('\n'), /Stage:.*server confirmed/);
   assert.match(h.checkpoint().completed.join('\n'), /Call task completed and verified/);
   assert.deepEqual(Object.keys(h.checkpoint().pendingActions), ['note']);
-  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), h.checkpoint().completed);
-  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.pendingActions)')), h.checkpoint().pendingActions);
-  assert.equal(h.e('workflow.pendingSave'), h.checkpoint().pendingSave);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), h.checkpoint().completed);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.pendingActions)')), h.checkpoint().pendingActions);
+  assert.equal(h.e('journal.pendingSave'), h.checkpoint().pendingSave);
   assert.equal(h.e('workflow.startingContact'), 'c1');
   assert.equal(h.e('workflow.step'), 'Saving selected actions concurrently…');
   assert.deepEqual(JSON.parse(h.e('JSON.stringify([workflow.busy, workflow.activeSaveProgress, workflow.guardedContact, workflow.guardedStageQueue, workflow.approvedActionContext])')), [false, null, null, null, null]);
@@ -401,8 +453,8 @@ test('failure to persist one lane cannot erase an already dispatched lane', asyn
   assert.deepEqual(h.writes.map(r => r.operation), ['stage']);
   assert.match(h.checkpoint().pendingSave, /Stage/);
   assert.deepEqual(Object.keys(h.checkpoint().pendingActions), ['stage']);
-  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.pendingActions)')), h.checkpoint().pendingActions);
-  assert.equal(h.e('workflow.pendingSave'), h.checkpoint().pendingSave);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.pendingActions)')), h.checkpoint().pendingActions);
+  assert.equal(h.e('journal.pendingSave'), h.checkpoint().pendingSave);
   assert.equal(h.e('workflow.approvedActionContext.stopSaves'), true);
   assert.deepEqual(h.checkpoint().completed, []);
   assert.equal(h.writes[0].body.pipelineStageId, 's2');

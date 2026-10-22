@@ -37,10 +37,10 @@ function harness(t) {
 }
 test('prepared completion keeps earlier confirmed actions and caller ownership', async t => {
   const h = harness(t);
-  h.e("workflow.completed = ['Stage: confirmed']; saveCheckpoint()");
-  const evidence = h.e('workflow.completed');
+  h.e("journal.restore({ completed: ['Stage: confirmed'], pendingSave: '', pendingActions: {} }); journal.save()");
+  const evidence = h.e('journal.completed');
   await h.run();
-  assert.equal(h.e('workflow.completed'), evidence);
+  assert.equal(h.e('journal.completed'), evidence);
   assert.equal(h.puts().length, 1);
   assert.match(h.checkpoint(), /Stage: confirmed/);
   assert.match(h.checkpoint(), /Call task completed and verified/);

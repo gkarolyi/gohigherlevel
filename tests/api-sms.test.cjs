@@ -161,7 +161,7 @@ test('only conservative eligible SMS numbers; no RCS inference', async t=>{
   h.hook(c=>c.path.startsWith('/phone-system/')?{numbers,total:numbers.length,rcsSenderIds:['rcs']}:undefined);
   assert.equal((await h.prep()).fromNumbers.length,1);
 });
-for (const change of ['workflow.approvedActionContext=null','workflow.approvedActionContext.actions.sms=false','workflow.approvedActionContext.sms.from=""','workflow.approvedActionContext.sms.to="+19999999999"','workflow.approvedActionContext.sms.message=" "','workflow.pendingSave="unresolved"']) test(`send refuses ${change}`,async t=>{
+for (const change of ['workflow.approvedActionContext=null','workflow.approvedActionContext.actions.sms=false','workflow.approvedActionContext.sms.from=""','workflow.approvedActionContext.sms.to="+19999999999"','workflow.approvedActionContext.sms.message=" "','journal.restore({completed:[],pendingSave:"unresolved",pendingActions:{}})']) test(`send refuses ${change}`,async t=>{
   const h=harness(t); h.e(change); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);
 });
 for (const isSpam of [true,null,undefined]) test(`spam ${isSpam} blocks send`,async t=>{
@@ -211,8 +211,8 @@ for (const change of ['route', 'auth']) test(`${change} changed during send pres
 test('storage failure prevents send and retry',async t=>{
   const h=harness(t); h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}');
   await assert.rejects(h.send());
-  assert.equal(h.e('workflow.pendingSave'), `SMS from ${number.phoneNumber} to ${contact.phone}; message: Hello; acceptance not yet confirmed`);
-  assert.equal(h.e('workflow.completed.length'), 0);
+  assert.equal(h.e('journal.pendingSave'), `SMS from ${number.phoneNumber} to ${contact.phone}; message: Hello; acceptance not yet confirmed`);
+  assert.equal(h.e('journal.completed.length'), 0);
   assert.equal(h.checkpoint(), null);
   await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,0);
 });
@@ -257,8 +257,8 @@ test('durable pre-send intent contains exact consent; ack storage failure cannot
     h.e('Storage.prototype.setItem=function(){throw new Error("storage full")}');
   }});
   await assert.rejects(h.send());
-  assert.equal(h.e('workflow.pendingSave'), 'SMS message m1; conversation v1: accepted; workflow continuation not yet approved');
-  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), ['SMS message m1; conversation v1: accepted by CRM; delivery not confirmed.']);
+  assert.equal(h.e('journal.pendingSave'), 'SMS message m1; conversation v1: accepted; workflow continuation not yet approved');
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), ['SMS message m1; conversation v1: accepted by CRM; delivery not confirmed.']);
   assert.deepEqual(h.checkpoint(), intent);
   await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
   assert.deepEqual(h.calls.find(c=>c.path==='/conversations/messages').body, {contactId:'c1',locationId:L,message:'Hello',fromNumber:number.phoneNumber,toNumber:contact.phone,type:'SMS',channel:'sms',fromOneToOneConversation:true,attachments:[]});
@@ -275,9 +275,9 @@ test('final SMS clear failure restores the unresolved accepted summary without r
     return original.call(this, key, value);
   };
   await assert.rejects(h.send());
-  assert.equal(h.e('workflow.pendingSave'), 'SMS message m1; conversation v1: accepted; workflow continuation not yet approved');
+  assert.equal(h.e('journal.pendingSave'), 'SMS message m1; conversation v1: accepted; workflow continuation not yet approved');
   assert.deepEqual(h.checkpoint(), accepted);
-  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), accepted.completed);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(journal.completed)')), accepted.completed);
   await assert.rejects(h.send());
   assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, 1);
 });
