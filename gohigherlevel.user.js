@@ -2058,10 +2058,22 @@
     if (!validContactRead(context) || context.route !== stageRouteRevision || context.path !== location.pathname
       || !liveReadHeaders || userFromHeaders(liveReadHeaders).id !== context.user) throw new Error('SMS contact/account/session changed.');
   }
+  function guardSmsSenders(context) {
+    if (!context.user || context.user !== currentUserId || identityExpires <= Date.now() / 1000
+      || context.session !== readSessionRevision || !location.pathname.includes(`/location/${LOCATION_ID}/`)
+      || !liveReadHeaders || userFromHeaders(liveReadHeaders).id !== context.user) throw new Error('SMS account/session changed.');
+  }
+  async function readSmsSenders() {
+    const context = { user: currentUserId, session: readSessionRevision, inventoryOnly: true };
+    const inventory = await smsApiRequest('inventory', context);
+    guardSmsSenders(context);
+    return selectSmsSenders(inventory, context.user);
+  }
   // Closed endpoint inventory: no arbitrary URL or native draft writes.
   async function smsApiRequest(operation, context, sms) {
     const reading = operation === 'inventory' || operation === 'drafts';
-    const guard = () => reading ? guardSmsRead(context) : requireActionApproval('sms', context);
+    const guard = () => operation === 'inventory' && context.inventoryOnly ? guardSmsSenders(context)
+      : reading ? guardSmsRead(context) : requireActionApproval('sms', context);
     guard();
     let path, body, diagnosticPath;
     if (operation === 'inventory') {
@@ -2104,6 +2116,26 @@
       throw new Error(`API SMS ${operation}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : diagnostic.status ? `HTTP ${diagnostic.status}; response not verified` : 'No verified HTTP response'}. No automatic retry.`);
     } finally { clearTimeout(timeout); diagnostic.elapsedMs = Date.now() - started; }
   }
+  function selectSmsSenders(inventory, user) {
+    if (!Array.isArray(inventory.numbers) || !Number.isSafeInteger(inventory.total)
+      || inventory.total !== inventory.numbers.length) throw new Error('SMS inventory lookup is incomplete.');
+    const seen = new Set(), fromNumbers = [];
+    for (const record of inventory.numbers) {
+      const number = canonicalSmsPhone(record?.phoneNumber);
+      if (seen.has(number) || record.linkedUser != null && typeof record.linkedUser !== 'string'
+        || record.capabilities != null && (typeof record.capabilities !== 'object' || Array.isArray(record.capabilities))
+        || record.isDefaultNumber != null && typeof record.isDefaultNumber !== 'boolean'
+        || record.isDisabled != null && typeof record.isDisabled !== 'boolean'
+        || record.status != null && typeof record.status !== 'string') throw new Error('Malformed or duplicate SMS inventory number.');
+      seen.add(number);
+      if (record.capabilities?.sms !== true || record.isDisabled === true || record.status === 'disabled') continue;
+      if (record.linkedUser !== user) continue;
+      fromNumbers.push({ number, label: number });
+    }
+    const from = fromNumbers.length === 1 ? fromNumbers[0].number
+      : fromNumbers.some(item => item.number === settings.smsFrom) ? settings.smsFrom : null;
+    return { from, fromNumbers };
+  }
   async function prepareSmsApi() {
     const context = { ...contactReadContext(), route: stageRouteRevision, path: location.pathname };
     guardSmsRead(context);
@@ -2117,24 +2149,8 @@
     const failure = reads.find(result => result.status === 'rejected');
     if (failure) throw failure.reason;
     const inventory = reads[0].value, drafts = reads[1].value;
-    if (!Array.isArray(inventory.numbers) || !Number.isSafeInteger(inventory.total) || inventory.total !== inventory.numbers.length
-      || !Array.isArray(drafts.drafts)) throw new Error('SMS inventory or draft lookup is incomplete.');
-    const seen = new Set(), fromNumbers = [];
-    for (const record of inventory.numbers) {
-      const number = canonicalSmsPhone(record?.phoneNumber);
-      if (seen.has(number) || record.linkedUser != null && typeof record.linkedUser !== 'string'
-        || record.capabilities != null && (typeof record.capabilities !== 'object' || Array.isArray(record.capabilities))
-        || record.isDefaultNumber != null && typeof record.isDefaultNumber !== 'boolean'
-        || record.isDisabled != null && typeof record.isDisabled !== 'boolean'
-        || record.status != null && typeof record.status !== 'string') throw new Error('Malformed or duplicate SMS inventory number.');
-      seen.add(number);
-      if (record.capabilities?.sms !== true || record.isDisabled === true || record.status === 'disabled') continue;
-      if (record.linkedUser !== context.user) continue;
-      fromNumbers.push({ number, label: number });
-    }
-    const from = fromNumbers.length === 1 ? fromNumbers[0].number
-      : fromNumbers.some(item => item.number === settings.smsFrom) ? settings.smsFrom : null;
-    return { contact, to, from, fromNumbers, savedDraftCount: drafts.drafts.length };
+    if (!Array.isArray(drafts.drafts)) throw new Error('SMS draft lookup is incomplete.');
+    return { contact, to, ...selectSmsSenders(inventory, context.user), savedDraftCount: drafts.drafts.length };
   }
   const smsAttempts = new WeakSet();
   async function sendSmsApi() {
@@ -2726,7 +2742,7 @@
       <label>Default note<textarea name="note" rows="2" required></textarea></label>
       <label>Task title template<input name="task" required></label>
       <h3>SMS templates</h3><p>Default is used when a stage has no template selected. Template buttons replace the current message without sending it.</p><div data-sms-template-list></div><button type="button" data-add-sms-template>Add SMS template</button>
-      <label>SMS sender number<select name="smsFrom" disabled><option value="">Open a contact to load your numbers…</option></select></label>
+      <label>SMS sender number<select name="smsFrom" disabled><option value="">Verify CRM authentication to load your numbers…</option></select></label>
       <p data-sms-settings-status>SMS is available only with a number linked to your CRM user.</p>
       <p>Save and next completes a matching existing Call task before creating a new follow-up. Tasks created with an older title template need manual completion.</p>
       <label>Lead priority<select name="priority"><option value="leads">New leads first</option><option value="tasks">Follow-ups first</option><option value="stage">Same stage only</option></select></label>
@@ -2759,8 +2775,8 @@
     if (!availableStages.includes(settings.newLeadStage)) stageSelect.add(new Option(`${settings.newLeadStage} (saved; not in loaded pipelines)`, settings.newLeadStage));
     for (const key of ['note', 'task', 'priority', 'newLeadStage']) form.elements.namedItem(key).value = settings[key];
     const senderSelect = form.elements.namedItem('smsFrom');
-    if (contactId() && location.pathname.includes(`/location/${LOCATION_ID}/`)) {
-      void prepareSmsApi().then(prepared => {
+    if (location.pathname.includes(`/location/${LOCATION_ID}/`)) {
+      void readSmsSenders().then(prepared => {
         if (!dialog.isConnected) return;
         senderSelect.replaceChildren(new Option('Select your number…', ''));
         for (const sender of prepared.fromNumbers) senderSelect.add(new Option(sender.label, sender.number));
@@ -2771,7 +2787,7 @@
           : prepared.fromNumbers.length === 1 ? `Your number ${prepared.from} is selected automatically.`
           : 'Choose a default number before sending SMS.';
       }).catch(() => {
-        if (dialog.isConnected) dialog.querySelector('[data-sms-settings-status]').textContent = 'Could not load your SMS numbers. Open a contact and try again.';
+        if (dialog.isConnected) dialog.querySelector('[data-sms-settings-status]').textContent = 'Could not load your SMS numbers. Verify CRM authentication and try again.';
       });
     }
     const pipelineRoot = dialog.querySelector('[data-pipelines]');
