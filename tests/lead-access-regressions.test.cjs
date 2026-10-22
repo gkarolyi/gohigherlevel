@@ -75,7 +75,8 @@ test('history index follows eviction and replacement on flush', t => {
   const h = harness(t), now = Date.now();
   h.e(`{
     const context = leadAccessContext();
-    for (let i = 0; i < 2001; i++) rememberLeadTask('c' + i, { id: 't' + i, title: 'Call', due: '', completed: false, observedAt: ${now - 5000} + i }, context);
+    leadHistories.set(context.user, Array.from({ length: 2000 }, (_, i) => ({ id: 'c' + i, name: '', observedAt: ${now - 5000} + i, lastAccessible: null, lastCall: null, tasks: [] })));
+    rememberLeadTask('c2000', { id: 't2000', title: 'Call', due: '', completed: false, observedAt: ${now} }, context);
     if (leadHistory(context).length !== 2000 || leadHistory(context).some(row => row.id === 'c0')) throw new Error('oldest contact not evicted');
     flushLeadHistory();
     rememberLeadContact({ id: 'c0', locationId: LOCATION_ID, firstName: 'Returned' }, context);
