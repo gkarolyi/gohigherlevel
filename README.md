@@ -18,6 +18,16 @@ Current and suggested next stages come from the checked pipelines. Saved stages 
 
 In **Save and next**, use **Scheduled for (WITA)** to choose an exact date and time for this save only. Changing follow-up days recalculates this picker; other action toggles preserve your chosen time. All picker values use WITA (UTC+8), regardless of your browser timezone. Existing saved rules are not changed.
 
+### Queue summary
+
+A muted summary beside **Save and next** shows **New leads N · Follow-ups due N**, ordered by your queue priority. These are matching opportunity and due-task totals—not calls or unique contacts—and use the same filters as Next lead. No selected pipelines means zero new leads.
+
+Same-stage mode shows **Stage · N remaining**, excluding all opportunities for the current contact. It uses two bounded aggregation reads (the full queue and the same queue restricted to this contact), including queues larger than the returned top hits. The reads are not an atomic server snapshot; concurrent CRM changes can affect counts. Invalid, failed or incomplete counts show **—**, never a guessed zero; the other category can still appear.
+
+Counts refresh when opening a contact, after Save and next finishes (including when no navigation occurs), and when settings or captured list filters change. Reads require a verified CRM session and visible contact toolbar, do not block workflow saves, and do not poll or automatically retry errors. There is no refresh button. Account/contact/session changes discard stale replies.
+
+**Live validation:** compare both queue totals and same-stage remaining against the native CRM filters before relying on them; automated tests do not verify live aggregation behavior.
+
 ### SMS templates
 
 In **Workflow settings → SMS templates**, add named messages using `{firstName}` and `{fullName}`. Your previous SMS message becomes **Default** automatically. Default's message is editable, but its name and entry are kept as the global fallback. Templates remain local to this browser and CRM account.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.18
+// @version      1.0.19
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,12 +21,14 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.18';
+  const VERSION = '1.0.19';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
   let refreshButtons = () => {};
   let hideStageIndicator = () => {};
+  let hideQueueSummary = () => {};
+  let queueSaveRevision = 0;
   const SETTINGS_KEY = `pertama:settings:${LOCATION_ID}`;
   const CATALOG_KEY = `pertama:pipelines:${LOCATION_ID}`;
   const SETTINGS_DEFAULTS = {
@@ -214,6 +216,7 @@
   }
   // Query templates contain filters/order only. Authentication stays in memory.
   let liveReadHeaders = null;
+  let readSessionRevision = 0;
   function captureReadHeaders(url, headers) {
     try {
       if (new URL(url, location.href).origin !== 'https://services.leadconnectorhq.com') return;
@@ -227,8 +230,12 @@
         if (incoming.has(key)) safe[key] = incoming.get(key);
       }
       const unchanged = liveReadHeaders && ['token-id', 'authorization'].every(key => liveReadHeaders[key] === safe[key]);
-      liveReadHeaders = safe;
-      if (!unchanged) bindUserSession(safe); // Expiry is still checked whenever identity is required.
+      if (!unchanged) {
+        liveReadHeaders = safe;
+        readSessionRevision++;
+        bindUserSession(safe); // Expiry is still checked whenever identity is required.
+        hideQueueSummary(); refreshButtons();
+      }
     } catch { /* Never interfere with CRM traffic. */ }
   }
   function filterValues(filters, field) {
@@ -245,7 +252,9 @@
       && body.page === 1 && filterValues(body.filters, 'properties.completed').includes(0)
       && !JSON.stringify(body.filters).includes('TASK_CONTACT_ASSOCIATION')) key = 'tasks';
     if (key) {
+      const changed = JSON.stringify(queryTemplates[key]) !== JSON.stringify(body);
       queryTemplates[key] = body;
+      if (changed) { hideQueueSummary(); refreshButtons(); }
       const serialized = JSON.stringify(body);
       if (persistedQueries.get(key) !== serialized) {
         try {
@@ -294,6 +303,7 @@
     await wait(() => liveReadHeaders, 'live CRM session',
       () => 'No session headers observed. Reload the CRM once after installing this script.', 30000);
     const historyContext = leadAccessContext();
+    const requestHeaders = liveReadHeaders;
     const wire = wireRequest(method, path, body);
     const diagnostic = { method, url: contactRead ? 'https://services.leadconnectorhq.com/contacts/{id}' : wire.url, started: new Date().toISOString(), status: null,
       result: 'pending', requestFields: Object.keys(body || {}) };
@@ -303,14 +313,14 @@
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
       const response = await originalFetch.call(window, wire.url, {
-        method, headers: { ...wire.headers, ...liveReadHeaders },
+        method, headers: { ...wire.headers, ...requestHeaders },
         redirect: 'error',
         ...(contactRead ? { cache: 'no-store' } : {}),
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: controller.signal,
       });
       diagnostic.status = response.status;
       if (!response.ok) {
-        if ([401, 403].includes(response.status)) rejectCrmAuthorization();
+        if ([401, 403].includes(response.status) && liveReadHeaders === requestHeaders) rejectCrmAuthorization();
         throw new Error(`HTTP ${response.status}`);
       }
       const data = await response.json();
@@ -347,8 +357,7 @@
     if (bucket.docCount > hits.length) throw new Error('More leads exist beyond this response. No fallback taken.');
     return null;
   }
-  async function topPipelineLead(pipeline, stage = 'New Lead', excludedContact = null, sameStage = false) {
-    await requireVerifiedUser();
+  function pipelineQueueQuery(pipeline, stage, sameStage = false) {
     if (!pipeline?.stages[stage]) throw new Error(`Unrecognised pipeline/stage: ${stage}`);
     if (!queryTemplates[pipeline.id]) {
       try { const saved = JSON.parse(localStorage.getItem(`pertama:query:${pipeline.id}`) || 'null'); if (saved?.locationId === LOCATION_ID) queryTemplates[pipeline.id] = saved; } catch { /* Board visit required. */ }
@@ -374,7 +383,11 @@
     }
     const group = body.aggregations.find(a => a.name === 'pipelines');
     group.options = { ...group.options, include: [pipeline.stages[stage]] };
-    return opportunityFromResponse(await readList('/opportunities/search', body), pipeline, stage, excludedContact);
+    return body;
+  }
+  async function topPipelineLead(pipeline, stage = 'New Lead', excludedContact = null, sameStage = false) {
+    await requireVerifiedUser();
+    return opportunityFromResponse(await readList('/opportunities/search', pipelineQueueQuery(pipeline, stage, sameStage)), pipeline, stage, excludedContact);
   }
   function taskContactFromResponse(data, dueBefore) {
     if (!Array.isArray(data.customObjectRecords)) throw new Error('Task list response is unreadable.');
@@ -416,8 +429,7 @@
     }
     return null;
   }
-  async function topTaskContact() {
-    nextButton.textContent = 'Checking tasks…';
+  function dueTaskQueueQuery(dueBefore) {
     const body = JSON.parse(JSON.stringify(queryTemplates.tasks));
     body.page = 1;
     const completedFilters = filterValues(body.filters, 'properties.completed');
@@ -430,14 +442,31 @@
         return children.length || !filter.filters.length ? [{ ...filter, filters: children }] : [];
       });
     }
-    const dueBefore = new Date().toISOString();
     // Captured date windows go stale. Preserve other filters, but always select due tasks as of this lookup.
     const remaining = removeDateFilters(body.filters);
     const filters = remaining.length === 1 && remaining[0].group === 'AND' ? remaining[0].filters : remaining;
     body.filters = [{ group: 'AND', filters: [...filters,
       { field: 'properties.dueDate', operator: 'range', value: { gte: '1901-01-01T00:00:00Z', lte: dueBefore } },
     ] }];
-    return taskContactFromResponse(await readList('/objects/task/records/search', body), dueBefore);
+    return body;
+  }
+  async function topTaskContact() {
+    nextButton.textContent = 'Checking tasks…';
+    const dueBefore = new Date().toISOString();
+    return taskContactFromResponse(await readList('/objects/task/records/search', dueTaskQueueQuery(dueBefore)), dueBefore);
+  }
+  function pipelineQueueCount(data, pipeline, stage) {
+    const group = data?.aggregations?.pipelines;
+    if (!Array.isArray(group?.buckets) || group.docCountErrorUpperBound !== 0 || group.sumOtherDocCount !== 0
+      || group.buckets.length > 1 || group.buckets.some(bucket => !bucket || bucket.key !== pipeline.stages[stage]
+        || !Number.isSafeInteger(bucket.docCount) || bucket.docCount < 0)) throw new Error('Queue counts are incomplete.');
+    return group.buckets[0]?.docCount ?? 0;
+  }
+  function dueTaskQueueCount(data, dueBefore) {
+    if (!Number.isSafeInteger(data?.total) || data.total < 0 || !Array.isArray(data.customObjectRecords)
+      || data.customObjectRecords.length > data.total || data.total > 0 && !data.customObjectRecords.length) throw new Error('Task count is unreadable.');
+    for (const task of data.customObjectRecords) taskContactFromResponse({ total: 1, customObjectRecords: [task] }, dueBefore);
+    return data.total;
   }
   function contactRouter(path) {
     const routers = new Set();
@@ -651,6 +680,7 @@
     contactReadEpoch++;
     contactReads.details = contactReads.opportunities = null;
     hideStageIndicator();
+    hideQueueSummary();
     refreshButtons();
   }
   function rejectCrmAuthorization() {
@@ -2641,6 +2671,8 @@
       runButton.disabled = false;
       runButton.textContent = 'Save and next';
       nextButton.textContent = nextLeadLabel();
+      queueSaveRevision++;
+      hideQueueSummary();
       refreshButtons();
     }
   }
@@ -2922,7 +2954,7 @@
           if (!pipeline || !pipeline.stages[next.newLeadStage]) throw new Error(`${pipeline?.name || 'Unavailable pipeline'} has no ${next.newLeadStage} stage. Disable it or change the stage name.`);
         }
         localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); settings = next; close();
-        refreshButtons(); taskNotice('Workflow settings saved.');
+        hideQueueSummary(); refreshButtons(); taskNotice('Workflow settings saved.');
       } catch (error) { dialog.querySelector('[data-error]').textContent = error.message; }
     });
     document.body.appendChild(dialog); dialog.showModal();
@@ -2944,6 +2976,73 @@
   runButton.textContent = 'Save and next';
   runButton.style.cssText = 'align-self:center;flex-shrink:0;margin-left:16px;padding:10px 16px;background:#155eef;color:white;border:0;border-radius:6px;font:14px sans-serif;white-space:nowrap;cursor:pointer';
   runButton.addEventListener('click', run);
+  const queueSummary = document.createElement('span');
+  queueSummary.id = 'pertama-queue-summary';
+  queueSummary.hidden = true;
+  queueSummary.style.cssText = 'align-self:center;margin-left:12px;color:#667085;font:12px/18px sans-serif';
+  queueSummary.title = 'Matching opportunities and due tasks, not calls or unique contacts. Same-stage remaining excludes this contact. — means unavailable. Snapshot refreshed on contact, save or filter changes.';
+  let queueSnapshot = null;
+  hideQueueSummary = () => {
+    if (!queueSummary.hidden) queueSummary.hidden = true;
+    if (queueSummary.textContent) queueSummary.textContent = '';
+  };
+  function queueIdentity() {
+    return JSON.stringify([location.pathname, stageRouteRevision, currentUserId, readSessionRevision, contactReadEpoch, queueSaveRevision,
+      settings.priority, settings.pipelineIds, settings.newLeadStage, stageQueue, NAV_PIPELINES, queryTemplates]);
+  }
+  function updateQueueSummary(show, allowReads) {
+    const context = contactReadContext();
+    if (!show || document.hidden || !liveReadHeaders || !validContactRead(context) || !previousContactControlsGone()) {
+      hideQueueSummary(); return;
+    }
+    const stage = settings.priority === 'stage' ? stageQueueContext() : null;
+    const key = queueIdentity();
+    const render = snapshot => {
+      const count = value => value === null ? '—' : String(value);
+      const label = settings.priority === 'stage' ? `${stage?.stage || 'Stage'} · ${count(snapshot.leads)} remaining`
+        : (settings.priority === 'tasks' ? [`Follow-ups due ${count(snapshot.tasks)}`, `New leads ${count(snapshot.leads)}`]
+          : [`New leads ${count(snapshot.leads)}`, `Follow-ups due ${count(snapshot.tasks)}`]).join(' · ');
+      if (queueSummary.textContent !== label) queueSummary.textContent = label;
+      if (queueSummary.hidden) queueSummary.hidden = false;
+    };
+    if (queueSnapshot?.key === key) { render(queueSnapshot); return; }
+    hideQueueSummary();
+    if (!allowReads || workflow.busy || stageWritesPending) return;
+    const snapshot = { key, leads: null, tasks: null };
+    queueSnapshot = snapshot;
+    render(snapshot);
+    const current = () => queueSnapshot === snapshot && snapshot.key === queueIdentity() && validContactRead(context);
+    const publish = (category, promise) => {
+      promise.then(value => {
+        if (!current()) return;
+        snapshot[category] = value;
+        if (!document.hidden && !workflow.busy && !stageWritesPending && visible(runButton) && previousContactControlsGone()) render(snapshot);
+      }, () => {});
+    };
+    const pipelineCount = async (pipeline, stageName, sameStage = false) => {
+      const body = pipelineQueueQuery(pipeline, stageName, sameStage);
+      if (!sameStage) return pipelineQueueCount(await readList('/opportunities/search', body), pipeline, stageName);
+      // Contact equality is also used by contactOpportunityQuery; no invented NOT filter or pagination.
+      const contactBody = { ...body, filters: [...body.filters,
+        { group: 'OR', filters: [{ field: 'contact_id', operator: 'eq', value: context.id }] }] };
+      const [all, own] = await Promise.all([readList('/opportunities/search', body), readList('/opportunities/search', contactBody)]);
+      const total = pipelineQueueCount(all, pipeline, stageName), excluded = pipelineQueueCount(own, pipeline, stageName);
+      if (excluded > total) throw new Error('Queue changed during count.');
+      return total - excluded;
+    };
+    if (settings.priority === 'stage') {
+      if (stage) publish('leads', pipelineCount(stage.pipeline, stage.stage, true));
+    } else {
+      publish('leads', Promise.all(settings.pipelineIds.map(id => pipelineCount(NAV_PIPELINES.find(p => p.id === id), settings.newLeadStage)))
+        .then(counts => { const total = counts.reduce((sum, count) => sum + count, 0); if (!Number.isSafeInteger(total)) throw new Error('Invalid queue total.'); return total; }));
+      publish('tasks', (async () => {
+        const dueBefore = new Date().toISOString();
+        return dueTaskQueueCount(await readList('/objects/task/records/search', dueTaskQueueQuery(dueBefore)), dueBefore);
+      })());
+    }
+    // Query builders may load a persisted template on their first use.
+    snapshot.key = queueIdentity();
+  }
   nextButton = document.createElement('button');
   nextButton.id = 'pertama-next-lead-button';
   nextButton.textContent = 'Next lead';
@@ -3013,7 +3112,7 @@
       if (owned(record.target)) continue;
       const nodes = [...record.addedNodes, ...record.removedNodes];
       const removedControl = [...record.removedNodes].some(node =>
-        [runButton, nextButton, settingsButton, stageBadge].includes(node) && !node.isConnected);
+        [runButton, nextButton, settingsButton, stageBadge, queueSummary].includes(node) && !node.isConnected);
       if (record.type === 'childList' && nodes.length && nodes.every(owned) && !removedControl) continue;
       changed = true;
       for (const node of record.addedNodes) if (node.nodeType === Node.ELEMENT_NODE && !owned(node)) rootsToDiscover.add(node);
@@ -3078,7 +3177,7 @@
   }
   refreshButtons = () => {
     if (document.hidden || frame !== null) return;
-    frame = requestAnimationFrame(() => { frame = null; refreshToolbar(); });
+    frame = requestAnimationFrame(() => { frame = null; refreshToolbar(true); });
   };
   function wakeDiscovery() {
     stopDiscovery(); discoveryExpired = false;
@@ -3105,7 +3204,7 @@
     companies = document.getElementById('tb_business');
     centralName = document.querySelector('[data-testid="CENTRALPANEL_NAME"]');
   }
-  function placeButton() {
+  function placeButton(allowReads) {
     // Finish layout reads before any writes; never measure unrelated page controls.
     const showRun = Boolean(contactId() && visible(companies));
     const visibleName = visible(centralName) ? centralName : null;
@@ -3133,6 +3232,8 @@
       if (nextButton.style.fontSize !== nextSize) nextButton.style.fontSize = nextSize;
       if (settingsButton.style.fontSize !== settingsSize) settingsButton.style.fontSize = settingsSize;
     }
+    if (showRun && runButton.nextElementSibling !== queueSummary) runButton.insertAdjacentElement('afterend', queueSummary);
+    updateQueueSummary(showRun, allowReads);
     updateStageIndicator(visibleName);
     return widthTarget;
   }
@@ -3150,7 +3251,7 @@
       scheduleDiscoveryRetry(missingNavHosts);
     }
   }
-  function refreshToolbar() {
+  function refreshToolbar(allowReads = false) {
     if (document.hidden) return;
     recordNavigationReady();
     syncStageQueue();
@@ -3163,18 +3264,20 @@
     if (callCounterView && !validLeadContext(callCounterView.context)) invalidateOutgoingCallCounter();
     if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
       cancelLeadAccessReport();
+      hideQueueSummary();
       setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
       hostObserver.disconnect(); stopDiscovery(); widthObserver?.disconnect();
       observedWidthTarget = null; observedWidth = null;
       return;
     }
     discoverHosts();
-    const widthTarget = placeButton();
+    const widthTarget = placeButton(allowReads);
     reconcileDiscovery(widthTarget);
   }
   window.addEventListener('resize', () => { observedWidth = null; rootsToDiscover.add(document); refreshButtons(); });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
+      hideQueueSummary();
       if (frame !== null) cancelAnimationFrame(frame);
       frame = null; stopDiscovery();
     } else { observedWidth = null; wakeDiscovery(); }
@@ -3185,6 +3288,7 @@
         || contactId() && (!companies?.isConnected || currentUserId && !centralName?.isConnected))) wakeDiscovery();
   }, true);
   refreshToolbar();
+  refreshButtons();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initializeButtons, { once: true });
   else initializeButtons();

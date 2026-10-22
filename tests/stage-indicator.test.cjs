@@ -28,6 +28,8 @@ function harness(t, { mounted = true, auth = true, session = {} } = {}) {
   w.alert = message => alerts.push(message);
   w.fetch = async (url, init) => {
     const pathname = new URL(url).pathname.replace(/\/$/, ''), body = init.body && JSON.parse(init.body);
+    // Queue summary reads are covered separately; these assertions count indicator/contact reads only.
+    if (pathname === '/objects/task/records/search') return new Response(JSON.stringify({ total: 0, customObjectRecords: [] }));
     const id = init.method === 'GET' ? pathname.split('/').at(-1) : body.filters[0].filters[0].value;
     const request = { pathname, method: init.method, body, id }; requests.push(request);
     const override = await hook(request);
