@@ -65,11 +65,89 @@ test('settings saves a selected user-linked number when several are available', 
   assert.equal(JSON.parse(h.w.localStorage.getItem(`pertama:settings:${L}`)).smsFrom, '+19876543211');
   assert.equal((await h.prep()).from, '+19876543211');
 });
+function openSenderSettings(h) {
+  h.w.HTMLDialogElement.prototype.showModal = function () {};
+  h.w.HTMLDialogElement.prototype.close = function () {};
+  h.e('openSettings()');
+  const dialog = h.w.document.getElementById('pertama-settings');
+  return { dialog, select: dialog.querySelector('[name="smsFrom"]') };
+}
+const inventoryPath = '/phone-system/numbers/v2/location/' + L;
+for (const phone of [contact.phone, 'invalid', null, undefined]) test(`settings reads only inventory regardless of recipient phone ${phone}`, async t => {
+  const h = harness(t);
+  h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, phone } } : undefined);
+  const { dialog, select } = openSenderSettings(h);
+  await h.flush();
+  assert.deepEqual(h.calls.map(c => c.path), [inventoryPath]);
+  assert.equal(select.value, number.phoneNumber);
+  assert.match(dialog.querySelector('[data-sms-settings-status]').textContent, /selected automatically/);
+  assert.equal(h.w.document.querySelector('textarea').value, 'untouched');
+  assert.equal(h.calls[0].init.method, 'GET');
+  assert.equal(h.calls[0].init.cache, 'no-store');
+  assert.equal(h.calls[0].init.redirect, 'error');
+  assert.equal(h.calls[0].init.headers.version, '2021-07-28');
+  assert.match(h.calls[0].url, /\?includeRcsSenderIds=true$/);
+});
+test('settings inventory needs no contact or contact read epoch', async t => {
+  const h = harness(t);
+  h.w.history.pushState({}, '', `/v2/location/${L}/opportunities/list`);
+  h.e('contactWritesPending++; contactReadEpoch++');
+  let release;
+  h.hook(c => c.path === inventoryPath ? new Promise(resolve => { release = resolve; }) : undefined);
+  const { select } = openSenderSettings(h);
+  await h.flush();
+  assert.deepEqual(h.calls.map(c => c.path), [inventoryPath]);
+  h.e('contactReadEpoch++');
+  release({ numbers: [number], total: 1 });
+  await h.flush();
+  assert.equal(select.value, number.phoneNumber);
+});
+for (const data of [{}, {numbers:[number]}, {numbers:[number],total:2}, {numbers:[number,number],total:2}, {numbers:[{...number,phoneNumber:'123'}],total:1}, {numbers:[{...number,linkedUser:{id:'owner1'}}],total:1}]) test(`settings rejects malformed inventory ${JSON.stringify(data)}`, async t => {
+  const h = harness(t);
+  h.hook(c => c.path === inventoryPath ? data : undefined);
+  const { dialog, select } = openSenderSettings(h);
+  await h.flush();
+  assert.deepEqual(h.calls.map(c => c.path), [inventoryPath]);
+  assert.equal(select.disabled, true);
+  assert.deepEqual([...select.options].map(option => option.value), ['']);
+  assert.match(dialog.querySelector('[data-sms-settings-status]').textContent, /Could not load/);
+});
+for (const change of ['currentUserId="other"', 'identityExpires=0', 'liveReadHeaders=null', 'readSessionRevision++',
+  'rejectCrmAuthorization()', `history.pushState({},"","/v2/location/other/opportunities/list")`]) test(`settings discards pending inventory after ${change}`, async t => {
+  const h = harness(t);
+  let release;
+  h.hook(c => c.path === inventoryPath ? new Promise(resolve => { release = resolve; }) : undefined);
+  const { dialog, select } = openSenderSettings(h);
+  await h.flush();
+  assert.deepEqual(h.calls.map(c => c.path), [inventoryPath]);
+  h.e(change);
+  release({ numbers: [number], total: 1 });
+  await h.flush();
+  assert.equal(select.disabled, true);
+  assert.deepEqual([...select.options].map(option => option.value), ['']);
+  assert.match(dialog.querySelector('[data-sms-settings-status]').textContent, /Could not load/);
+});
+for (const change of ['currentUserId=null', 'identityExpires=0', 'liveReadHeaders=null',
+  'liveReadHeaders={"token-id":"unreadable"}', `history.pushState({},"","/v2/location/other/contacts/detail/c1")`]) test(`settings inventory requires verified account and session: ${change}`, async t => {
+  const h = harness(t);
+  h.e(change);
+  const { select } = openSenderSettings(h);
+  await h.flush();
+  assert.deepEqual(h.calls, []);
+  assert.equal(select.disabled, true);
+  assert.deepEqual([...select.options].map(option => option.value), ['']);
+});
+test('SMS endpoint inventory stays closed to arbitrary operations', async t => {
+  const h = harness(t);
+  await assert.rejects(h.e('smsApiRequest("other", workflow.approvedActionContext)'), /not permitted/);
+  assert.deepEqual(h.calls, []);
+});
 test('API prep returns safe explicit choices and count without touching native drafts or composer', async t => {
   const h=harness(t), p=await h.prep();
   assert.equal(p.to,contact.phone); assert.equal(p.contact.id,'c1'); assert.equal(p.savedDraftCount,1);
   assert.equal(p.fromNumbers.length,1); assert.equal(p.fromNumbers[0].number,number.phoneNumber);
   assert.equal(p.from,number.phoneNumber); assert.equal(p.drafts,undefined);
+  assert.deepEqual(h.calls.map(c => c.path), ['/contacts/c1', inventoryPath, `/conversations/messages/drafts/${L}/contacts/c1`]);
   assert.equal(h.w.document.querySelector('textarea').value,'untouched');
   assert.ok(h.calls.every(c=>c.init.method==='GET' && c.init.cache==='no-store' && c.init.redirect==='error'));
   assert.match(h.calls[1].url,/includeRcsSenderIds=true$/);
