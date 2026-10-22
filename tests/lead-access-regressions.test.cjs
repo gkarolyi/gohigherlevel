@@ -36,6 +36,53 @@ function harness(t) {
   return { w, e, calls, handler: fn => { handler = fn; }, async flush() { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); },
     history: () => JSON.parse(e('JSON.stringify(leadHistory(leadAccessContext()))')) };
 }
+test('history observations use indexed contacts without scanning or serializing rows', t => {
+  const h = harness(t);
+  h.e(`{
+    const context = leadAccessContext();
+    for (let i = 0; i < 2000; i++) rememberLeadContact({ id: 'c' + i, locationId: LOCATION_ID, firstName: 'Lead', lastName: String(i) }, context);
+    const rows = leadHistory(context);
+    rows.find = () => { throw new Error('linear contact lookup'); };
+    const stringify = JSON.stringify;
+    JSON.stringify = function(value, ...args) {
+      if (value && rows.includes(value)) throw new Error('serialized history row');
+      return stringify.call(this, value, ...args);
+    };
+    try {
+      rememberLeadTasks({ total: 100, customObjectRecords: Array.from({ length: 100 }, (_, i) => ({
+        id: 'task' + i, locationId: LOCATION_ID, objectKey: 'task', owners: [context.user],
+        properties: { title: 'Call', dueDate: '2026-10-10', completed: 0 },
+        relations: [{ associationId: 'TASK_CONTACT_ASSOCIATION', objectKey: 'contact', recordId: 'c' + i, relationId: 'rel' + i }],
+      })) }, context);
+      if (rows.slice(0, 100).some(row => row.tasks.length !== 1)) throw new Error('task observations lost');
+      completeRememberedLeadTask('c0', 'task0', context);
+      if (!rows[0].tasks[0].completed) throw new Error('completion lost');
+      rememberLeadContact({ id: 'c0', locationId: LOCATION_ID, firstName: 'Updated' }, context);
+      if (rows[0].name !== 'Updated') throw new Error('name observation lost');
+    } finally { JSON.stringify = stringify; }
+  }`);
+});
+
+test('older task observations neither change history nor schedule persistence', t => {
+  const h = harness(t), now = Date.now();
+  h.e(`rememberLeadTask('c1', { id: 't1', title: 'Latest', due: '', completed: true, observedAt: ${now} }, leadAccessContext()); flushLeadHistory();
+    rememberLeadTask('c1', { id: 't1', title: 'Old', due: '', completed: false, observedAt: ${now - 1000} }, leadAccessContext())`);
+  assert.equal(h.e('leadHistoryTimer'), null);
+  assert.equal(h.history()[0].tasks[0].title, 'Latest');
+});
+
+test('history index follows eviction and replacement on flush', t => {
+  const h = harness(t), now = Date.now();
+  h.e(`{
+    const context = leadAccessContext();
+    for (let i = 0; i < 2001; i++) rememberLeadTask('c' + i, { id: 't' + i, title: 'Call', due: '', completed: false, observedAt: ${now - 5000} + i }, context);
+    if (leadHistory(context).length !== 2000 || leadHistory(context).some(row => row.id === 'c0')) throw new Error('oldest contact not evicted');
+    flushLeadHistory();
+    rememberLeadContact({ id: 'c0', locationId: LOCATION_ID, firstName: 'Returned' }, context);
+    if (leadHistory(context).filter(row => row.id === 'c0').length !== 1) throw new Error('index retained evicted row');
+  }`);
+});
+
 test('native Request task search is captured before original fetch consumes its body', async t => {
   const h = harness(t); h.handler(() => list([task()]));
   const request = new Request(`${origin}/objects/task/records/search`, { method: 'POST', body: JSON.stringify({ locationId: L }) });
