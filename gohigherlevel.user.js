@@ -1045,7 +1045,7 @@
         : action === 'stage' ? `Stage: ${context.targetStageName} (${context.targetStageId}); opportunity ${context.opportunity.id}`
         : action === 'note' ? `Note: ${context.noteText}`
         : `Task: ${context.taskTitle}; ${taskDueLabel(context.due)}; owner ${context.ownerId}`;
-      setPendingAction(operation, description); // No request before this operation's durable journal entry.
+      journal.setPending(operation, description); // No request before this operation's durable journal entry.
       attempts.add(operation);
     }
     const diagnostic = { method, url: `https://services.leadconnectorhq.com${action === 'stage' ? '/opportunities/{id}' : path.split('?')[0]}`,
@@ -1103,9 +1103,9 @@
     const saved = await actionRequest('stage', context);
     verifyStage(saved.data, saved.body, approved.id, context.contact, approved.pipelineId);
     requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === actionStageVersions.get(context), 'saved opportunity account/version/owner did not match.');
-    appendJournalEvidence(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
+    journal.append(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
     workflow.activeSaveProgress?.confirm('stage');
-    setPendingAction('stage', null);
+    journal.setPending('stage', null);
     requireActionApproval('stage', context);
   }
   async function saveNoteApi() {
@@ -1113,9 +1113,9 @@
     const { data, body } = await actionRequest('note', context);
     requireSaved(safeActionId(data.note?.id), 'unsafe note ID.');
     verifyNote(data, body, context.contact, context.noteText);
-    appendJournalEvidence(`Note saved (server confirmed; note ${data.note.id})`);
+    journal.append(`Note saved (server confirmed; note ${data.note.id})`);
     workflow.activeSaveProgress?.confirm('note');
-    setPendingAction('note', null);
+    journal.setPending('note', null);
     requireActionApproval('note', context);
   }
   async function createTaskApi() {
@@ -1127,17 +1127,17 @@
     verifyTask(data, body, context.contact, context.taskTitle, context.due);
     context.taskId = data.record.id;
     workflow.activeSaveProgress?.created();
-    appendJournalEvidence(`Task created: ${context.taskId}; ${taskDueLabel(context.due)} (server confirmed)`);
-    setPendingAction('task', `Contact association for task ${context.taskId}`);
+    journal.append(`Task created: ${context.taskId}; ${taskDueLabel(context.due)} (server confirmed)`);
+    journal.setPending('task', `Contact association for task ${context.taskId}`);
     requireActionApproval('task', context);
     const linked = await actionRequest('link', context);
     verifyTaskLink(linked.data, context.taskId, context.contact);
     rememberLeadContact(context.contactRecord, { user: context.user });
     rememberLeadTask(context.contact, { id: context.taskId, title: context.taskTitle, due: context.due, completed: false, observedAt: Date.now() }, { user: context.user });
-    appendJournalEvidence('Task contact association: server confirmed');
+    journal.append('Task contact association: server confirmed');
     workflow.activeSaveProgress?.confirm('task');
-    setPendingAction('link', null);
-    setPendingAction('task', null);
+    journal.setPending('link', null);
+    journal.setPending('task', null);
     requireActionApproval('task', context);
   }
 
@@ -1559,8 +1559,7 @@
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const workflow = {
     busy: false, activeSaveProgress: null, guardedContact: null, guardedStageQueue: null,
-    approvedActionContext: null, step: '', completed: [], pendingSave: '',
-    pendingActions: {}, startingContact: '',
+    approvedActionContext: null, step: '', startingContact: '',
   };
 
   // Fixed phase labels and durations only: no names, IDs, credentials or message text.
@@ -1672,59 +1671,51 @@
     if (workflow.busy || contactId() !== id || localStorage.getItem(key) !== original) {
       throw new Error('Contact or checkpoint changed. Nothing cleared.');
     }
-    localStorage.removeItem(key);
+    journal.remove(id);
     return true;
   }
 
-  function resetJournalEvidence() {
-    workflow.completed = [];
-    workflow.pendingSave = '';
-    workflow.pendingActions = {};
-  }
-
-  function restoreJournalEvidence(saved) {
-    workflow.completed = saved.completed || [];
-    workflow.pendingSave = saved.pendingSave || '';
-    workflow.pendingActions = saved.pendingActions || {};
-  }
-
-  function appendJournalEvidence(description) {
-    workflow.completed.push(description);
-  }
-
-  function setSmsSummary(description) {
-    workflow.pendingSave = description;
-    saveCheckpoint();
-  }
-
-  function clearSmsSummary() {
-    const unresolved = workflow.pendingSave;
-    workflow.pendingSave = '';
-    try { saveCheckpoint(); } catch (error) { workflow.pendingSave = unresolved; throw error; }
-  }
-
-  function removeCompletedCheckpoint(id) {
-    localStorage.removeItem(checkpointKey(id));
-  }
-
-  function saveCheckpoint() {
-    localStorage.setItem(checkpointKey(workflow.startingContact), JSON.stringify({
-      completed: workflow.completed, pendingSave: workflow.pendingSave, pendingActions: { ...workflow.pendingActions }, time: new Date().toISOString(),
-    }));
-  }
-
-  function setPendingAction(operation, description) {
-    const previous = { ...workflow.pendingActions }, previousSummary = workflow.pendingSave;
-    if (description === null) delete workflow.pendingActions[operation];
-    else workflow.pendingActions[operation] = description;
-    workflow.pendingSave = Object.values(workflow.pendingActions).join('\n');
-    try { saveCheckpoint(); }
-    catch (error) {
-      workflow.pendingActions = previous; workflow.pendingSave = previousSummary;
-      if (workflow.approvedActionContext) workflow.approvedActionContext.stopSaves = true;
-      throw error;
+  // Own all journal mutations here. Callers may inspect evidence, but writes must
+  // persist intent before dispatch and preserve uncertainty when storage fails.
+  const journal = (() => {
+    let completed = [], pendingSave = '', pendingActions = {};
+    function restore(saved) {
+      completed = saved.completed || [];
+      pendingSave = saved.pendingSave || '';
+      pendingActions = saved.pendingActions || {};
     }
-  }
+    function save() {
+      localStorage.setItem(checkpointKey(workflow.startingContact), JSON.stringify({
+        completed, pendingSave, pendingActions, time: new Date().toISOString(),
+      }));
+    }
+    function setPending(operation, description) {
+      const previous = { ...pendingActions }, previousSummary = pendingSave;
+      if (description === null) delete pendingActions[operation];
+      else pendingActions[operation] = description;
+      pendingSave = Object.values(pendingActions).join('\n');
+      try { save(); }
+      catch (error) {
+        pendingActions = previous; pendingSave = previousSummary;
+        if (workflow.approvedActionContext) workflow.approvedActionContext.stopSaves = true;
+        throw error;
+      }
+    }
+    return {
+      get completed() { return completed; },
+      get pendingSave() { return pendingSave; },
+      get pendingActions() { return pendingActions; },
+      reset() { restore({}); }, restore, save, setPending,
+      append(description) { completed.push(description); },
+      setSummary(description) { pendingSave = description; save(); },
+      clearSummary() {
+        const unresolved = pendingSave;
+        pendingSave = '';
+        try { save(); } catch (error) { pendingSave = unresolved; throw error; }
+      },
+      remove(id) { localStorage.removeItem(checkpointKey(id)); },
+    };
+  })();
   async function drainAll(promises) {
     const results = await Promise.allSettled(promises);
     for (const result of results) if (result.status === 'rejected') throw result.reason;
@@ -1993,8 +1984,8 @@
       diagnostic.result = 'completion accepted';
       completeRememberedLeadTask(context.id, taskId, { user: context.user });
       // Preserve known acceptance even if navigation/session changed while the request was in flight.
-      appendJournalEvidence(`Call task completion accepted: ${taskId}; readback not yet verified.`);
-      saveCheckpoint();
+      journal.append(`Call task completion accepted: ${taskId}; readback not yet verified.`);
+      journal.save();
       requireCallTaskContext(context);
     } catch (error) {
       if (diagnostic.result !== 'completion accepted') diagnostic.result = error?.name === 'AbortError' ? 'timeout' : 'completion unverified';
@@ -2054,7 +2045,7 @@
       const matchesTitle = row => row.properties.title.replace(/\s+/g, ' ').trim() === title;
       phase = 'saving the completion checkpoint';
       if (context.approval.stopSaves) throw new Error('Saving was stopped.');
-      setPendingAction('complete', `Complete Call task ${task.id}: ${task.properties.title}`); // Persist before PUT.
+      journal.setPending('complete', `Complete Call task ${task.id}: ${task.properties.title}`); // Persist before PUT.
       requireCallTaskContext(context);
       phase = 'sending task completion or verifying its acknowledgment';
       attempted = true;
@@ -2076,9 +2067,9 @@
         }
       }
       if (!verified) throw new Error('Task completion readback unavailable.');
-      appendJournalEvidence(`Call task completed and verified: ${task.id}: ${title}`);
+      journal.append(`Call task completed and verified: ${task.id}: ${title}`);
       workflow.activeSaveProgress?.confirm('complete');
-      setPendingAction('complete', null);
+      journal.setPending('complete', null);
       requireCallTaskContext(context);
     } catch {
       // Never surface arbitrary native/network errors, which can include credentials or response data.
@@ -2194,7 +2185,7 @@
   const smsAttempts = new WeakSet();
   async function sendSmsApi() {
     const context = requireActionApproval('sms');
-    if (workflow.pendingSave || smsAttempts.has(context)) throw new Error('SMS already attempted or an unresolved save exists. No retry.');
+    if (journal.pendingSave || smsAttempts.has(context)) throw new Error('SMS already attempted or an unresolved save exists. No retry.');
     const sms = { ...context.sms };
     if (canonicalSmsPhone(sms.from) !== sms.from || canonicalSmsPhone(sms.to) !== sms.to
       || typeof sms.message !== 'string' || !sms.message.trim()) throw new Error('Explicit SMS sender, recipient and message approval are required.');
@@ -2207,16 +2198,16 @@
     const spam = await smsApiRequest('spam', context, sms);
     requireActionApproval('sms', context);
     if (spam.isSpam !== false) throw new Error('SMS spam preflight did not approve the message.');
-    if (workflow.pendingSave) throw new Error('An unresolved save exists. No retry.');
-    setSmsSummary(`SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance not yet confirmed`);
+    if (journal.pendingSave) throw new Error('An unresolved save exists. No retry.');
+    journal.setSummary(`SMS from ${sms.from} to ${sms.to}; message: ${sms.message}; acceptance not yet confirmed`);
     const acknowledgment = await smsApiRequest('send', context, sms);
     if (!safeActionId(acknowledgment.conversationId) || !safeActionId(acknowledgment.messageId)) throw new Error('SMS acknowledgment is unverified. No retry.');
     const identity = `SMS message ${acknowledgment.messageId}; conversation ${acknowledgment.conversationId}`;
-    appendJournalEvidence(`${identity}: accepted by CRM; delivery not confirmed.`);
+    journal.append(`${identity}: accepted by CRM; delivery not confirmed.`);
     workflow.activeSaveProgress?.confirm('sms');
-    setSmsSummary(`${identity}: accepted; workflow continuation not yet approved`);
+    journal.setSummary(`${identity}: accepted; workflow continuation not yet approved`);
     requireActionApproval('sms', context);
-    clearSmsSummary();
+    journal.clearSummary();
     requireActionApproval('sms', context);
     const notice = `SMS to ${sms.to}: accepted by CRM; delivery not confirmed.`;
     try {
@@ -2539,7 +2530,7 @@
     let saveProgress = null;
     workflow.busy = true;
     runButton.disabled = true;
-    resetJournalEvidence();
+    journal.reset();
     workflow.step = 'Checking contact page';
     workflow.guardedContact = contactId();
     workflow.startingContact = workflow.guardedContact || '(none)';
@@ -2554,7 +2545,7 @@
       const previous = localStorage.getItem(checkpointKey(workflow.startingContact));
       if (previous) {
         const saved = JSON.parse(previous);
-        restoreJournalEvidence(saved);
+        journal.restore(saved);
         throw new Error(`Repeat run blocked: an unfinished no-answer action exists from ${saved.time}. Stage/note/task changes may already be saved. Reconcile that action before starting another; refreshing does not clear this block.`);
       }
       if (settings.pipelineIds?.length || settings.priority === 'stage') {
@@ -2648,7 +2639,7 @@
         await trackAction('sms', sendSmsApi, 'Sending…');
       }
 
-      removeCompletedCheckpoint(workflow.startingContact);
+      journal.remove(workflow.startingContact);
       progress('Opening next lead…');
       workflow.guardedContact = null; // Navigation is allowed only after the saves succeeded.
       workflow.guardedStageQueue = null;
@@ -2664,8 +2655,8 @@
         `Pertama No answer — v${VERSION}`, `Stopped: ${workflow.step}`,
         `Contact ID: ${workflow.startingContact}`, `Current path: ${location.pathname}`,
         '', error.message || String(error), '',
-        'Completed actions (verification noted below):', workflow.completed.join('\n') || 'None confirmed.',
-        '', workflow.pendingSave ? `Save attempted; result not fully verified:\n${workflow.pendingSave}\nThis may already be saved. Inspect the record to avoid duplicates.`
+        'Completed actions (verification noted below):', journal.completed.join('\n') || 'None confirmed.',
+        '', journal.pendingSave ? `Save attempted; result not fully verified:\n${journal.pendingSave}\nThis may already be saved. Inspect the record to avoid duplicates.`
           : 'No save is awaiting verification. Unsaved form edits may remain.',
         '', 'Execution stopped. No automatic retry. Check the record before running again.',
         'The same report and technical error are in the browser console.',
