@@ -15,8 +15,15 @@ function harness(t, rows = [], respond) {
   w.Date.now = () => NOW;
   w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
   w.HTMLDialogElement.prototype.close = function () { this.open = false; };
-  const calls = [];
+  const calls = [], settingsCalls = [];
+  let openingSettings = false;
   w.fetch = async (url, init) => {
+    if (openingSettings) {
+      settingsCalls.push({ url, init });
+      assert.equal(url, `https://services.leadconnectorhq.com/phone-system/numbers/v2/location/${L}?includeRcsSenderIds=true`);
+      assert.equal(init.method, 'GET');
+      return new Response(JSON.stringify(inventory));
+    }
     calls.push({ url, init });
     let data;
     if (respond) data = await respond(url, init, calls.length);
@@ -30,7 +37,21 @@ function harness(t, rows = [], respond) {
   const e = evaluateUserscript(w, source);
   function auth(user = 'u1') { const token = `x.${Buffer.from(JSON.stringify({ user_id: user, sub: user, locations: [L], exp: NOW / 1000 + 3600 })).toString('base64url')}.x`; e(`captureReadHeaders('https://services.leadconnectorhq.com/contacts/c1', {'token-id': ${JSON.stringify(token)}})`); }
   auth();
-  return { w, e, calls, auth, run: () => e('runOutgoingCallCount()'), open() { e('openSettings()'); return w.document.querySelector('#pertama-settings'); } };
+  return { w, e, calls, settingsCalls, auth, run: () => e('runOutgoingCallCount()'), async open() {
+    // Settings owns its inventory lookup; counter assertions cover only subsequent requests.
+    const before = calls.length, settingsBefore = settingsCalls.length;
+    openingSettings = true;
+    e('openSettings()'); await tick();
+    openingSettings = false;
+    assert.equal(calls.length, before);
+    const inventoryRequests = settingsCalls.slice(settingsBefore);
+    assert.ok(inventoryRequests.length <= 1);
+    for (const request of inventoryRequests) {
+      assert.equal(request.url, `https://services.leadconnectorhq.com/phone-system/numbers/v2/location/${L}?includeRcsSenderIds=true`);
+      assert.equal(request.init.method, 'GET');
+    }
+    return w.document.querySelector('#pertama-settings');
+  } };
 }
 const plain = x => JSON.parse(JSON.stringify(x));
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -59,13 +80,13 @@ test('over-cap call inventory stops after its first page without partial results
   const h = harness(t, Array.from({ length: 5001 }, (_, i) => call(i)));
   await assert.rejects(h.run(), /capped at 5,000/);
   assert.equal(h.calls.length, 2); assert.equal(h.e('leadReportRun'), null);
-  const d = h.open(); await d.querySelector('[data-call-count-load]').onclick();
+  const d = await h.open(); await d.querySelector('[data-call-count-load]').onclick();
   assert.equal(h.calls.length, 4);
   assert.equal(d.querySelector('[data-call-count-rows]').textContent, '');
   assert.match(d.querySelector('[data-call-count-status]').textContent, /Could not load/);
 });
-test('outgoing counter appears above inaccessible report with spacing', t => {
-  const h = harness(t), d = h.open(), counter = d.querySelector('[data-call-count]'), report = d.querySelector('[data-lead-access]');
+test('outgoing counter appears above inaccessible report with spacing', async t => {
+  const h = harness(t), d = await h.open(), counter = d.querySelector('[data-call-count]'), report = d.querySelector('[data-lead-access]');
   assert.ok(counter.compareDocumentPosition(report) & h.w.Node.DOCUMENT_POSITION_FOLLOWING);
   assert.equal(h.w.getComputedStyle(counter).marginBottom, '16px');
 });
@@ -94,7 +115,7 @@ for (const mode of ['failure', 'repeat', 'overlap', 'total', 'short']) test(`rej
 test('UI is click-only, safely renders totals and WITA timestamp, refresh clears failure and preserves settings', async t => {
   let fail = false;
   const h = harness(t, [call(1, { callStatus: '<img src=x>' })], () => fail ? new Response('{}', { status: 500 }) : undefined);
-  const d = h.open(), button = d.querySelector('[data-call-count-load]'); assert.ok(button); assert.equal(button.textContent, 'Load call counts');
+  const d = await h.open(), button = d.querySelector('[data-call-count-load]'); assert.ok(button); assert.equal(button.textContent, 'Load call counts');
   assert.equal(h.calls.length, 0); assert.equal(d.querySelector('[data-call-count-rows]').textContent, '');
   d.querySelector('[name=note]').value = 'Unsaved';
   await button.onclick();
@@ -109,7 +130,7 @@ test('UI is click-only, safely renders totals and WITA timestamp, refresh clears
 for (const mode of ['close', 'escape', 'save', 'user', 'auth', 'account']) test(`${mode} cancels counter and suppresses late paint`, async t => {
   let finish;
   const h = harness(t, [], (url) => url.includes('/numbers/') ? new Promise(resolve => { finish = resolve; }) : undefined);
-  const d = h.open(), button = d.querySelector('[data-call-count-load]'); assert.ok(button);
+  const d = await h.open(), button = d.querySelector('[data-call-count-load]'); assert.ok(button);
   const pending = button.onclick(); await tick(); assert.equal(button.disabled, true);
   await button.onclick(); assert.equal(h.calls.length, 1); assert.equal(d.querySelector('[data-lead-access]').disabled, true);
   if (mode === 'close') d.querySelector('[data-cancel]').click();
@@ -136,7 +157,7 @@ test('counter rejects another active owner without cancelling it', async t => {
   await assert.rejects(h.run(), /already running/); assert.equal(h.e('leadReportRun.cancelled'), false);
 });
 test('identity switch clears already loaded rows and disables old settings context', async t => {
-  const h = harness(t, [call(1)]), d = h.open(), button = d.querySelector('[data-call-count-load]'); assert.ok(button);
+  const h = harness(t, [call(1)]), d = await h.open(), button = d.querySelector('[data-call-count-load]'); assert.ok(button);
   await button.onclick(); h.auth('u2');
   assert.equal(d.querySelector('[data-call-count-rows]').textContent, ''); assert.equal(button.disabled, true);
 });
@@ -149,7 +170,7 @@ test('unknown and prototype-like statuses are safe and nested call legs never co
   const result = await h.run();
   assert.equal(result.days[0].total, 3);
   assert.deepEqual(plain(result.days[0].statuses), JSON.parse('{"__proto__":1,"unknown":1,"no-answer":1}'));
-  const d = h.open(); await d.querySelector('[data-call-count-load]').onclick();
+  const d = await h.open(); await d.querySelector('[data-call-count-load]').onclick();
   assert.deepEqual([...d.querySelectorAll('[data-call-count-rows] thead th')].map(x => x.textContent), ['Day · WITA', 'Total', 'Completed', 'Busy', 'Failed', '__proto__', 'unknown', 'No answer']);
 });
 test('captured now stays fixed while pages load, including exactly WITA midnight', async t => {
@@ -163,14 +184,14 @@ test('captured now stays fixed while pages load, including exactly WITA midnight
 });
 test('old settings handler cannot paint into reopened settings', async t => {
   let finish; const h = harness(t, [], url => url.includes('/numbers/') ? new Promise(resolve => { finish = resolve; }) : undefined);
-  const old = h.open(), pending = old.querySelector('[data-call-count-load]').onclick(); await tick();
-  old.querySelector('[data-cancel]').click(); const current = h.open();
+  const old = await h.open(), pending = old.querySelector('[data-call-count-load]').onclick(); await tick();
+  old.querySelector('[data-cancel]').click(); const current = await h.open();
   finish(inventory); await pending;
   assert.equal(current.isConnected, true); assert.equal(current.querySelector('[data-call-count-rows]').textContent, '');
   assert.equal(current.querySelector('[data-call-count-load]').disabled, false); assert.equal(h.calls.length, 1);
 });
-test('invalidating an old settings context is idempotent, without repeated DOM mutations', t => {
-  const h = harness(t), d = h.open(); h.auth('u2');
+test('invalidating an old settings context is idempotent, without repeated DOM mutations', async t => {
+  const h = harness(t), d = await h.open(); h.auth('u2');
   const message = d.querySelector('[data-call-count-status]').firstChild;
   h.e('invalidateOutgoingCallCounter()');
   assert.equal(d.querySelector('[data-call-count-status]').firstChild, message);
@@ -179,7 +200,7 @@ test('late page failure leaves UI empty, not a partial total', async t => {
   const h = harness(t, Array.from({ length: 51 }, (_, i) => call(i)), (url, init) => {
     if (url.includes('/reporting/') && JSON.parse(init.body).skip === 50) return new Response('{}', { status: 500 });
   });
-  const d = h.open(); await d.querySelector('[data-call-count-load]').onclick();
+  const d = await h.open(); await d.querySelector('[data-call-count-load]').onclick();
   assert.equal(d.querySelectorAll('[data-call-count-rows] tr').length, 0);
   assert.match(d.querySelector('[data-call-count-status]').textContent, /Could not load/);
 });

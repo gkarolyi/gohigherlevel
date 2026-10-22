@@ -10,15 +10,28 @@ function harness(t) {
   const w = dom.window; t.after(() => w.close()); installWebGlobals(w);
   w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
   w.HTMLDialogElement.prototype.close = function () { this.open = false; };
-  const calls = []; w.fetch = async (...args) => { calls.push(args); throw Error('Unexpected request'); };
+  const calls = []; w.fetch = async (url, init) => {
+    calls.push({ url, init });
+    if (url === `https://services.leadconnectorhq.com/phone-system/numbers/v2/location/${L}?includeRcsSenderIds=true` && init.method === 'GET') {
+      return new Response(JSON.stringify({ numbers: [{ phoneNumber: '+15550000001', linkedUser: 'u1', capabilities: { sms: true } }], total: 1 }));
+    }
+    throw Error('Unexpected request');
+  };
   const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({ user_id: 'u1', sub: 'u1', locations: [L], exp: Date.now() / 1000 + 3600 })).toString('base64url')}.x`;
   e(`captureReadHeaders('https://services.leadconnectorhq.com/contacts/c1', ${JSON.stringify({ 'token-id': token })})`);
   return { w, e, calls, d: w.document, open() { e('openLeadAccessReport()'); return w.document.getElementById('pertama-lead-access'); },
     result(result) { w.reportResult = { complete: true, cancelled: false, checked: 33, warnings: [], rows: [], ...result }; e('runLeadAccessReport = async () => globalThis.reportResult'); } };
 }
-for (const escape of [false, true]) test(`settings report entry preserves unsaved form and restores focus; Escape=${escape}`, t => {
-  const h = harness(t); h.e('openSettings()'); const settings = h.d.querySelector('#pertama-settings');
+for (const escape of [false, true]) test(`settings report entry preserves unsaved form and restores focus; Escape=${escape}`, async t => {
+  const h = harness(t); h.e('openSettings()'); await new Promise(resolve => setImmediate(resolve));
+  const settings = h.d.querySelector('#pertama-settings');
+  assert.ok(h.calls.length <= 1);
+  for (const request of h.calls) {
+    assert.equal(request.url, `https://services.leadconnectorhq.com/phone-system/numbers/v2/location/${L}?includeRcsSenderIds=true`);
+    assert.equal(request.init.method, 'GET');
+  }
+  const settingsRequests = h.calls.length;
   const entry = settings.querySelector('[data-lead-access]'); assert.ok(entry); assert.equal(entry.type, 'button');
   assert.equal(entry.textContent, 'Inaccessible leads →');
   assert.equal(entry.closest('section').querySelector('h3').textContent, 'Reports');
@@ -26,8 +39,9 @@ for (const escape of [false, true]) test(`settings report entry preserves unsave
   const input = settings.querySelector('[name=note]'); input.value = 'Unsaved edit';
   let submitted = 0; settings.querySelector('form').addEventListener('submit', () => submitted++);
   const before = h.w.localStorage.length; entry.click(); const report = h.d.querySelector('#pertama-lead-access');
-  assert.ok(report.open); assert.ok(settings.open); assert.equal(submitted, 0); assert.equal(h.calls.length, 0);
+  assert.ok(report.open); assert.ok(settings.open); assert.equal(submitted, 0); assert.equal(h.calls.length, settingsRequests);
   h.e('openLeadAccessReport()'); assert.equal(h.d.querySelectorAll('#pertama-lead-access').length, 1);
+  assert.equal(h.calls.length, settingsRequests, 'opening the report adds no requests');
   if (escape) report.dispatchEvent(new h.w.Event('cancel', { cancelable: true })); else report.querySelector('[data-close]').click();
   assert.ok(settings.open); assert.equal(input.value, 'Unsaved edit'); assert.equal(h.w.localStorage.length, before);
   assert.equal(h.d.activeElement, entry);
