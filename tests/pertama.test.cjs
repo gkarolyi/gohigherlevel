@@ -381,7 +381,8 @@ test('native transition blocks automation until old contact, task and SMS contro
   await flush();
   assert.equal(h.w.location.pathname, NEXT_PATH);
   assert.equal(h.evaluate('workflow.busy'), true, 'route commitment is not contact readiness');
-  await h.evaluate("completeCallTask('contact-b'); run(); nextLead()");
+  await assert.rejects(h.evaluate("prepareCallTask('contact-b')"), /previous contact controls/i);
+  await h.evaluate('run(); nextLead()');
   assert.equal(fixture.clicks(), 0);
   assert.equal(h.requests.length, 1);
   // Replaced names alone do not make retained task/SMS controls safe.
@@ -405,7 +406,8 @@ test('controls hidden before native navigation remain blocked if revealed for th
   assert.equal(h.w.location.pathname, NEXT_PATH);
   assert.equal(h.evaluate('workflow.busy'), true, 'initially hidden source controls also need retirement');
   fixture.root.hidden = false;
-  await h.evaluate("completeCallTask('contact-b'); run(); nextLead()");
+  await assert.rejects(h.evaluate("prepareCallTask('contact-b')"), /previous contact controls/i);
+  await h.evaluate('run(); nextLead()');
   assert.equal(fixture.clicks(), 0);
   assert.equal(h.requests.length, 1);
   fixture.root.remove(); fixture.advance(150);
@@ -423,7 +425,7 @@ test('retained controls remain blocked after navigation readiness timeout and un
   assert.equal(h.evaluate('workflow.busy'), false);
   assert.equal(h.w.location.pathname, NEXT_PATH);
   h.evaluate('globalThis.__sidebarTouches = 0; globalThis.openSidebar = async () => { __sidebarTouches++; }; openSidebar = globalThis.openSidebar;');
-  await h.evaluate("completeCallTask('contact-b')");
+  await assert.rejects(h.evaluate("prepareCallTask('contact-b')"), /previous contact controls/i);
   await h.evaluate('run()');
   await h.evaluate('nextLead()');
   assert.equal(fixture.clicks(), 0, 'old task and Send controls must never be clicked');

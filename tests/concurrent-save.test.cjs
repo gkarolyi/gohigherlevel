@@ -64,6 +64,75 @@ function harness(t, { oldTask = true } = {}) {
     checkpoint: () => JSON.parse(w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`) || 'null') };
 }
 
+for (const field of ['assignedTo', 'firstName', 'lastName', 'phone']) for (const atRead of [2, 3]) {
+  test(`production preflight rejects changed ${field} at contact read ${atRead}`, async t => {
+    const h = harness(t); let reads = 0;
+    for (const gate of Object.values(h.gates)) gate.resolve();
+    h.hook(r => r.pathname === '/contacts/c1' && ++reads >= atRead
+      ? { contact: { ...contact, [field]: 'changed' } } : undefined);
+    await h.run();
+    assert.equal(h.writes.length, 0);
+    assert.equal(h.e('__nextCalls'), 0);
+    assert.match(h.w.document.body.textContent, /Contact.*changed/i);
+  });
+}
+
+test('production workflow restores an unfinished journal before any request or evidence reset', async t => {
+  const h = harness(t), saved = { completed: ['Prior confirmation'], pendingSave: 'Prior uncertainty',
+    pendingActions: { note: 'Prior note' }, time: new Date().toISOString() };
+  h.w.localStorage.setItem(`pertama:no-answer:unfinished:${L}:c1`, JSON.stringify(saved));
+  await h.run();
+  assert.deepEqual(h.checkpoint(), saved);
+  assert.equal(h.reads.length + h.writes.length, 0);
+  assert.deepEqual(JSON.parse(h.e('JSON.stringify(workflow.completed)')), saved.completed);
+  assert.equal(h.e('workflow.pendingSave'), saved.pendingSave);
+  assert.equal(h.e('workflow.busy'), false);
+  assert.match(h.alerts.join('\n'), /Repeat run blocked/);
+});
+
+test('production checkpoint removal failure retains completion receipts and blocks a repeated run', async t => {
+  const h = harness(t); let beforeRemoval;
+  h.w.Storage.prototype.removeItem = function (key) {
+    if (key.includes('unfinished')) { beforeRemoval = h.checkpoint(); throw new Error('Storage refused'); }
+  };
+  for (const gate of Object.values(h.gates)) gate.resolve();
+  await h.run();
+  assert.ok(beforeRemoval);
+  assert.match(beforeRemoval.completed.join('\n'), /Call task completion accepted/);
+  assert.match(beforeRemoval.completed.join('\n'), /Call task completed and verified/);
+  assert.equal(beforeRemoval.pendingSave, '');
+  assert.deepEqual(h.checkpoint(), beforeRemoval);
+  assert.equal(h.e('__nextCalls'), 0);
+  const count = h.writes.length;
+  await h.run();
+  assert.equal(h.writes.length, count);
+  assert.deepEqual(h.checkpoint(), beforeRemoval);
+});
+
+for (const ack of [{ succeded: false }, { success: true }, { succeded: 'true' }, null]) {
+  test(`production malformed completion acknowledgment cannot be retried: ${JSON.stringify(ack)}`, async t => {
+    const h = harness(t);
+    h.hook(r => r.operation === 'complete' ? new Response(JSON.stringify(ack)) : undefined);
+    for (const gate of Object.values(h.gates)) gate.resolve();
+    await h.run();
+    assert.match(h.checkpoint().pendingActions.complete, /old-task/);
+    assert.doesNotMatch(h.checkpoint().completed.join('\n'), /Call task completion accepted|Call task completed and verified/);
+    assert.equal(h.e('__nextCalls'), 0);
+    await h.run();
+    assert.equal(h.writes.filter(r => r.operation === 'complete').length, 1);
+  });
+}
+
+test('production busy ownership blocks a second run while completion is in flight', async t => {
+  const h = harness(t), pending = h.run(); await flush();
+  assert.equal(h.writes.filter(r => r.operation === 'complete').length, 1);
+  await h.run();
+  assert.equal(h.writes.filter(r => r.operation === 'complete').length, 1);
+  for (const gate of Object.values(h.gates)) gate.resolve();
+  await pending;
+  assert.equal(h.checkpoint(), null);
+});
+
 for (const order of [['stage', 'note', 'complete'], ['stage', 'complete', 'note'], ['note', 'stage', 'complete'],
   ['note', 'complete', 'stage'], ['complete', 'stage', 'note'], ['complete', 'note', 'stage']]) {
   test(`independent saves overlap and retain each intent: ${order.join(', ')}`, async t => {

@@ -82,6 +82,7 @@ for (const failedLink of [false, true]) test(`actual task creation remembers onl
   const h = harness(t);
   h.e(`workflow.startingContact = 'c1'; workflow.approvedActionContext = {
     contact:'c1', route:stageRouteRevision, user:currentUserId, epoch:contactReadEpoch,
+    ownedEpoch:0, ownedWritesPending:0, stopSaves:false,
     contactRecord:${JSON.stringify(contact)}, ownerId:'owner1', taskTitle:'Call Ada', due:'2026-10-10T03:00:00.000Z', actions:{task:true}, taskId:null };`);
   h.handler(c => c.url.includes('/contacts/') ? { contact }
     : c.url.endsWith('/objects/task/records') ? { record: { ...c.body, id: 't1', objectKey: 'task' }, errors: [] }

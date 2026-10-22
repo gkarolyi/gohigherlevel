@@ -28,7 +28,7 @@ function harness(t) {
   };
   const e = evaluateUserscript(w, source);
   const token = `x.${Buffer.from(JSON.stringify({user_id:'user1',sub:'user1',locations:[L],exp:Date.now()/1000+3600})).toString('base64url')}.x`;
-  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({'token-id':token})}); workflow.startingContact='c1'; workflow.approvedActionContext={contact:'c1',route:stageRouteRevision,user:currentUserId,epoch:contactReadEpoch,contactRecord:${JSON.stringify(contact)},actions:{sms:true},sms:{from:'${number.phoneNumber}',to:'${contact.phone}',message:'Hello'}};`);
+  e(`captureReadHeaders('${origin}/contacts/c1', ${JSON.stringify({'token-id':token})}); workflow.startingContact='c1'; workflow.approvedActionContext={contact:'c1',route:stageRouteRevision,user:currentUserId,epoch:contactReadEpoch,ownedEpoch:0,ownedWritesPending:0,stopSaves:false,contactRecord:${JSON.stringify(contact)},actions:{sms:true},sms:{from:'${number.phoneNumber}',to:'${contact.phone}',message:'Hello'}};`);
   return {w,e,calls,hook:fn => {hook=fn;}, prep:()=>e('prepareSmsApi()'), send:()=>e('sendSmsApi()'), checkpoint:()=>JSON.parse(w.localStorage.getItem(`pertama:no-answer:unfinished:${L}:c1`)), flush:()=>new Promise(r=>setImmediate(r))};
 }
 test('sole CRM-user number becomes the SMS sender without a settings choice', async t => {
@@ -99,12 +99,11 @@ test('exact send succeeds on durable acknowledgment without history readback or 
   assert.equal(h.w.document.querySelector('textarea').value,'untouched');
   await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.path==='/conversations/messages').length,1);
 });
-for (const patch of [{phone:'+12222222222'},{assignedTo:'other'}]) test('fresh contact change blocks send '+JSON.stringify(patch),async t=>{
+for (const patch of [{phone:'+12222222222'}]) test('fresh contact change blocks send '+JSON.stringify(patch),async t=>{
   const h=harness(t); h.hook(c=>c.path==='/contacts/c1'?{contact:{...contact,...patch}}:undefined); await assert.rejects(h.send()); assert.equal(h.calls.filter(c=>c.init.method==='POST').length,0);
 });
 test('concurrent-save approval keeps the preflight owner but still rechecks the SMS recipient', async t => {
   const h = harness(t);
-  h.e('Object.assign(workflow.approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
   h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, assignedTo: 'other' } } : undefined);
   await h.send();
   assert.equal(h.calls.filter(c => c.path === '/conversations/messages').length, 1);
@@ -112,7 +111,6 @@ test('concurrent-save approval keeps the preflight owner but still rechecks the 
 
 test('a concurrent-save approval never permits a changed SMS phone number', async t => {
   const h = harness(t);
-  h.e('Object.assign(workflow.approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0 })');
   h.hook(c => c.path === '/contacts/c1' ? { contact: { ...contact, phone: '+12222222222' } } : undefined);
   await assert.rejects(h.send());
   assert.equal(h.calls.filter(c => c.init.method === 'POST').length, 0);
