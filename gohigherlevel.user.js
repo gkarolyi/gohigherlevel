@@ -945,7 +945,7 @@
   const actionAttempts = new WeakMap();
   const actionStageVersions = new WeakMap();
   function safeActionId(value) { return typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(value); }
-  function requireActionApproval(action, context = workflow.approvedActionContext, expectedWrites = 0) {
+  function requireActionApproval(action, context = workflow.approvedActionContext) {
     syncStageQueue();
     if (!context || context !== workflow.approvedActionContext || context.actions?.[action] !== true
       || !safeActionId(context.contact) || workflow.startingContact !== context.contact
@@ -954,16 +954,8 @@
       || !liveReadHeaders || userFromHeaders(liveReadHeaders).id !== context.user) {
       throw new Error('A valid selected action and live approved contact/account/session are required.');
     }
-    assertApprovedActionContext(expectedWrites);
+    assertApprovedActionContext();
     return context;
-  }
-  async function recheckActionContact(action, context) {
-    requireActionApproval(action, context);
-    const fresh = await readContactDetails({ fresh: true });
-    requireActionApproval(action, context);
-    if (['id', 'locationId', 'firstName', 'lastName', 'phone', 'assignedTo'].some(key => fresh[key] !== context.contactRecord[key])) {
-      throw new Error('Contact changed after confirmation. Further saves stopped.');
-    }
   }
   function actionRequestShape(operation, context) {
     if (operation === 'stageRead' || operation === 'stage') {
@@ -1002,7 +994,7 @@
     requireActionApproval(action, context);
     let attempts = actionAttempts.get(context);
     if (!attempts) { attempts = new Set(); actionAttempts.set(context, attempts); }
-    if (attempts.has(operation) || context.stopSaves || workflow.pendingSave && !context.parallel && operation !== 'link') throw new Error('Action already attempted, stopped or an unresolved save exists. No retry.');
+    if (attempts.has(operation) || context.stopSaves) throw new Error('Action already attempted, stopped or an unresolved save exists. No retry.');
     const wire = wireRequest(method, path, body);
     if (action !== 'task') delete wire.headers.developer_version;
     if (method !== 'GET') {
@@ -1025,7 +1017,7 @@
       if (operation === 'stage') {
         contactObservation = observeContactRequest(method, wire.url, () => body);
         // Account for our own stage write without making contact caches reusable during it.
-        if (context.parallel && contactObservation?.write) {
+        if (contactObservation?.write) {
           context.ownedEpoch++;
           context.ownedWritesPending++;
         }
@@ -1046,7 +1038,7 @@
       // Do not propagate server text, URLs, bodies or native exception messages.
       throw new Error(`API ${action}: ${error.name === 'AbortError' ? 'Timed out after 30 seconds' : diagnostic.status ? `HTTP ${diagnostic.status}; response not verified` : 'No verified HTTP response'}. No automatic retry.`);
     } finally {
-      if (context.parallel && contactObservation?.write && !contactObservation.finished) {
+      if (contactObservation?.write && !contactObservation.finished) {
         context.ownedEpoch++;
         context.ownedWritesPending--;
       }
@@ -1073,17 +1065,14 @@
     const approved = context.opportunity;
     const saved = await actionRequest('stage', context);
     verifyStage(saved.data, saved.body, approved.id, context.contact, approved.pipelineId);
-    requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === actionStageVersions.get(context)
-      && (context.parallel || (saved.data.opportunity.assignedTo ?? '') === (approved.assignedTo ?? '')), 'saved opportunity account/version/owner did not match.');
+    requireSaved(saved.data.opportunity.locationId === LOCATION_ID && saved.data.opportunity.indexVersion === actionStageVersions.get(context), 'saved opportunity account/version/owner did not match.');
     appendJournalEvidence(`Stage: ${context.targetStageName} (server confirmed; opportunity ${approved.id})`);
     workflow.activeSaveProgress?.confirm('stage');
     setPendingAction('stage', null);
-    requireActionApproval('stage', context, 1);
-    if (!context.parallel) context.epoch = contactReadEpoch;
+    requireActionApproval('stage', context);
   }
   async function saveNoteApi() {
     const context = requireActionApproval('note');
-    if (!context.parallel) await recheckActionContact('note', context);
     const { data, body } = await actionRequest('note', context);
     requireSaved(safeActionId(data.note?.id), 'unsafe note ID.');
     verifyNote(data, body, context.contact, context.noteText);
@@ -1095,8 +1084,7 @@
   async function createTaskApi() {
     const context = requireActionApproval('task');
     actionRequestShape('task', context);
-    if (workflow.pendingSave && !context.parallel || actionAttempts.get(context)?.has('task')) throw new Error('Task already attempted or unresolved save exists. No retry.');
-    if (!context.parallel) await recheckActionContact('task', context);
+    if (actionAttempts.get(context)?.has('task')) throw new Error('Task already attempted. No retry.');
     const { data, body } = await actionRequest('task', context);
     requireSaved(safeActionId(data.record?.id), 'unsafe task ID.');
     verifyTask(data, body, context.contact, context.taskTitle, context.due);
@@ -1679,7 +1667,7 @@
     try { saveCheckpoint(); }
     catch (error) {
       workflow.pendingActions = previous; workflow.pendingSave = previousSummary;
-      if (workflow.approvedActionContext?.parallel) workflow.approvedActionContext.stopSaves = true;
+      if (workflow.approvedActionContext) workflow.approvedActionContext.stopSaves = true;
       throw error;
     }
   }
@@ -1688,13 +1676,13 @@
     for (const result of results) if (result.status === 'rejected') throw result.reason;
     return results.map(result => result.value);
   }
-  function assertApprovedActionContext(expectedWrites = 0) {
+  function assertApprovedActionContext() {
     const context = workflow.approvedActionContext;
     // Only explicitly owned invalidations may overlap; any external mutation still fails closed.
     if (context && (contactId() !== context.contact || stageRouteRevision !== context.route
       || currentUserId !== context.user || identityExpires <= Date.now() / 1000
-      || contactWritesPending !== (context.parallel ? context.ownedWritesPending : 0)
-      || contactReadEpoch !== context.epoch + (context.parallel ? context.ownedEpoch : expectedWrites * 2))) {
+      || contactWritesPending !== context.ownedWritesPending
+      || contactReadEpoch !== context.epoch + context.ownedEpoch)) {
       throw new Error('Contact, opportunity or session changed after confirmation. Further saves stopped; review the record before trying again.');
     }
   }
@@ -2011,35 +1999,16 @@
         !== task.relations.find(r => r.associationId === 'TASK_CONTACT_ASSOCIATION').relationId) throw new Error('Task changed before completion.');
     return { context, contact: fresh, title, task };
   }
-  async function completeCallTask(id, { fromSaveAndNext = false, prepared = null } = {}) {
-    if (workflow.busy && !fromSaveAndNext) {
-      console.info('Call-task completion skipped: another script action is running.');
-      return;
-    }
-    if (!fromSaveAndNext) {
-      workflow.busy = true;
-      workflow.guardedContact = id;
-    }
+  async function completeCallTask({ context, title, task }) {
     let attempted = false;
-    let phase = 'checking contact/session and unfinished actions';
+    let phase = 'checking the prepared contact/session and exact pending task';
     try {
-      requireContactControlsReady();
-      if (!fromSaveAndNext && localStorage.getItem(checkpointKey(id))) {
-        taskNotice('Call task stopped: an unfinished action already exists. Inspect the CRM record, then use Settings to clear its checkpoint. No automatic retry.', true);
-        return;
-      }
-      if (!fromSaveAndNext) {
-        resetJournalEvidence();
-        workflow.startingContact = id;
-      }
-      phase = 'reading and rechecking the current contact and exact pending task';
-      const { context, title, task } = prepared || await prepareCallTask(id);
+      if (!context.approval) throw new Error('Approved save preflight is required.');
       requireCallTaskContext(context);
       if (!task) return;
       const matchesTitle = row => row.properties.title.replace(/\s+/g, ' ').trim() === title;
       phase = 'saving the completion checkpoint';
-      if (!fromSaveAndNext && localStorage.getItem(checkpointKey(id))) throw new Error('An unfinished action appeared.');
-      if (workflow.approvedActionContext?.stopSaves || workflow.pendingSave && !context.approval) throw new Error('An unresolved save exists or saving was stopped.');
+      if (context.approval.stopSaves) throw new Error('Saving was stopped.');
       setPendingAction('complete', `Complete Call task ${task.id}: ${task.properties.title}`); // Persist before PUT.
       requireCallTaskContext(context);
       phase = 'sending task completion or verifying its acknowledgment';
@@ -2050,7 +2019,7 @@
       phase = 'verifying the completed task by its exact ID';
       let verified = false;
       for (let check = 0; check < 3; check++) {
-        if (check && fromSaveAndNext) await sleep(check * 500);
+        if (check) await sleep(check * 500);
         const result = await readCallTasks(context);
         requireCallTaskContext(context);
         const saved = result.rows.find(row => row.id === task.id);
@@ -2066,27 +2035,16 @@
       workflow.activeSaveProgress?.confirm('complete');
       setPendingAction('complete', null);
       requireCallTaskContext(context);
-      if (!fromSaveAndNext) {
-        removeCompletedCheckpoint(id);
-        taskNotice(`Completed: ${title}`);
-      }
     } catch {
       // Never surface arbitrary native/network errors, which can include credentials or response data.
       console.error('Pertama call task stopped', { phase, attempted });
-      if (fromSaveAndNext) throw new Error(`Call task stopped while ${phase}. ${attempted
+      throw new Error(`Call task stopped while ${phase}. ${attempted
         ? 'Completion may already be saved; inspect the task before clearing the checkpoint.'
         : 'No task completion was sent.'} No automatic retry.`);
-      taskNotice(`Call task stopped while ${phase}. ${attempted
-        ? 'Completion may already be saved. Inspect the task and unfinished-action checkpoint before clearing it in Settings.'
-        : 'No task completion was sent. Check the contact, session and task data before trying again.'} No automatic retry. The native call was not blocked.`, true);
     } finally {
       if (attempted) {
-        if (fromSaveAndNext && workflow.approvedActionContext?.parallel) workflow.approvedActionContext.ownedEpoch++;
+        context.approval.ownedEpoch++;
         invalidateContactReads();
-      }
-      if (!fromSaveAndNext) {
-        workflow.guardedContact = null;
-        workflow.busy = false;
       }
     }
   }
@@ -2190,7 +2148,6 @@
     const fresh = await prepareSmsApi();
     requireActionApproval('sms', context);
     if (['id', 'locationId', 'firstName', 'lastName', 'phone'].some(key => fresh.contact[key] !== context.contactRecord[key])
-      || !context.parallel && fresh.contact.assignedTo !== context.contactRecord.assignedTo
       || fresh.to !== sms.to || fresh.from !== sms.from) throw new Error('SMS contact or sender changed after confirmation.');
     const spam = await smsApiRequest('spam', context, sms);
     requireActionApproval('sms', context);
@@ -2587,6 +2544,7 @@
         throw new Error('Contact or opportunity changed after confirmation. Nothing saved; review the updated record before trying again.');
       }
       workflow.approvedActionContext = { contact: workflow.startingContact, route: startingRevision, user: startingUser, epoch: approvedEpoch,
+        ownedEpoch: 0, ownedWritesPending: 0, stopSaves: false,
         contactRecord: contact, opportunity, targetStageId: pipeline.stages[choices.targetStage], targetStageName: choices.targetStage,
         ownerId, noteText: choices.noteText, taskTitle, due: choices.due,
         actions: { stage: choices.stage, note: choices.note, task: choices.task, sms: choices.sms }, taskId: null,
@@ -2604,7 +2562,6 @@
       }
       if (!preparedTask.task) saveProgress.skip('complete');
       // Every lane uses this preflight snapshot; in-flight requests cannot be recalled on failure.
-      Object.assign(workflow.approvedActionContext, { parallel: true, ownedEpoch: 0, ownedWritesPending: 0, stopSaves: false });
       preparedTask.context.approval = workflow.approvedActionContext;
       progress('Saving selected actions concurrently…');
       const trackAction = async (key, action, detail = 'Saving…') => {
@@ -2620,7 +2577,7 @@
         ...(choices.stage ? [saveLane(() => trackAction('stage', saveStageApi))] : []),
         ...(choices.note ? [saveLane(() => trackAction('note', saveNoteApi))] : []),
         saveLane(async () => {
-          const complete = () => completeCallTask(workflow.startingContact, { fromSaveAndNext: true, prepared: preparedTask });
+          const complete = () => completeCallTask(preparedTask);
           if (preparedTask.task) await trackAction('complete', complete, 'Completing…');
           else await complete();
           if (choices.task) {
