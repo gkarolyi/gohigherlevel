@@ -149,6 +149,30 @@ test('refresh requests coalesce and stable controls incur no scans or redundant 
   assert.equal(records.length, 0, 'unchanged labels/styles/positions must not be written again');
 });
 
+test('stable hosts keep observer subscriptions until ancestry changes', async t => {
+  const h = harness(t); await h.flush();
+  const observer = h.observers.find(observer => observer.targets.has(h.button('tb_business')));
+  assert.ok(observer);
+  let subscriptions = 0, disconnections = 0;
+  const observe = observer.observe.bind(observer), disconnect = observer.disconnect.bind(observer);
+  observer.observe = (...args) => { subscriptions++; observe(...args); };
+  observer.disconnect = () => { disconnections++; disconnect(); };
+  for (let i = 0; i < 5; i++) { h.refresh(); await h.flush(); }
+  assert.equal(subscriptions, 0);
+  assert.equal(disconnections, 0);
+  const wrapper = h.d.createElement('section');
+  h.d.getElementById('app').append(wrapper); wrapper.append(h.button('sidebar'));
+  await h.flush(); assertPlacement(h);
+  assert.ok(subscriptions > 0 && disconnections > 0, 'new ancestors must be observed');
+  h.w.history.pushState({}, '', '/v2/location/other/contacts/detail/contact-a'); await h.flush();
+  assert.equal(observer.targets.size, 0);
+  h.w.history.pushState({}, '', CONTACT); await h.flush();
+  assert.ok(observer.targets.size > 0, 'same hosts must be resubscribed after account teardown');
+  const header = h.d.querySelector('header'), replacement = h.d.createElement('header');
+  replacement.innerHTML = '<button id="tb_business">Companies</button>';
+  header.replaceWith(replacement); await h.flush(); assertPlacement(h);
+});
+
 test('flat CRM hosts do not turn the application root into a subtree observer', async t => {
   const h = harness(t, { flat: true }); await h.flush(); h.reset();
   const app = h.d.getElementById('app');

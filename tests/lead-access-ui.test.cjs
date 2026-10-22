@@ -86,6 +86,24 @@ test('semantic rows keep IDs once, escape text, stack tasks and format dates exp
   h.result({ rows: [] }); await dialog.querySelector('[data-run]').onclick(); assert.equal(dialog.querySelectorAll('tbody tr').length, 0);
   assert.match(dialog.querySelector('[data-rows]').textContent, /No inaccessible contacts found\./);
 });
+test('report date formatter construction is bounded across rows and reruns', async t => {
+  const h = harness(t);
+  const DateTimeFormat = h.w.Intl.DateTimeFormat;
+  let constructions = 0;
+  h.w.Intl.DateTimeFormat = function(...args) { constructions++; return new DateTimeFormat(...args); };
+  h.result({ rows: Array.from({ length: 30 }, (_, i) => ({ id: 'lead' + i, name: 'Lead ' + i,
+    lastCall: '2026-10-14T20:15:00Z', tasks: [
+      { title: 'Date only', due: '2026-10-14' }, { title: 'Timestamp', due: '2026-10-14T20:15:00Z' },
+    ] })) });
+  const dialog = h.open(); await dialog.querySelector('[data-run]').onclick();
+  assert.equal(dialog.querySelectorAll('tbody tr').length, 30);
+  assert.equal(dialog.querySelector('tbody tr td:nth-child(2)').title, '15 Oct 2026, 04:15 WITA');
+  assert.ok(constructions <= 4, `constructed ${constructions} formatters for 90 dates`);
+  const firstRun = constructions;
+  await dialog.querySelector('[data-run]').onclick();
+  assert.equal(constructions, firstRun, 'reruns should reuse the same formatters');
+});
+
 test('date tooltips use converted full WITA timestamps, including date-only deadlines and next-day calls', async t => {
   const h = harness(t);
   h.result({ rows: [

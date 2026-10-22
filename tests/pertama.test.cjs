@@ -631,6 +631,36 @@ test('board snapshot pins exact opportunity, contact, pipeline and stage', t => 
   assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
 });
 
+test('verified board snapshots avoid scanning unrelated pipeline labels and geometry', t => {
+  const h = harness(t, { route: BOARD_PATH });
+  rememberSnapshot(h, result([hit('contact-a', 'opp-a')]));
+  h.w.document.body.insertAdjacentHTML('beforeend', '<main>' + '<div><span>Unrelated</span></div>'.repeat(600) + '</main>');
+  let measurements = 0;
+  const rects = h.w.HTMLElement.prototype.getClientRects;
+  h.w.HTMLElement.prototype.getClientRects = function() { measurements++; return rects.call(this); };
+  clickBoardCard(h);
+  assert.deepEqual(JSON.parse(h.w.sessionStorage.getItem(QUEUE_KEY)), queue);
+  assert.ok(measurements < 10, `measured ${measurements} unrelated controls`);
+  assert.equal(JSON.parse(h.w.sessionStorage.getItem('pertama:origin:contact-a')).pipelineId, 'pipe-a');
+});
+
+test('board origin fallback still refuses ambiguous pipeline labels', t => {
+  const h = harness(t, { route: BOARD_PATH });
+  h.evaluate("NAV_PIPELINES.push({ id: 'other', name: 'Other sales', stages: { 'New Lead': 'other-stage' } })");
+  h.w.document.body.insertAdjacentHTML('beforeend', '<button>Other sales</button>');
+  clickBoardCard(h);
+  assert.equal(h.w.sessionStorage.getItem(QUEUE_KEY), null);
+  assert.equal(h.w.sessionStorage.getItem('pertama:origin:contact-a'), null);
+});
+
+test('board snapshot fast path refuses a different contact', t => {
+  const h = harness(t, { route: BOARD_PATH });
+  rememberSnapshot(h, result([hit('other-contact', 'opp-a')]));
+  clickBoardCard(h);
+  assert.equal(h.w.sessionStorage.getItem(QUEUE_KEY), null);
+  assert.equal(JSON.parse(h.w.sessionStorage.getItem('pertama:origin:contact-a')).opportunityId, 'opp-a');
+});
+
 test('board snapshot does not infer stage for an unmatched opportunity', t => {
   const h = harness(t, { route: BOARD_PATH });
   rememberSnapshot(h, result([hit('contact-a', 'opp-other')]));
