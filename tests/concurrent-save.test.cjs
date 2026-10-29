@@ -471,3 +471,62 @@ test('failure to persist one lane cannot erase an already dispatched lane', asyn
   assert.equal(d.querySelector('[data-action="note"]').dataset.state, 'failed');
   assert.equal(d.querySelector('[data-action="task"]').dataset.state, 'blocked');
 });
+
+for (const failure of ['complete', 'task', 'link']) {
+  test(`Skip stops after ${failure} failure`, async t => {
+    const h = harness(t);
+    for (const [operation, gate] of Object.entries(h.gates)) gate.resolve(operation === failure ? new Error('Save failed') : undefined);
+    const pending = h.e("run('skip')");
+    assert.equal(h.e('runButton.disabled'), true);
+    assert.equal(h.e('skipButton.disabled'), true);
+    await pending;
+    assert.equal(h.e('runButton.disabled'), false);
+    assert.equal(h.e('skipButton.disabled'), false);
+    assert.equal(h.e('__nextCalls'), 0);
+    assert.ok(h.checkpoint());
+    assert.equal(h.w.document.querySelector('#pertama-save-progress h2').textContent, 'Execution stopped');
+    assert.match(h.w.document.querySelector('[data-report]').textContent, /No automatic retry/);
+    if (failure === 'complete') assert.equal(h.writes.some(r => r.operation === 'task'), false);
+    assert.equal(h.writes.some(r => ['stage', 'note'].includes(r.operation)), false);
+  });
+}
+
+test('Skip shares the busy lock with Save and next', async t => {
+  const h = harness(t);
+  const pending = h.run();
+  for (let i = 0; i < 30; i++) await flush();
+  const count = h.writes.length;
+  await h.e("run('skip')");
+  assert.equal(h.writes.length, count);
+  for (const gate of Object.values(h.gates)) gate.resolve();
+  await pending;
+});
+
+for (const oldTask of [true, false]) {
+  test(`Skip postpones follow-up with existing task=${oldTask}`, async t => {
+    const h = harness(t, { oldTask });
+    h.e("confirmActions = async () => { throw new Error('Skip must not confirm'); }");
+    const before = Date.now();
+    h.w.Date.now = () => before;
+    const pending = h.e("run('skip')");
+    for (let i = 0; i < 30; i++) await flush();
+    assert.deepEqual(h.writes.map(r => r.operation), [oldTask ? 'complete' : 'task']);
+    assert.equal(h.e('__nextCalls'), 0);
+    if (oldTask) h.gates.complete.resolve();
+    for (let i = 0; i < 30; i++) await flush();
+    const request = h.writes.find(r => r.operation === 'task');
+    assert.ok(request);
+    const due = Date.parse(request.body.properties.dueDate);
+    assert.equal(due, before + 3 * 3600000);
+    assert.deepEqual(request.body.owners, ['u1']);
+    assert.equal(request.body.properties.title, 'Call again Ada Lee');
+    h.gates.task.resolve();
+    for (let i = 0; i < 30; i++) await flush();
+    h.gates.link.resolve();
+    await pending;
+    assert.deepEqual(h.writes.map(r => r.operation), oldTask ? ['complete', 'task', 'link'] : ['task', 'link']);
+    assert.equal(h.e('__nextCalls'), 1);
+    assert.equal(h.checkpoint(), null);
+    assert.equal(h.writes.some(r => ['stage', 'note'].includes(r.operation)), false);
+  });
+}

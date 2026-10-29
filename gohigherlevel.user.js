@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pertama — No answer
 // @namespace    pertama-local
-// @version      1.0.20
+// @version      1.0.21
 // @description  No-answer workflow and a Next lead button for the Opportunities dashboard.
 // @updateURL    https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
 // @downloadURL  https://raw.githubusercontent.com/gkarolyi/gohigherlevel/main/gohigherlevel.user.js
@@ -21,7 +21,7 @@
   window.__pertamaNoAnswerInstalled = true;
 
   // Account boundary; workflow defaults below remain editable in Settings.
-  const VERSION = '1.0.20';
+  const VERSION = '1.0.21';
   const LOCATION_ID = '3QixdLNutDXye95tTBK0';
   const SMS_NOTICE_KEY = `pertama:sms-notice:${LOCATION_ID}`;
   const NAV_PIPELINES = [];
@@ -2539,19 +2539,22 @@
     return { contact, opportunity, pipeline, stage };
   }
 
-  async function run() {
+  async function run(mode = 'save') {
     if (workflow.busy) return;
+    const skip = mode === 'skip';
+    const skipDue = skip ? new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString() : null;
     document.getElementById('pertama-save-progress')?.remove();
     let saveProgress = null;
     workflow.busy = true;
     runButton.disabled = true;
+    skipButton.disabled = true;
     journal.reset();
     workflow.step = 'Checking contact page';
     workflow.guardedContact = contactId();
     workflow.startingContact = workflow.guardedContact || '(none)';
     const startingRevision = stageRouteRevision, startingUser = currentUserId;
     let timingResult = 'ok';
-    startWorkflowTiming('Save and next', workflow.step);
+    startWorkflowTiming(skip ? 'Skip' : 'Save and next', workflow.step);
     try {
       requireContactControlsReady();
       if (!workflow.guardedContact || !location.pathname.includes(`/location/${LOCATION_ID}/`)) {
@@ -2588,12 +2591,19 @@
         : { next: '', days: 2, updateStage: false };
       const ownerId = typeof contact.assignedTo === 'string' && /^[a-zA-Z0-9_-]+$/.test(contact.assignedTo) ? contact.assignedTo : '';
       const taskTitle = renderTemplate(settings.task, { name, firstName });
-      progress('Awaiting confirmation…');
-      const choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, ownerId, taskTitle, pipelineName, stageOptions }, choices => {
-        saveProgress = createSaveProgress({ name, pipelineName, choices });
+      let choices;
+      const accept = selected => {
+        saveProgress = createSaveProgress({ name, pipelineName, choices: selected });
         workflow.activeSaveProgress = saveProgress;
-      });
-      if (!choices) { timingResult = 'cancelled'; return; }
+      };
+      if (skip) {
+        choices = { stage: false, note: false, task: true, sms: false, due: skipDue };
+        accept(choices);
+      } else {
+        progress('Awaiting confirmation…');
+        choices = await confirmActions({ contact, name, firstName: firstName || name, phone, stage, rule, ownerId, taskTitle, pipelineName, stageOptions }, accept);
+        if (!choices) { timingResult = 'cancelled'; return; }
+      }
       if (contactId() !== workflow.startingContact || stageRouteRevision !== startingRevision) throw new Error('Contact or original stage queue changed during confirmation. Nothing saved.');
       progress('Rechecking contact and opportunity…');
       const approvedEpoch = contactReadEpoch;
@@ -2687,6 +2697,7 @@
       workflow.approvedActionContext = null;
       workflow.busy = false;
       runButton.disabled = false;
+      skipButton.disabled = false;
       runButton.textContent = 'Save and next';
       nextButton.textContent = nextLeadLabel();
       queueSaveRevision++;
@@ -2978,7 +2989,7 @@
     document.body.appendChild(dialog); dialog.showModal();
   }
 
-  let runButton, nextButton;
+  let runButton, skipButton, nextButton;
   let buttonsInitialized = false;
   function initializeButtons() {
   if (buttonsInitialized) return;
@@ -2993,7 +3004,13 @@
   runButton.id = 'pertama-no-answer-button';
   runButton.textContent = 'Save and next';
   runButton.style.cssText = 'align-self:center;flex-shrink:0;margin-left:16px;padding:10px 16px;background:#155eef;color:white;border:0;border-radius:6px;font:14px sans-serif;white-space:nowrap;cursor:pointer';
-  runButton.addEventListener('click', run);
+  runButton.addEventListener('click', () => run());
+  skipButton = document.createElement('button');
+  skipButton.id = 'pertama-skip-button';
+  skipButton.textContent = 'Skip';
+  skipButton.title = 'Create a follow-up for 3 hours from now and open the next lead.';
+  skipButton.style.cssText = 'align-self:center;flex-shrink:0;margin-left:8px;padding:10px 16px;background:white;color:#344054;border:1px solid #d0d5dd;border-radius:6px;font:14px sans-serif;white-space:nowrap;cursor:pointer';
+  skipButton.addEventListener('click', () => run('skip'));
   const queueSummary = document.createElement('span');
   queueSummary.id = 'pertama-queue-summary';
   queueSummary.hidden = true;
@@ -3130,7 +3147,7 @@
       if (owned(record.target)) continue;
       const nodes = [...record.addedNodes, ...record.removedNodes];
       const removedControl = [...record.removedNodes].some(node =>
-        [runButton, nextButton, settingsButton, stageBadge, queueSummary].includes(node) && !node.isConnected);
+        [runButton, skipButton, nextButton, settingsButton, stageBadge, queueSummary].includes(node) && !node.isConnected);
       if (record.type === 'childList' && nodes.length && nodes.every(owned) && !removedControl) continue;
       changed = true;
       for (const node of record.addedNodes) if (node.nodeType === Node.ELEMENT_NODE && !owned(node)) rootsToDiscover.add(node);
@@ -3245,9 +3262,11 @@
 
     if (!workflow.busy && nextButton.textContent !== label) nextButton.textContent = label;
     setDisplay(runButton, showRun);
+    setDisplay(skipButton, showRun);
     setDisplay(nextButton, Boolean(widthTarget), 'flex');
     setDisplay(settingsButton, Boolean(settings), 'flex');
     if (showRun && companies.nextElementSibling !== runButton) companies.insertAdjacentElement('afterend', runButton);
+    if (showRun && runButton.nextElementSibling !== skipButton) runButton.insertAdjacentElement('afterend', skipButton);
     if (settings && settings.previousElementSibling !== settingsButton) settings.insertAdjacentElement('beforebegin', settingsButton);
     if (hub && hub.nextElementSibling !== nextButton) hub.insertAdjacentElement('afterend', nextButton);
     else if (!hub && settings && settingsButton.previousElementSibling !== nextButton) settingsButton.insertAdjacentElement('beforebegin', nextButton);
@@ -3256,7 +3275,7 @@
       if (nextButton.style.fontSize !== nextSize) nextButton.style.fontSize = nextSize;
       if (settingsButton.style.fontSize !== settingsSize) settingsButton.style.fontSize = settingsSize;
     }
-    if (showRun && runButton.nextElementSibling !== queueSummary) runButton.insertAdjacentElement('afterend', queueSummary);
+    if (showRun && skipButton.nextElementSibling !== queueSummary) skipButton.insertAdjacentElement('afterend', queueSummary);
     updateQueueSummary(showRun, allowReads);
     updateStageIndicator(visibleName);
     return widthTarget;
@@ -3289,7 +3308,7 @@
     if (!location.pathname.includes(`/location/${LOCATION_ID}/`)) {
       cancelLeadAccessReport();
       hideQueueSummary();
-      setDisplay(runButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
+      setDisplay(runButton, false); setDisplay(skipButton, false); setDisplay(nextButton, false, 'flex'); setDisplay(settingsButton, false, 'flex');
       hostObserver.disconnect(); hostSubscriptions.clear(); stopDiscovery(); widthObserver?.disconnect();
       observedWidthTarget = null; observedWidth = null;
       return;

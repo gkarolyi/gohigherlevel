@@ -18,6 +18,8 @@ Current and suggested next stages come from the checked pipelines. Saved stages 
 
 In **Save and next**, use **Scheduled for (WITA)** to choose an exact date and time for this save only. Changing follow-up days recalculates this picker; other action toggles preserve your chosen time. All picker values use WITA (UTC+8), regardless of your browser timezone. Existing saved rules are not changed.
 
+**Skip** completes the matching follow-up task, creates a new one due three hours from the click (even if no matching task exists), then opens the next contact. It does not update stage, add notes, or send SMS. If a save fails, navigation stops; inspect the error and record before retrying, since completion may already have succeeded.
+
 ### Queue summary
 
 A muted summary beside **Save and next** shows **New leads N · Follow-ups due N**, ordered by your queue priority. These are matching opportunity and due-task totals—not calls or unique contacts—and use the same filters as Next lead. No selected pipelines means zero new leads.

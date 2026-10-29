@@ -51,13 +51,16 @@ for (const paused of ['hidden', 'busy']) test(`pending snapshot survives tempora
 test('mounts muted summary adjacent to Save and next and fetches once without changing Next label', async t => {
   const h = harness(t); await h.flush();
   assert.ok(h.summary(), 'summary mounted');
-  assert.equal(h.w.document.getElementById('pertama-no-answer-button').nextElementSibling, h.summary());
+  const skip = h.w.document.getElementById('pertama-skip-button');
+  assert.equal(h.w.document.getElementById('pertama-no-answer-button').nextElementSibling, skip);
+  assert.equal(skip.nextElementSibling, h.summary());
   assert.equal(h.summary().textContent, 'New leads 3 · Follow-ups due 2');
   assert.equal(h.requests.length, 2);
   assert.equal(h.w.document.getElementById('pertama-next-lead-button').textContent, 'Next lead');
   for (let i = 0; i < 4; i++) { h.refresh(); h.w.document.querySelector('header').className = `x${i}`; await h.flush(); }
   assert.equal(h.requests.length, 2);
   h.summary().remove(); await h.flush(); assert.ok(h.summary()); assert.equal(h.requests.length, 2);
+  skip.remove(); await h.flush(); assert.equal(h.w.document.getElementById('pertama-no-answer-button').nextElementSibling, skip);
 });
 for (const options of [{ verified: false }, { visible: false }]) test(`no reads without verified visible contact ${JSON.stringify(options)}`, async t => {
   const h = harness(t, options); await h.flush(); assert.equal(h.requests.length, 0); assert.ok(!h.summary() || h.summary().hidden);
